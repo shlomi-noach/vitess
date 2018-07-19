@@ -1,148 +1,175 @@
-// Package test contains utilities to test topo.Server
-// implementations. If you are testing your implementation, you will
-// want to call CheckAll in your test method. For an example, look at
-// the tests in github.com/youtube/vitess/go/vt/zktopo.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreedto in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package test
 
 import (
+	"path"
 	"testing"
 	"time"
 
-	"github.com/youtube/vitess/go/vt/topo"
 	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/topo"
+
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
-func CheckKeyspaceLock(t *testing.T, ts topo.Server) {
-	if err := ts.CreateKeyspace("test_keyspace", &topo.Keyspace{}); err != nil {
+// timeUntilLockIsTaken is the time to wait until a lock is taken.
+// We haven't found a better simpler way to guarantee a routine is stuck
+// waiting for a topo lock than sleeping that amount.
+var timeUntilLockIsTaken = 10 * time.Millisecond
+
+// checkLock checks we can lock / unlock as expected. It's using a keyspace
+// as the lock target.
+func checkLock(t *testing.T, ts *topo.Server) {
+	ctx := context.Background()
+	if err := ts.CreateKeyspace(ctx, "test_keyspace", &topodatapb.Keyspace{}); err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
 	}
 
-	ctx, ctxCancel := context.WithCancel(context.Background())
-	lockPath, err := ts.LockKeyspaceForAction(ctx, "test_keyspace", "fake-content")
+	conn, err := ts.ConnForCell(context.Background(), topo.GlobalCell)
 	if err != nil {
-		t.Fatalf("LockKeyspaceForAction: %v", err)
+		t.Fatalf("ConnForCell(global) failed: %v", err)
+	}
+
+	t.Log("===      checkLockTimeout")
+	checkLockTimeout(ctx, t, conn)
+
+	t.Log("===      checkLockMissing")
+	checkLockMissing(ctx, t, conn)
+
+	t.Log("===      checkLockUnblocks")
+	checkLockUnblocks(ctx, t, conn)
+}
+
+func checkLockTimeout(ctx context.Context, t *testing.T, conn topo.Conn) {
+	keyspacePath := path.Join(topo.KeyspacesPath, "test_keyspace")
+	lockDescriptor, err := conn.Lock(ctx, keyspacePath, "")
+	if err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+
+	// We have the lock, list the keyspace directory.
+	// It should not contain anything, except Ephemeral files.
+	entries, err := conn.ListDir(ctx, keyspacePath, true /*full*/)
+	if err != nil {
+		t.Fatalf("Listdir(%v) failed: %v", keyspacePath, err)
+	}
+	for _, e := range entries {
+		if e.Name == "Keyspace" {
+			continue
+		}
+		if e.Ephemeral {
+			t.Logf("skipping ephemeral node %v in %v", e, keyspacePath)
+			continue
+		}
+		// Non-ephemeral entries better have only ephemeral children.
+		p := path.Join(keyspacePath, e.Name)
+		entries, err := conn.ListDir(ctx, p, true /*full*/)
+		if err != nil {
+			t.Fatalf("Listdir(%v) failed: %v", p, err)
+		}
+		for _, e := range entries {
+			if e.Ephemeral {
+				t.Logf("skipping ephemeral node %v in %v", e, p)
+			} else {
+				t.Errorf("Entry in %v has non-ephemeral DirEntry: %v", p, e)
+			}
+		}
 	}
 
 	// test we can't take the lock again
-	fastCtx, cancel := context.WithTimeout(ctx, time.Second/10)
-	if _, err := ts.LockKeyspaceForAction(fastCtx, "test_keyspace", "unused-fake-content"); err != topo.ErrTimeout {
-		t.Errorf("LockKeyspaceForAction(again): %v", err)
+	fastCtx, cancel := context.WithTimeout(ctx, timeUntilLockIsTaken)
+	if _, err := conn.Lock(fastCtx, keyspacePath, "again"); !topo.IsErrType(err, topo.Timeout) {
+		t.Fatalf("Lock(again): %v", err)
 	}
 	cancel()
 
 	// test we can interrupt taking the lock
+	interruptCtx, cancel := context.WithCancel(ctx)
 	go func() {
-		time.Sleep(time.Second / 10)
-		ctxCancel()
+		time.Sleep(timeUntilLockIsTaken)
+		cancel()
 	}()
-	if _, err := ts.LockKeyspaceForAction(ctx, "test_keyspace", "unused-fake-content"); err != topo.ErrInterrupted {
-		t.Errorf("LockKeyspaceForAction(interrupted): %v", err)
+	if _, err := conn.Lock(interruptCtx, keyspacePath, "interrupted"); !topo.IsErrType(err, topo.Interrupted) {
+		t.Fatalf("Lock(interrupted): %v", err)
 	}
 
-	if err := ts.UnlockKeyspaceForAction("test_keyspace", lockPath, "fake-results"); err != nil {
-		t.Errorf("UnlockKeyspaceForAction(): %v", err)
+	if err := lockDescriptor.Check(ctx); err != nil {
+		t.Errorf("Check(): %v", err)
+	}
+
+	if err := lockDescriptor.Unlock(ctx); err != nil {
+		t.Fatalf("Unlock(): %v", err)
 	}
 
 	// test we can't unlock again
-	if err := ts.UnlockKeyspaceForAction("test_keyspace", lockPath, "fake-results"); err == nil {
-		t.Error("UnlockKeyspaceForAction(again) worked")
-	}
-
-	// test we can't lock a non-existing keyspace
-	ctx = context.Background()
-	if _, err := ts.LockKeyspaceForAction(ctx, "test_keyspace_666", "fake-content"); err == nil {
-		t.Errorf("LockKeyspaceForAction(test_keyspace_666) worked for non-existing keyspace")
+	if err := lockDescriptor.Unlock(ctx); err == nil {
+		t.Fatalf("Unlock(again) worked")
 	}
 }
 
-func CheckShardLock(t *testing.T, ts topo.Server) {
-	if err := ts.CreateKeyspace("test_keyspace", &topo.Keyspace{}); err != nil {
-		t.Fatalf("CreateKeyspace: %v", err)
-	}
-	if err := topo.CreateShard(ts, "test_keyspace", "10-20"); err != nil {
-		t.Fatalf("CreateShard: %v", err)
-	}
-
-	ctx, ctxCancel := context.WithCancel(context.Background())
-	lockPath, err := ts.LockShardForAction(ctx, "test_keyspace", "10-20", "fake-content")
-	if err != nil {
-		t.Fatalf("LockShardForAction: %v", err)
-	}
-
-	// test we can't take the lock again
-	fastCtx, cancel := context.WithTimeout(ctx, time.Second/10)
-	if _, err := ts.LockShardForAction(fastCtx, "test_keyspace", "10-20", "unused-fake-content"); err != topo.ErrTimeout {
-		t.Errorf("LockShardForAction(again): %v", err)
-	}
-	cancel()
-
-	// test we can interrupt taking the lock
-	go func() {
-		time.Sleep(time.Second / 2)
-		ctxCancel()
-	}()
-	if _, err := ts.LockShardForAction(ctx, "test_keyspace", "10-20", "unused-fake-content"); err != topo.ErrInterrupted {
-		t.Errorf("LockShardForAction(interrupted): %v", err)
-	}
-
-	if err := ts.UnlockShardForAction("test_keyspace", "10-20", lockPath, "fake-results"); err != nil {
-		t.Errorf("UnlockShardForAction(): %v", err)
-	}
-
-	// test we can't unlock again
-	if err := ts.UnlockShardForAction("test_keyspace", "10-20", lockPath, "fake-results"); err == nil {
-		t.Error("UnlockShardForAction(again) worked")
-	}
-
-	// test we can't lock a non-existing shard
-	ctx = context.Background()
-	if _, err := ts.LockShardForAction(ctx, "test_keyspace", "20-30", "fake-content"); err == nil {
-		t.Errorf("LockShardForAction(test_keyspace/20-30) worked for non-existing shard")
+// checkLockMissing makes sure we can't lock a non-existing directory.
+func checkLockMissing(ctx context.Context, t *testing.T, conn topo.Conn) {
+	keyspacePath := path.Join(topo.KeyspacesPath, "test_keyspace_666")
+	if _, err := conn.Lock(ctx, keyspacePath, "missing"); err == nil {
+		t.Fatalf("Lock(test_keyspace_666) worked for non-existing keyspace")
 	}
 }
 
-func CheckSrvShardLock(t *testing.T, ts topo.Server) {
-	// make sure we can create the lock even if no directory exists
-	ctx, ctxCancel := context.WithCancel(context.Background())
-	lockPath, err := ts.LockSrvShardForAction(ctx, "test", "test_keyspace", "10-20", "fake-content")
-	if err != nil {
-		t.Fatalf("LockSrvShardForAction: %v", err)
-	}
+// checkLockUnblocks makes sure that a routine waiting on a lock
+// is unblocked when another routine frees the lock
+func checkLockUnblocks(ctx context.Context, t *testing.T, conn topo.Conn) {
+	keyspacePath := path.Join(topo.KeyspacesPath, "test_keyspace")
+	unblock := make(chan struct{})
+	finished := make(chan struct{})
 
-	if err := ts.UnlockSrvShardForAction("test", "test_keyspace", "10-20", lockPath, "fake-results"); err != nil {
-		t.Errorf("UnlockShardForAction(): %v", err)
-	}
-
-	// now take the lock again after the root exists
-	lockPath, err = ts.LockSrvShardForAction(ctx, "test", "test_keyspace", "10-20", "fake-content")
-	if err != nil {
-		t.Fatalf("LockSrvShardForAction: %v", err)
-	}
-
-	// test we can't take the lock again
-	fastCtx, cancel := context.WithTimeout(ctx, time.Second/10)
-	if _, err := ts.LockSrvShardForAction(fastCtx, "test", "test_keyspace", "10-20", "unused-fake-content"); err != topo.ErrTimeout {
-		t.Errorf("LockSrvShardForAction(again): %v", err)
-	}
-	cancel()
-
-	// test we can interrupt taking the lock
+	// As soon as we're unblocked, we try to lock the keyspace.
 	go func() {
-		time.Sleep(time.Second / 2)
-		ctxCancel()
+		<-unblock
+		lockDescriptor, err := conn.Lock(ctx, keyspacePath, "unblocks")
+		if err != nil {
+			t.Fatalf("Lock(test_keyspace) failed: %v", err)
+		}
+		if err = lockDescriptor.Unlock(ctx); err != nil {
+			t.Fatalf("Unlock(test_keyspace): %v", err)
+		}
+		close(finished)
 	}()
-	if _, err := ts.LockSrvShardForAction(ctx, "test", "test_keyspace", "10-20", "unused-fake-content"); err != topo.ErrInterrupted {
-		t.Errorf("LockSrvShardForAction(interrupted): %v", err)
+
+	// Lock the keyspace.
+	lockDescriptor2, err := conn.Lock(ctx, keyspacePath, "")
+	if err != nil {
+		t.Fatalf("Lock(test_keyspace) failed: %v", err)
 	}
 
-	// unlock now
-	if err := ts.UnlockSrvShardForAction("test", "test_keyspace", "10-20", lockPath, "fake-results"); err != nil {
-		t.Errorf("UnlockSrvShardForAction(): %v", err)
+	// unblock the go routine so it starts waiting
+	close(unblock)
+
+	// sleep for a while so we're sure the go routine is blocking
+	time.Sleep(timeUntilLockIsTaken)
+
+	if err = lockDescriptor2.Unlock(ctx); err != nil {
+		t.Fatalf("Unlock(test_keyspace): %v", err)
 	}
 
-	// test we can't unlock again
-	if err := ts.UnlockSrvShardForAction("test", "test_keyspace", "10-20", lockPath, "fake-results"); err == nil {
-		t.Error("UnlockSrvShardForAction(again) worked")
+	timeout := time.After(10 * time.Second)
+	select {
+	case <-finished:
+	case <-timeout:
+		t.Fatalf("unlocking timed out")
 	}
-
 }

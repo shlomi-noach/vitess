@@ -1,13 +1,28 @@
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreedto in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 // package logutil provides some utilities for logging using glog and
 // redirects the stdlib logging to glog.
 
 package logutil
 
 import (
-	"flag"
 	stdlog "log"
 
-	log "github.com/golang/glog"
+	"vitess.io/vitess/go/vt/log"
 )
 
 type logShim struct{}
@@ -21,14 +36,4 @@ func init() {
 	stdlog.SetPrefix("log: ")
 	stdlog.SetFlags(0)
 	stdlog.SetOutput(new(logShim))
-}
-
-// GetSubprocessFlags returns the list of flags to use to have subprocesses
-// log in the same directory as the current process.
-func GetSubprocessFlags() []string {
-	logDir := flag.Lookup("log_dir")
-	if logDir == nil {
-		panic("the logging module doesn't specify a log_dir flag")
-	}
-	return []string{"-log_dir", logDir.Value.String()}
 }

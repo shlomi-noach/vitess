@@ -1,45 +1,73 @@
-// Copyright 2012, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package proc
 
 import (
-	"encoding/json"
+	"expvar"
 	"fmt"
-	"io/ioutil"
-	"net/http"
+	"net"
 	"testing"
 )
 
 func TestPublished(t *testing.T) {
 	l, err := Listen("")
 	if err != nil {
-		t.Fatalf("could not initialize listener: %v", err)
+		t.Fatal(err)
 	}
-	go http.Serve(l, nil)
+	opened := make(chan struct{})
+	closed := make(chan struct{})
+	go func() {
+		for {
+			conn, err := l.Accept()
+			opened <- struct{}{}
+			if err != nil {
+				t.Fatal(err)
+			}
+			go func() {
+				b := make([]byte, 100)
+				for {
+					_, err := conn.Read(b)
+					if err != nil {
+						conn.Close()
+						closed <- struct{}{}
+						return
+					}
+				}
+			}()
+		}
+	}()
 
+	addr := l.Addr().String()
 	for i := 1; i <= 3; i++ {
-		resp, err := http.Get(fmt.Sprintf("http://%s/debug/vars", l.Addr().String()))
+		conn1, err := net.Dial("tcp", addr)
 		if err != nil {
 			t.Fatal(err)
 		}
-		val, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			t.Fatal(err)
+		<-opened
+		if v := expvar.Get("ConnCount").String(); v != "1" {
+			t.Errorf("ConnCount: %v, want 1", v)
 		}
-		http.DefaultTransport.(*http.Transport).CloseIdleConnections()
-		vars := make(map[string]interface{})
-		err = json.Unmarshal(val, &vars)
-		if err != nil {
-			t.Error(err)
+		conn1.Close()
+		<-closed
+		if v := expvar.Get("ConnCount").String(); v != "0" {
+			t.Errorf("ConnCount: %v, want 1", v)
 		}
-		if vars["ConnCount"].(float64) != 1 {
-			t.Errorf("want 1, got %v", vars["connection-count"])
-		}
-		if vars["ConnAccepted"].(float64) != float64(i) {
-			t.Errorf("want %d, got %v", i, vars["connection-count"])
+		if v := expvar.Get("ConnAccepted").String(); v != fmt.Sprintf("%d", i) {
+			t.Errorf("ConnAccepted: %v, want %d", v, i)
 		}
 	}
-	l.Close()
 }

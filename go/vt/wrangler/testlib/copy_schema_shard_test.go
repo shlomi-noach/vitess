@@ -1,165 +1,183 @@
-// Copyright 2014, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package testlib
 
 import (
-	"fmt"
-	"sync/atomic"
 	"testing"
-	"time"
 
-	mproto "github.com/youtube/vitess/go/mysql/proto"
-	"github.com/youtube/vitess/go/vt/dbconnpool"
-	"github.com/youtube/vitess/go/vt/logutil"
-	myproto "github.com/youtube/vitess/go/vt/mysqlctl/proto"
-	_ "github.com/youtube/vitess/go/vt/tabletmanager/gorpctmclient"
-	_ "github.com/youtube/vitess/go/vt/tabletserver/gorpctabletconn"
-	"github.com/youtube/vitess/go/vt/topo"
-	"github.com/youtube/vitess/go/vt/wrangler"
-	"github.com/youtube/vitess/go/vt/zktopo"
+	"golang.org/x/net/context"
+
+	"vitess.io/vitess/go/mysql/fakesqldb"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/mysqlctl/tmutils"
+	"vitess.io/vitess/go/vt/topo/memorytopo"
+	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/vttablet/tmclient"
+	"vitess.io/vitess/go/vt/wrangler"
+
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
-type ExpectedExecuteFetch struct {
-	Query       string
-	MaxRows     int
-	WantFields  bool
-	QueryResult *mproto.QueryResult
-	Error       error
+func TestCopySchemaShard_UseTabletAsSource(t *testing.T) {
+	copySchema(t, false /* useShardAsSource */)
 }
 
-// FakePoolConnection implements dbconnpool.PoolConnection
-type FakePoolConnection struct {
-	t      *testing.T
-	Closed bool
-
-	ExpectedExecuteFetch      []ExpectedExecuteFetch
-	ExpectedExecuteFetchIndex int
+func TestCopySchemaShard_UseShardAsSource(t *testing.T) {
+	copySchema(t, true /* useShardAsSource */)
 }
 
-func NewFakePoolConnectionQuery(t *testing.T, query string) *FakePoolConnection {
-	return &FakePoolConnection{
-		t: t,
-		ExpectedExecuteFetch: []ExpectedExecuteFetch{
-			ExpectedExecuteFetch{
-				Query:       query,
-				QueryResult: &mproto.QueryResult{},
-			},
-		},
+func copySchema(t *testing.T, useShardAsSource bool) {
+	ts := memorytopo.NewServer("cell1", "cell2")
+	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
+	vp := NewVtctlPipe(t, ts)
+	defer vp.Close()
+
+	if err := ts.CreateKeyspace(context.Background(), "ks", &topodatapb.Keyspace{
+		ShardingColumnName: "keyspace_id",
+		ShardingColumnType: topodatapb.KeyspaceIdType_UINT64,
+	}); err != nil {
+		t.Fatalf("CreateKeyspace failed: %v", err)
 	}
-}
 
-func (fpc *FakePoolConnection) ExecuteFetch(query string, maxrows int, wantfields bool) (*mproto.QueryResult, error) {
-	if fpc.ExpectedExecuteFetchIndex >= len(fpc.ExpectedExecuteFetch) {
-		fpc.t.Errorf("got unexpected out of bound fetch: %v >= %v", fpc.ExpectedExecuteFetchIndex, len(fpc.ExpectedExecuteFetch))
-		return nil, fmt.Errorf("unexpected out of bound fetch")
-	}
-	expected := fpc.ExpectedExecuteFetch[fpc.ExpectedExecuteFetchIndex].Query
-	if query != expected {
-		fpc.t.Errorf("got unexpected query: %v != %v", query, expected)
-		return nil, fmt.Errorf("unexpected query")
-	}
-	fpc.t.Logf("ExecuteFetch: %v", query)
-	defer func() {
-		fpc.ExpectedExecuteFetchIndex++
-	}()
-	return fpc.ExpectedExecuteFetch[fpc.ExpectedExecuteFetchIndex].QueryResult, nil
-}
-
-func (fpc *FakePoolConnection) ExecuteStreamFetch(query string, callback func(*mproto.QueryResult) error, streamBufferSize int) error {
-	return nil
-}
-
-func (fpc *FakePoolConnection) Id() int64 {
-	return 1
-}
-
-func (fpc *FakePoolConnection) Close() {
-	fpc.Closed = true
-}
-
-func (fpc *FakePoolConnection) IsClosed() bool {
-	return fpc.Closed
-}
-
-func (fpc *FakePoolConnection) Recycle() {
-}
-
-// on the destinations
-func DestinationsFactory(t *testing.T) func() (dbconnpool.PoolConnection, error) {
-	var queryIndex int64 = -1
-
-	return func() (dbconnpool.PoolConnection, error) {
-		qi := atomic.AddInt64(&queryIndex, 1)
-		switch {
-		case qi == 0:
-			return NewFakePoolConnectionQuery(t, "CREATE DATABASE `vt_ks` /*!40100 DEFAULT CHARACTER SET utf8 */"), nil
-		case qi == 1:
-			return NewFakePoolConnectionQuery(t, "CREATE TABLE `vt_ks`.`resharding1` (\n"+
-				"  `id` bigint(20) NOT NULL AUTO_INCREMENT,\n"+
-				"  `msg` varchar(64) DEFAULT NULL,\n"+
-				"  `keyspace_id` bigint(20) unsigned NOT NULL,\n"+
-				"  PRIMARY KEY (`id`),\n"+
-				"  KEY `by_msg` (`msg`)\n"+
-				") ENGINE=InnoDB DEFAULT CHARSET=utf8"), nil
-		case qi == 2:
-			return NewFakePoolConnectionQuery(t, "CREATE TABLE `view1` (\n"+
-				"  `id` bigint(20) NOT NULL AUTO_INCREMENT,\n"+
-				"  `msg` varchar(64) DEFAULT NULL,\n"+
-				"  `keyspace_id` bigint(20) unsigned NOT NULL,\n"+
-				"  PRIMARY KEY (`id`),\n"+
-				"  KEY `by_msg` (`msg`)\n"+
-				") ENGINE=InnoDB DEFAULT CHARSET=utf8"), nil
-		}
-
-		return nil, fmt.Errorf("Unexpected connection")
-	}
-}
-
-func TestCopySchemaShard(t *testing.T) {
-	ts := zktopo.NewTestServer(t, []string{"cell1", "cell2"})
-	wr := wrangler.New(logutil.NewConsoleLogger(), ts, time.Minute, time.Second)
-
+	sourceMasterDb := fakesqldb.New(t).SetName("sourceMasterDb")
+	defer sourceMasterDb.Close()
 	sourceMaster := NewFakeTablet(t, wr, "cell1", 0,
-		topo.TYPE_MASTER, TabletKeyspaceShard(t, "ks", "-80"))
+		topodatapb.TabletType_MASTER, sourceMasterDb, TabletKeyspaceShard(t, "ks", "-80"))
+
+	sourceRdonlyDb := fakesqldb.New(t).SetName("sourceRdonlyDb")
+	defer sourceRdonlyDb.Close()
 	sourceRdonly := NewFakeTablet(t, wr, "cell1", 1,
-		topo.TYPE_RDONLY, TabletKeyspaceShard(t, "ks", "-80"),
-		TabletParent(sourceMaster.Tablet.Alias))
+		topodatapb.TabletType_RDONLY, sourceRdonlyDb, TabletKeyspaceShard(t, "ks", "-80"))
 
+	destinationMasterDb := fakesqldb.New(t).SetName("destinationMasterDb")
+	defer destinationMasterDb.Close()
 	destinationMaster := NewFakeTablet(t, wr, "cell1", 10,
-		topo.TYPE_MASTER, TabletKeyspaceShard(t, "ks", "-40"))
-	// one destination RdOnly, so we know that schema copies propogate from masters
-	destinationRdonly := NewFakeTablet(t, wr, "cell1", 11,
-		topo.TYPE_RDONLY, TabletKeyspaceShard(t, "ks", "-40"),
-		TabletParent(destinationMaster.Tablet.Alias))
+		topodatapb.TabletType_MASTER, destinationMasterDb, TabletKeyspaceShard(t, "ks", "-40"))
 
-	for _, ft := range []*FakeTablet{sourceMaster, sourceRdonly, destinationMaster, destinationRdonly} {
+	for _, ft := range []*FakeTablet{sourceMaster, sourceRdonly, destinationMaster} {
 		ft.StartActionLoop(t, wr)
 		defer ft.StopActionLoop(t)
 	}
 
-	sourceRdonly.FakeMysqlDaemon.Schema = &myproto.SchemaDefinition{
+	schema := &tabletmanagerdatapb.SchemaDefinition{
 		DatabaseSchema: "CREATE DATABASE `{{.DatabaseName}}` /*!40100 DEFAULT CHARACTER SET utf8 */",
-		TableDefinitions: []*myproto.TableDefinition{
-			&myproto.TableDefinition{
+		TableDefinitions: []*tabletmanagerdatapb.TableDefinition{
+			{
 				Name:   "table1",
-				Schema: "CREATE TABLE `resharding1` (\n  `id` bigint(20) NOT NULL AUTO_INCREMENT,\n  `msg` varchar(64) DEFAULT NULL,\n  `keyspace_id` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`id`),\n  KEY `by_msg` (`msg`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8",
-				Type:   myproto.TABLE_BASE_TABLE,
+				Schema: "CREATE TABLE `table1` (\n  `id` bigint(20) NOT NULL AUTO_INCREMENT,\n  `msg` varchar(64) DEFAULT NULL,\n  `keyspace_id` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`id`),\n  KEY `by_msg` (`msg`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8",
+				Type:   tmutils.TableBaseTable,
 			},
-			&myproto.TableDefinition{
+			{
 				Name:   "view1",
 				Schema: "CREATE TABLE `view1` (\n  `id` bigint(20) NOT NULL AUTO_INCREMENT,\n  `msg` varchar(64) DEFAULT NULL,\n  `keyspace_id` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`id`),\n  KEY `by_msg` (`msg`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8",
-				Type:   myproto.TABLE_VIEW,
+				Type:   tmutils.TableView,
 			},
 		},
 	}
+	schemaEmptyDb := &tabletmanagerdatapb.SchemaDefinition{
+		DatabaseSchema:   "CREATE DATABASE `{{.DatabaseName}}` /*!40100 DEFAULT CHARACTER SET utf8 */",
+		TableDefinitions: []*tabletmanagerdatapb.TableDefinition{},
+	}
+	sourceMaster.FakeMysqlDaemon.Schema = schema
+	sourceRdonly.FakeMysqlDaemon.Schema = schema
 
-	destinationMaster.FakeMysqlDaemon.DbaConnectionFactory = DestinationsFactory(t)
-	destinationRdonly.FakeMysqlDaemon.DbaConnectionFactory = DestinationsFactory(t)
+	changeToDb := "USE vt_ks"
+	createDb := "CREATE DATABASE `vt_ks` /*!40100 DEFAULT CHARACTER SET utf8 */"
+	createTable := "CREATE TABLE `vt_ks`.`table1` (\n" +
+		"  `id` bigint(20) NOT NULL AUTO_INCREMENT,\n" +
+		"  `msg` varchar(64) DEFAULT NULL,\n" +
+		"  `keyspace_id` bigint(20) unsigned NOT NULL,\n" +
+		"  PRIMARY KEY (`id`),\n" +
+		"  KEY `by_msg` (`msg`)\n" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8"
+	createTableView := "CREATE TABLE `view1` (\n" +
+		"  `id` bigint(20) NOT NULL AUTO_INCREMENT,\n" +
+		"  `msg` varchar(64) DEFAULT NULL,\n" +
+		"  `keyspace_id` bigint(20) unsigned NOT NULL,\n" +
+		"  PRIMARY KEY (`id`),\n" +
+		"  KEY `by_msg` (`msg`)\n" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8"
+	selectInformationSchema := "SELECT 1 FROM information_schema.tables WHERE table_schema = '_vt' AND table_name = 'shard_metadata'"
+	selectShardMetadata := "SELECT name, value FROM _vt.shard_metadata"
 
-	if err := wr.CopySchemaShard(sourceRdonly.Tablet.Alias, nil, nil, true, "ks", "-40"); err != nil {
+	// The source table is asked about its schema.
+	// It may be the master or the rdonly.
+	sourceDb := sourceRdonlyDb
+	if useShardAsSource {
+		sourceDb = sourceMasterDb
+	}
+	sourceDb.AddQuery(changeToDb, &sqltypes.Result{})
+	sourceDb.AddQuery(selectInformationSchema, &sqltypes.Result{
+		Fields: []*querypb.Field{
+			{
+				Type: querypb.Type_INT64,
+			},
+		},
+		Rows: [][]sqltypes.Value{
+			{
+				sqltypes.Value{},
+			},
+		},
+	})
+	sourceDb.AddQuery(selectShardMetadata, &sqltypes.Result{})
+
+	// The destination table is asked to create the new schema.
+	destinationMasterDb.AddQuery(changeToDb, &sqltypes.Result{})
+	destinationMasterDb.AddQuery(createDb, &sqltypes.Result{})
+	destinationMasterDb.AddQuery(createTable, &sqltypes.Result{})
+	destinationMasterDb.AddQuery(createTableView, &sqltypes.Result{})
+
+	destinationMaster.FakeMysqlDaemon.SchemaFunc = func() (*tabletmanagerdatapb.SchemaDefinition, error) {
+		if destinationMasterDb.GetQueryCalledNum(createTableView) == 1 {
+			return schema, nil
+		}
+		return schemaEmptyDb, nil
+	}
+
+	source := topoproto.TabletAliasString(sourceRdonly.Tablet.Alias)
+	if useShardAsSource {
+		source = "ks/-80"
+	}
+	if err := vp.Run([]string{"CopySchemaShard", "-include-views", source, "ks/-40"}); err != nil {
 		t.Fatalf("CopySchemaShard failed: %v", err)
 	}
 
+	// Check call count on the source.
+	if count := sourceDb.GetQueryCalledNum(changeToDb); count != 2 {
+		t.Errorf("CopySchemaShard did not change to the db 2 times. Query count: %v", count)
+	}
+	if count := sourceDb.GetQueryCalledNum(selectInformationSchema); count != 1 {
+		t.Errorf("CopySchemaShard did not select data from information_schema.tables exactly once. Query count: %v", count)
+	}
+	if count := sourceDb.GetQueryCalledNum(selectShardMetadata); count != 1 {
+		t.Errorf("CopySchemaShard did not select data from _vt.shard_metadata exactly once. Query count: %v", count)
+	}
+
+	// Check call count on destinationMasterDb
+	if count := destinationMasterDb.GetQueryCalledNum(createDb); count != 1 {
+		t.Errorf("CopySchemaShard did not create the db exactly once. Query count: %v", count)
+	}
+	if count := destinationMasterDb.GetQueryCalledNum(createTable); count != 1 {
+		t.Errorf("CopySchemaShard did not create the table exactly once. Query count: %v", count)
+	}
+	if count := destinationMasterDb.GetQueryCalledNum(createTableView); count != 1 {
+		t.Errorf("CopySchemaShard did not create the table view exactly once. Query count: %v", count)
+	}
 }

@@ -1,3 +1,19 @@
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreedto in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package servenv
 
 import (
@@ -6,6 +22,7 @@ import (
 	"html"
 	"html/template"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -13,8 +30,8 @@ import (
 	"sync"
 	"time"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/acl"
+	"vitess.io/vitess/go/acl"
+	"vitess.io/vitess/go/vt/log"
 )
 
 var (
@@ -42,8 +59,8 @@ func AddStatusFuncs(fmap template.FuncMap) {
 	defer statusMu.Unlock()
 
 	for name, fun := range fmap {
-		if !strings.HasPrefix(name, "github_com_youtube_vitess_") {
-			panic("status func registered without proper prefix, need github_com_youtube_vitess_:" + name)
+		if !strings.HasPrefix(name, "github_com_vitessio_vitess_") {
+			panic("status func registered without proper prefix, need github_com_vitessio_vitess_:" + name)
 		}
 		if _, ok := statusFuncMap[name]; ok {
 			panic("duplicate status func registered: " + name)
@@ -131,7 +148,7 @@ func AddStatusPart(banner, frag string, f func() interface{}) {
 	if err != nil {
 		secs[len(secs)-1] = section{
 			Banner:   banner,
-			Fragment: "<code>bad statusz template: {{.}}</code>",
+			Fragment: "<code>bad status template: {{.}}</code>",
 			F:        func() interface{} { return err },
 		}
 	}
@@ -168,7 +185,9 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := statusTmpl.ExecuteTemplate(w, "status", data); err != nil {
-		log.Errorf("servenv: couldn't execute template: %v", err)
+		if _, ok := err.(net.Error); !ok {
+			log.Errorf("servenv: couldn't execute template: %v", err)
+		}
 	}
 }
 
@@ -181,7 +200,7 @@ func init() {
 	var err error
 	hostname, err = os.Hostname()
 	if err != nil {
-		log.Fatalf("os.Hostname: %v", err)
+		log.Exitf("os.Hostname: %v", err)
 	}
 	http.HandleFunc("/debug/status", statusHandler)
 }

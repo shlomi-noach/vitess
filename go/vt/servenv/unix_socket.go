@@ -1,99 +1,61 @@
-// Copyright 2014, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package servenv
 
 import (
 	"flag"
 	"net"
-	"net/http"
 	"os"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/rpcplus"
-	"github.com/youtube/vitess/go/rpcwrap"
-	"github.com/youtube/vitess/go/rpcwrap/bsonrpc"
+	"vitess.io/vitess/go/vt/log"
 )
 
 var (
-	// The flags used when calling RegisterDefaultSocketFileFlags.
+	// SocketFile has the flag used when calling
+	// RegisterDefaultSocketFileFlags.
 	SocketFile *string
-
-	// The rpc servers to use
-	socketFileRpcServer              = rpcplus.NewServer()
-	authenticatedSocketFileRpcServer = rpcplus.NewServer()
 )
 
-// socketFileRegister registers the provided server to be served on the
-// SocketFile, if enabled by the service map.
-func socketFileRegister(name string, rcvr interface{}) {
+// serveSocketFile listen to the named socket and serves RPCs on it.
+func serveSocketFile() {
 	if SocketFile == nil || *SocketFile == "" {
-		return
-	}
-	if ServiceMap["bsonrpc-unix-"+name] {
-		log.Infof("Registering %v for bsonrpc over unix socket, disable it with -bsonrpc-unix-%v service_map parameter", name, name)
-		socketFileRpcServer.Register(rcvr)
-	} else {
-		log.Infof("Not registering %v for bsonrpc over unix socket, enable it with bsonrpc-unix-%v service_map parameter", name, name)
-	}
-	if ServiceMap["bsonrpc-auth-unix-"+name] {
-		log.Infof("Registering %v for SASL bsonrpc over unix socket, disable it with -bsonrpc-auth-unix-%v service_map parameter", name, name)
-		authenticatedSocketFileRpcServer.Register(rcvr)
-	} else {
-		log.Infof("Not registering %v for SASL bsonrpc over unix socket, enable it with bsonrpc-auth-unix-%v service_map parameter", name, name)
-	}
-}
-
-// ServeSocketFile listen to the named socket and serves RPCs on it.
-func ServeSocketFile(name string) {
-	if name == "" {
 		log.Infof("Not listening on socket file")
 		return
 	}
+	name := *SocketFile
 
 	// try to delete if file exists
 	if _, err := os.Stat(name); err == nil {
 		err = os.Remove(name)
 		if err != nil {
-			log.Fatalf("Cannot remove socket file %v: %v", name, err)
+			log.Exitf("Cannot remove socket file %v: %v", name, err)
 		}
 	}
 
 	l, err := net.Listen("unix", name)
 	if err != nil {
-		log.Fatalf("Error listening on socket file %v: %v", name, err)
+		log.Exitf("Error listening on socket file %v: %v", name, err)
 	}
-	log.Infof("Listening on socket file %v", name)
-
-	// HandleHTTP registers the default GOB handler at /_goRPC_
-	// and the debug RPC service at /debug/rpc (it displays a list
-	// of registered services and their methods).
-	if ServiceMap["gob-unix"] {
-		log.Infof("Registering GOB handler and /debug/rpc URL for unix socket")
-		socketFileRpcServer.HandleHTTP(rpcwrap.GetRpcPath("gob", false), rpcplus.DefaultDebugPath)
-	}
-	if ServiceMap["gob-auth-unix"] {
-		log.Infof("Registering GOB handler and /debug/rpcs URL for SASL unix socket")
-		authenticatedSocketFileRpcServer.HandleHTTP(rpcwrap.GetRpcPath("gob", true), rpcplus.DefaultDebugPath+"s")
-	}
-
-	handler := http.NewServeMux()
-	bsonrpc.ServeCustomRPC(handler, socketFileRpcServer, false)
-	bsonrpc.ServeCustomRPC(handler, authenticatedSocketFileRpcServer, true)
-	httpServer := http.Server{
-		Handler: handler,
-	}
-	go httpServer.Serve(l)
+	log.Infof("Listening on socket file %v for gRPC", name)
+	go GRPCServer.Serve(l)
 }
 
 // RegisterDefaultSocketFileFlags registers the default flags for listening
-// to a socket. It also registers an OnRun callback to enable the listening
-// socket.
-// This needs to be called before flags are parsed.
+// to a socket. This needs to be called before flags are parsed.
 func RegisterDefaultSocketFileFlags() {
 	SocketFile = flag.String("socket_file", "", "Local unix socket file to listen on")
-	OnRun(func() {
-		ServeSocketFile(*SocketFile)
-	})
 }

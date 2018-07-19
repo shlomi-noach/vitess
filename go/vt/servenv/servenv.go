@@ -1,6 +1,18 @@
-// Copyright 2012, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 // Package servenv contains functionality that is common for all
 // Vitess server programs.  It defines and initializes command line
@@ -14,7 +26,6 @@
 // a vitess distribution, register them using onInit and onClose. A
 // clean way of achieving that is adding to this package a file with
 // an init() function that registers the hooks.
-
 package servenv
 
 import (
@@ -22,27 +33,32 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	// register the HTTP handlers for profiling
 	_ "net/http/pprof"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/event"
-	"github.com/youtube/vitess/go/netutil"
-	"github.com/youtube/vitess/go/stats"
-	_ "github.com/youtube/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/event"
+	"vitess.io/vitess/go/netutil"
+	"vitess.io/vitess/go/stats"
+	"vitess.io/vitess/go/vt/log"
+
+	// register the proper init and shutdown hooks for logging
+	_ "vitess.io/vitess/go/vt/logutil"
 )
 
 var (
-	// The flags used when calling RegisterDefaultFlags.
+	// Port is part of the flags used when calling RegisterDefaultFlags.
 	Port *int
 
 	// Flags to alter the behavior of the library.
-	lameduckPeriod = flag.Duration("lameduck-period", 50*time.Millisecond, "keep running at least this long after SIGTERM before stopping")
-	onTermTimeout  = flag.Duration("onterm_timeout", 10*time.Second, "wait no more than this for OnTermSync handlers before stopping")
-	memProfileRate = flag.Int("mem-profile-rate", 512*1024, "profile every n bytes allocated")
+	lameduckPeriod       = flag.Duration("lameduck-period", 50*time.Millisecond, "keep running at least this long after SIGTERM before stopping")
+	onTermTimeout        = flag.Duration("onterm_timeout", 10*time.Second, "wait no more than this for OnTermSync handlers before stopping")
+	memProfileRate       = flag.Int("mem-profile-rate", 512*1024, "profile every n bytes allocated")
+	mutexProfileFraction = flag.Int("mutex-profile-fraction", 0, "profile every n mutex contention events (see runtime.SetMutexProfileFraction)")
 
 	// mutex used to protect the Init function
 	mu sync.Mutex
@@ -53,10 +69,11 @@ var (
 	onRunHooks      event.Hooks
 	inited          bool
 
-	// filled in when calling Run
+	// ListeningURL is filled in when calling Run, contains the server URL.
 	ListeningURL url.URL
 )
 
+// Init is the first phase of the server startup.
 func Init() {
 	mu.Lock()
 	defer mu.Unlock()
@@ -68,13 +85,14 @@ func Init() {
 	// Once you run as root, you pretty much destroy the chances of a
 	// non-privileged user starting the program correctly.
 	if uid := os.Getuid(); uid == 0 {
-		log.Fatalf("servenv.Init: running this as root makes no sense")
+		log.Exitf("servenv.Init: running this as root makes no sense")
 	}
 
 	runtime.MemProfileRate = *memProfileRate
-	gomaxprocs := os.Getenv("GOMAXPROCS")
-	if gomaxprocs == "" {
-		gomaxprocs = "1"
+
+	if *mutexProfileFraction != 0 {
+		log.Infof("setting mutex profile fraction to %v", *mutexProfileFraction)
+		runtime.SetMutexProfileFraction(*mutexProfileFraction)
 	}
 
 	// We used to set this limit directly, but you pretty much have to
@@ -86,23 +104,23 @@ func Init() {
 	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, fdLimit); err != nil {
 		log.Errorf("max-open-fds failed: %v", err)
 	}
-	fdl := stats.NewInt("MaxFds")
+	fdl := stats.NewGauge("MaxFds", "File descriptor limit")
 	fdl.Set(int64(fdLimit.Cur))
 
 	onInitHooks.Fire()
 }
 
-func populateListeningURL() {
+func populateListeningURL(port int32) {
 	host, err := netutil.FullyQualifiedHostname()
 	if err != nil {
 		host, err = os.Hostname()
 		if err != nil {
-			log.Fatalf("os.Hostname() failed: %v", err)
+			log.Exitf("os.Hostname() failed: %v", err)
 		}
 	}
 	ListeningURL = url.URL{
 		Scheme: "http",
-		Host:   netutil.JoinHostPort(host, *Port),
+		Host:   netutil.JoinHostPort(host, port),
 		Path:   "/",
 	}
 }
@@ -164,6 +182,13 @@ func OnRun(f func()) {
 	onRunHooks.Add(f)
 }
 
+// FireRunHooks fires the hooks registered by OnHook.
+// Use this in a non-server to run the hooks registered
+// by servenv.OnRun().
+func FireRunHooks() {
+	onRunHooks.Fire()
+}
+
 // RegisterDefaultFlags registers the default flags for
 // listening to a given port for standard connections.
 // If calling this, then call RunDefault()
@@ -174,4 +199,38 @@ func RegisterDefaultFlags() {
 // RunDefault calls Run() with the parameters from the flags.
 func RunDefault() {
 	Run(*Port)
+}
+
+// ParseFlags initializes flags and handles the common case when no positional
+// arguments are expected.
+func ParseFlags(cmd string) {
+	flag.Parse()
+
+	if *Version {
+		AppVersion.Print()
+		os.Exit(0)
+	}
+
+	args := flag.Args()
+	if len(args) > 0 {
+		flag.Usage()
+		log.Exitf("%s doesn't take any positional arguments, got '%s'", cmd, strings.Join(args, " "))
+	}
+}
+
+// ParseFlagsWithArgs initializes flags and returns the positional arguments
+func ParseFlagsWithArgs(cmd string) []string {
+	flag.Parse()
+
+	if *Version {
+		AppVersion.Print()
+		os.Exit(0)
+	}
+
+	args := flag.Args()
+	if len(args) == 0 {
+		log.Exitf("%s expected at least one positional argument", cmd)
+	}
+
+	return args
 }

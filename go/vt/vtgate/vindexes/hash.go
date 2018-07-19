@@ -1,186 +1,108 @@
-// Copyright 2014, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package vindexes
 
 import (
+	"bytes"
 	"crypto/cipher"
 	"crypto/des"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 
-	"github.com/youtube/vitess/go/vt/key"
-	tproto "github.com/youtube/vitess/go/vt/tabletserver/proto"
-	"github.com/youtube/vitess/go/vt/vtgate/planbuilder"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/key"
+)
+
+var (
+	_ Vindex     = (*Hash)(nil)
+	_ Reversible = (*Hash)(nil)
 )
 
 // Hash defines vindex that hashes an int64 to a KeyspaceId
 // by using null-key 3DES hash. It's Unique, Reversible and
 // Functional.
 type Hash struct {
-	hv HashAuto
+	name string
 }
 
 // NewHash creates a new Hash.
-func NewHash(m map[string]interface{}) (planbuilder.Vindex, error) {
-	h := &Hash{}
-	h.hv.Init(m)
-	return h, nil
+func NewHash(name string, m map[string]string) (Vindex, error) {
+	return &Hash{name: name}, nil
+}
+
+// String returns the name of the vindex.
+func (vind *Hash) String() string {
+	return vind.name
 }
 
 // Cost returns the cost of this index as 1.
 func (vind *Hash) Cost() int {
-	return vind.hv.Cost()
-}
-
-// Map returns the corresponding KeyspaceId values for the given ids.
-func (vind *Hash) Map(_ planbuilder.VCursor, ids []interface{}) ([]key.KeyspaceId, error) {
-	return vind.hv.Map(nil, ids)
-}
-
-// Verify returns true if id maps to ksid.
-func (vind *Hash) Verify(_ planbuilder.VCursor, id interface{}, ksid key.KeyspaceId) (bool, error) {
-	return vind.hv.Verify(nil, id, ksid)
-}
-
-// ReverseMap returns the id from ksid.
-func (vind *Hash) ReverseMap(_ planbuilder.VCursor, ksid key.KeyspaceId) (interface{}, error) {
-	return vind.hv.ReverseMap(nil, ksid)
-}
-
-// Create reserves the id by inserting it into the vindex table.
-func (vind *Hash) Create(vcursor planbuilder.VCursor, id interface{}) error {
-	return vind.hv.Create(vcursor, id)
-}
-
-// Delete deletes the entry from the vindex table.
-func (vind *Hash) Delete(vcursor planbuilder.VCursor, ids []interface{}, _ key.KeyspaceId) error {
-	return vind.hv.Delete(vcursor, ids, "")
-}
-
-// HashAuto defines vindex that hashes an int64 to a KeyspaceId
-// by using null-key 3DES hash. It's Unique, Reversible and
-// Functional. Additionally, it's also a FunctionalGenerator
-// because it's capable of generating new values from a vindex table
-// with a single unique autoinc column.
-type HashAuto struct {
-	Table, Column string
-	ins, del      string
-}
-
-// NewHashAuto creates a new HashAuto.
-func NewHashAuto(m map[string]interface{}) (planbuilder.Vindex, error) {
-	hva := &HashAuto{}
-	hva.Init(m)
-	return hva, nil
-}
-
-// Init initializes HashAuto.
-func (vind *HashAuto) Init(m map[string]interface{}) {
-	get := func(name string) string {
-		v, _ := m[name].(string)
-		return v
-	}
-	t := get("Table")
-	c := get("Column")
-	vind.Table = t
-	vind.Column = c
-	vind.ins = fmt.Sprintf("insert into %s(%s) values(:%s)", t, c, c)
-	vind.del = fmt.Sprintf("delete from %s where %s in ::%s", t, c, c)
-}
-
-// Cost returns the cost of this index as 1.
-func (vind *HashAuto) Cost() int {
 	return 1
 }
 
-// Map returns the corresponding KeyspaceId values for the given ids.
-func (vind *HashAuto) Map(_ planbuilder.VCursor, ids []interface{}) ([]key.KeyspaceId, error) {
-	out := make([]key.KeyspaceId, 0, len(ids))
-	for _, id := range ids {
-		num, err := getNumber(id)
+// IsUnique returns true since the Vindex is unique.
+func (vind *Hash) IsUnique() bool {
+	return true
+}
+
+// IsFunctional returns true since the Vindex is functional.
+func (vind *Hash) IsFunctional() bool {
+	return true
+}
+
+// Map can map ids to key.Destination objects.
+func (vind *Hash) Map(cursor VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
+	out := make([]key.Destination, len(ids))
+	for i, id := range ids {
+		num, err := sqltypes.ToUint64(id)
 		if err != nil {
-			return nil, fmt.Errorf("hash.Map: %v", err)
+			out[i] = key.DestinationNone{}
+			continue
 		}
-		out = append(out, vhash(num))
+		out[i] = key.DestinationKeyspaceID(vhash(num))
 	}
 	return out, nil
 }
 
-// Verify returns true if id maps to ksid.
-func (vind *HashAuto) Verify(_ planbuilder.VCursor, id interface{}, ksid key.KeyspaceId) (bool, error) {
-	num, err := getNumber(id)
-	if err != nil {
-		return false, fmt.Errorf("hash.Verify: %v", err)
+// Verify returns true if ids maps to ksids.
+func (vind *Hash) Verify(_ VCursor, ids []sqltypes.Value, ksids [][]byte) ([]bool, error) {
+	out := make([]bool, len(ids))
+	for i := range ids {
+		num, err := sqltypes.ToUint64(ids[i])
+		if err != nil {
+			return nil, fmt.Errorf("hash.Verify: %v", err)
+		}
+		out[i] = (bytes.Compare(vhash(num), ksids[i]) == 0)
 	}
-	return vhash(num) == ksid, nil
+	return out, nil
 }
 
-// ReverseMap returns the id from ksid.
-func (vind *HashAuto) ReverseMap(_ planbuilder.VCursor, ksid key.KeyspaceId) (interface{}, error) {
-	return vunhash(ksid)
-}
-
-// Create reserves the id by inserting it into the vindex table.
-func (vind *HashAuto) Create(vcursor planbuilder.VCursor, id interface{}) error {
-	bq := &tproto.BoundQuery{
-		Sql: vind.ins,
-		BindVariables: map[string]interface{}{
-			vind.Column: id,
-		},
+// ReverseMap returns the ids from ksids.
+func (vind *Hash) ReverseMap(_ VCursor, ksids [][]byte) ([]sqltypes.Value, error) {
+	reverseIds := make([]sqltypes.Value, 0, len(ksids))
+	for _, keyspaceID := range ksids {
+		val, err := vunhash(keyspaceID)
+		if err != nil {
+			return reverseIds, err
+		}
+		reverseIds = append(reverseIds, sqltypes.NewUint64(val))
 	}
-	if _, err := vcursor.Execute(bq); err != nil {
-		return fmt.Errorf("hash.Create: %v", err)
-	}
-	return nil
-}
-
-// Generate generates a new id by using the autoinc of the vindex table.
-func (vind *HashAuto) Generate(vcursor planbuilder.VCursor) (id int64, err error) {
-	bq := &tproto.BoundQuery{
-		Sql: vind.ins,
-		BindVariables: map[string]interface{}{
-			vind.Column: nil,
-		},
-	}
-	result, err := vcursor.Execute(bq)
-	if err != nil {
-		return 0, fmt.Errorf("hash.Generate: %v", err)
-	}
-	return int64(result.InsertId), err
-}
-
-// Delete deletes the entry from the vindex table.
-func (vind *HashAuto) Delete(vcursor planbuilder.VCursor, ids []interface{}, _ key.KeyspaceId) error {
-	bq := &tproto.BoundQuery{
-		Sql: vind.del,
-		BindVariables: map[string]interface{}{
-			vind.Column: ids,
-		},
-	}
-	if _, err := vcursor.Execute(bq); err != nil {
-		return fmt.Errorf("hash.Delete: %v", err)
-	}
-	return nil
-}
-
-func getNumber(v interface{}) (int64, error) {
-	switch v := v.(type) {
-	case int:
-		return int64(v), nil
-	case int32:
-		return int64(v), nil
-	case int64:
-		return v, nil
-	case uint:
-		return int64(v), nil
-	case uint32:
-		return int64(v), nil
-	case uint64:
-		return int64(v), nil
-	}
-	return 0, fmt.Errorf("unexpected type for %v: %T", v, v)
+	return reverseIds, nil
 }
 
 var block3DES cipher.Block
@@ -191,22 +113,21 @@ func init() {
 	if err != nil {
 		panic(err)
 	}
-	planbuilder.Register("hash", NewHash)
-	planbuilder.Register("hash_autoinc", NewHashAuto)
+	Register("hash", NewHash)
 }
 
-func vhash(shardKey int64) key.KeyspaceId {
+func vhash(shardKey uint64) []byte {
 	var keybytes, hashed [8]byte
-	binary.BigEndian.PutUint64(keybytes[:], uint64(shardKey))
+	binary.BigEndian.PutUint64(keybytes[:], shardKey)
 	block3DES.Encrypt(hashed[:], keybytes[:])
-	return key.KeyspaceId(hashed[:])
+	return []byte(hashed[:])
 }
 
-func vunhash(k key.KeyspaceId) (int64, error) {
+func vunhash(k []byte) (uint64, error) {
 	if len(k) != 8 {
-		return 0, fmt.Errorf("invalid keyspace id: %v", k)
+		return 0, fmt.Errorf("invalid keyspace id: %v", hex.EncodeToString(k))
 	}
 	var unhashed [8]byte
-	block3DES.Decrypt(unhashed[:], []byte(k))
-	return int64(binary.BigEndian.Uint64(unhashed[:])), nil
+	block3DES.Decrypt(unhashed[:], k)
+	return binary.BigEndian.Uint64(unhashed[:]), nil
 }

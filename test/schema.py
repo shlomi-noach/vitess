@@ -1,11 +1,28 @@
 #!/usr/bin/env python
 
+# Copyright 2017 Google Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+import os
+
 import logging
 import unittest
 
 import environment
-import utils
 import tablet
+import utils
 
 shard_0_master = tablet.Tablet()
 shard_0_replica1 = tablet.Tablet()
@@ -17,263 +34,344 @@ shard_1_replica1 = tablet.Tablet()
 shard_2_master = tablet.Tablet()
 shard_2_replica1 = tablet.Tablet()
 
+# shard_2 tablets shouldn't exist yet when _apply_initial_schema() is called.
+initial_tablets = [
+    shard_0_master, shard_0_replica1, shard_0_replica2, shard_0_rdonly,
+    shard_0_backup, shard_1_master, shard_1_replica1,
+]
+shard_2_tablets = [shard_2_master, shard_2_replica1]
+all_tablets = initial_tablets + shard_2_tablets
+
+test_keyspace = 'test_keyspace'
+db_name = 'vt_' + test_keyspace
+
 
 def setUpModule():
   try:
     environment.topo_server().setup()
 
-    setup_procs = [
-        shard_0_master.init_mysql(),
-        shard_0_replica1.init_mysql(),
-        shard_0_replica2.init_mysql(),
-        shard_0_rdonly.init_mysql(),
-        shard_0_backup.init_mysql(),
-        shard_1_master.init_mysql(),
-        shard_1_replica1.init_mysql(),
-        shard_2_master.init_mysql(),
-        shard_2_replica1.init_mysql(),
-        ]
-    utils.wait_procs(setup_procs)
-  except:
-    tearDownModule()
-    raise
+    _init_mysql(all_tablets)
+
+    utils.run_vtctl(['CreateKeyspace', test_keyspace])
+
+    utils.Vtctld().start(enable_schema_change_dir=True)
+
+  except Exception as setup_exception:  # pylint: disable=broad-except
+    try:
+      tearDownModule()
+    except Exception as e:  # pylint: disable=broad-except
+      logging.exception('Tearing down a failed setUpModule() failed: %s', e)
+    raise setup_exception
+
+
+def _init_mysql(tablets):
+  setup_procs = []
+  for t in tablets:
+    setup_procs.append(t.init_mysql())
+  utils.wait_procs(setup_procs)
+
+
+def _setup_shard_2():
+  shard_2_master.init_tablet('replica', test_keyspace, '2')
+  shard_2_replica1.init_tablet('replica', test_keyspace, '2')
+
+  # create databases, start the tablets
+  for t in shard_2_tablets:
+    t.create_db(db_name)
+    t.start_vttablet(wait_for_state=None)
+
+  # wait for the tablets to start
+  shard_2_master.wait_for_vttablet_state('NOT_SERVING')
+  shard_2_replica1.wait_for_vttablet_state('NOT_SERVING')
+
+  utils.run_vtctl(['InitShardMaster', '-force', test_keyspace + '/2',
+                   shard_2_master.tablet_alias], auto_log=True)
+  utils.run_vtctl(['ValidateKeyspace', '-ping-tablets', test_keyspace])
+
+
+def _teardown_shard_2():
+  tablet.kill_tablets(shard_2_tablets)
+
+  utils.run_vtctl(
+      ['DeleteShard', '-recursive', '-even_if_serving', 'test_keyspace/2'],
+      auto_log=True)
+
+  for t in shard_2_tablets:
+    t.reset_replication()
+    t.set_semi_sync_enabled(master=False)
+    t.clean_dbs()
+
 
 def tearDownModule():
+  utils.required_teardown()
   if utils.options.skip_teardown:
     return
 
-  teardown_procs = [
-      shard_0_master.teardown_mysql(),
-      shard_0_replica1.teardown_mysql(),
-      shard_0_replica2.teardown_mysql(),
-      shard_0_rdonly.teardown_mysql(),
-      shard_0_backup.teardown_mysql(),
-      shard_1_master.teardown_mysql(),
-      shard_1_replica1.teardown_mysql(),
-      shard_2_master.teardown_mysql(),
-      shard_2_replica1.teardown_mysql(),
-      ]
+  teardown_procs = []
+  for t in all_tablets:
+    teardown_procs.append(t.teardown_mysql())
   utils.wait_procs(teardown_procs, raise_on_error=False)
 
   environment.topo_server().teardown()
   utils.kill_sub_processes()
   utils.remove_tmp_files()
 
-  shard_0_master.remove_tree()
-  shard_0_replica1.remove_tree()
-  shard_0_replica2.remove_tree()
-  shard_0_rdonly.remove_tree()
-  shard_0_backup.remove_tree()
-  shard_1_master.remove_tree()
-  shard_1_replica1.remove_tree()
-  shard_2_master.remove_tree()
-  shard_2_replica1.remove_tree()
+  for t in all_tablets:
+    t.remove_tree()
 
-# statements to create the table
-create_vt_select_test = [
-    ('''create table vt_select_test%d (
-id bigint not null,
-msg varchar(64),
-primary key (id)
-) Engine=InnoDB''' % x).replace("\n", "")
-    for x in xrange(4)]
 
 class TestSchema(unittest.TestCase):
 
-  def _check_tables(self, tablet, expectedCount):
-    tables = tablet.mquery('vt_test_keyspace', 'show tables')
-    self.assertEqual(len(tables), expectedCount,
-                     'Unexpected table count on %s (not %u): %s' %
-                     (tablet.tablet_alias, expectedCount, str(tables)))
-
-  def _check_db_not_created(self, tablet):
-    # Broadly catch all exceptions, since the exception being raised is internal to MySQL.
-    # We're strictly checking the error message though, so should be fine.
-    with self.assertRaisesRegexp(Exception, '(1049, "Unknown database \'vt_test_keyspace\'")'):
-      tables = tablet.mquery('vt_test_keyspace', 'show tables')
-
-  def test_complex_schema(self):
-
-    utils.run_vtctl(['CreateKeyspace', 'test_keyspace'])
-
-    shard_0_master.init_tablet(  'master',  'test_keyspace', '0')
-    shard_0_replica1.init_tablet('replica', 'test_keyspace', '0')
-    shard_0_replica2.init_tablet('replica', 'test_keyspace', '0')
-    shard_0_rdonly.init_tablet(  'rdonly',  'test_keyspace', '0')
-    shard_0_backup.init_tablet(  'backup',  'test_keyspace', '0')
-    shard_1_master.init_tablet(  'master',  'test_keyspace', '1')
-    shard_1_replica1.init_tablet('replica', 'test_keyspace', '1')
-    shard_2_master.init_tablet(  'master',  'test_keyspace', '2')
-    shard_2_replica1.init_tablet('replica', 'test_keyspace', '2')
-
-    utils.run_vtctl(['RebuildKeyspaceGraph', 'test_keyspace'], auto_log=True)
-
-    # run checks now before we start the tablets
-    utils.validate_topology()
+  def setUp(self):
+    shard_0_master.init_tablet('replica', test_keyspace, '0')
+    shard_0_replica1.init_tablet('replica', test_keyspace, '0')
+    shard_0_replica2.init_tablet('replica', test_keyspace, '0')
+    shard_0_rdonly.init_tablet('rdonly', test_keyspace, '0')
+    shard_0_backup.init_tablet('backup', test_keyspace, '0')
+    shard_1_master.init_tablet('replica', test_keyspace, '1')
+    shard_1_replica1.init_tablet('replica', test_keyspace, '1')
 
     # create databases, start the tablets
-    for t in [shard_0_master, shard_0_replica1, shard_0_replica2,
-              shard_0_rdonly, shard_0_backup, shard_1_master, shard_1_replica1]:
-      t.create_db('vt_test_keyspace')
+    for t in initial_tablets:
+      t.create_db(db_name)
       t.start_vttablet(wait_for_state=None)
 
-    # we intentionally don't want to create db on these tablets
-    shard_2_master.start_vttablet(wait_for_state=None)
-    shard_2_replica1.start_vttablet(wait_for_state=None)
-
     # wait for the tablets to start
-    shard_0_master.wait_for_vttablet_state('SERVING')
-    shard_0_replica1.wait_for_vttablet_state('SERVING')
-    shard_0_replica2.wait_for_vttablet_state('SERVING')
-    shard_0_rdonly.wait_for_vttablet_state('SERVING')
-    shard_0_backup.wait_for_vttablet_state('NOT_SERVING')
-    shard_1_master.wait_for_vttablet_state('SERVING')
-    shard_1_replica1.wait_for_vttablet_state('SERVING')
-    shard_2_master.wait_for_vttablet_state('NOT_SERVING')
-    shard_2_replica1.wait_for_vttablet_state('NOT_SERVING')
+    for t in initial_tablets:
+      t.wait_for_vttablet_state('NOT_SERVING')
 
-    # make sure all replication is good
-    for t in [shard_0_master, shard_0_replica1, shard_0_replica2,
-              shard_0_rdonly, shard_0_backup, shard_1_master, shard_1_replica1, shard_2_master, shard_2_replica1]:
+    utils.run_vtctl(['InitShardMaster', '-force', test_keyspace + '/0',
+                     shard_0_master.tablet_alias], auto_log=True)
+    utils.run_vtctl(['InitShardMaster', '-force', test_keyspace + '/1',
+                     shard_1_master.tablet_alias], auto_log=True)
+
+  def tearDown(self):
+    # kill all tablets
+    tablet.kill_tablets(initial_tablets)
+
+    for t in initial_tablets:
       t.reset_replication()
-    utils.run_vtctl(['ReparentShard', '-force', 'test_keyspace/0', shard_0_master.tablet_alias], auto_log=True)
-    utils.run_vtctl(['ReparentShard', '-force', 'test_keyspace/1', shard_1_master.tablet_alias], auto_log=True)
-    utils.run_vtctl(['ReparentShard', '-force', 'test_keyspace/2', shard_2_master.tablet_alias], auto_log=True)
-    utils.run_vtctl(['ValidateKeyspace', '-ping-tablets', 'test_keyspace'])
+      t.set_semi_sync_enabled(master=False)
+      t.clean_dbs()
 
-    # check after all tablets are here and replication is fixed
-    utils.validate_topology(ping_tablets=True)
+    utils.run_vtctl(['DeleteShard', '-recursive', '-even_if_serving',
+                     test_keyspace + '/0'], auto_log=True)
+    utils.run_vtctl(['DeleteShard', '-recursive', '-even_if_serving',
+                     test_keyspace + '/1'], auto_log=True)
 
-    # shard 0: apply the schema using a complex schema upgrade, no
-    # reparenting yet
-    utils.run_vtctl(['ApplySchemaShard',
-                     '-sql='+create_vt_select_test[0],
-                     'test_keyspace/0'],
-                    auto_log=True)
-
-    # check all expected hosts have the change:
-    # - master won't have it as it's a complex change
-    self._check_tables(shard_0_master, 0)
-    self._check_tables(shard_0_replica1, 1)
-    self._check_tables(shard_0_replica2, 1)
-    self._check_tables(shard_0_rdonly, 1)
-    self._check_tables(shard_0_backup, 1)
-    self._check_tables(shard_1_master, 0)
-    self._check_tables(shard_1_replica1, 0)
-
-    # shard 0: apply schema change to just master directly
-    # (to test its state is not changed)
-    utils.run_vtctl(['ApplySchema',
-                     '-stop-replication',
-                     '-sql='+create_vt_select_test[0],
-                     shard_0_master.tablet_alias],
-                    auto_log=True)
-    self._check_tables(shard_0_master, 1)
-
-    # shard 0: apply new schema change, with reparenting
-    utils.run_vtctl(['ApplySchemaShard',
-                     '-new-parent='+shard_0_replica1.tablet_alias,
-                     '-sql='+create_vt_select_test[1],
-                     'test_keyspace/0'],
-                    auto_log=True)
-    self._check_tables(shard_0_master, 1)
-    self._check_tables(shard_0_replica1, 2)
-    self._check_tables(shard_0_replica2, 2)
-    self._check_tables(shard_0_rdonly, 2)
-    self._check_tables(shard_0_backup, 2)
-
-    # verify GetSchema --tables works
-    s = utils.run_vtctl_json(['GetSchema', '--tables=vt_select_test0',
-                               shard_0_replica1.tablet_alias])
-    self.assertEqual(len(s['TableDefinitions']), 1)
-    self.assertEqual(s['TableDefinitions'][0]['Name'], 'vt_select_test0')
-
-    # CopySchemaShard is responsible for creating the db; one shouldn't exist before
-    # the command is run.
-    self._check_db_not_created(shard_2_master)
-    self._check_db_not_created(shard_2_replica1)
-
-    utils.run_vtctl(['CopySchemaShard',
-                     shard_0_replica1.tablet_alias,
-                     'test_keyspace/2'],
-                    auto_log=True)
-
-    # shard_2_master should look the same as the replica we copied from
-    self._check_tables(shard_2_master, 2)
-    self._check_tables(shard_2_replica1, 2)
-    # shard_2_replica1 should have gotten an identical schema applied to it via replication
+  def _check_tables(self, tablet_obj, expected_count):
+    tables = tablet_obj.mquery(db_name, 'show tables')
     self.assertEqual(
-      utils.run_vtctl_json(['GetSchema', shard_0_replica1.tablet_alias]),
-      utils.run_vtctl_json(['GetSchema', shard_2_replica1.tablet_alias]),
-    )
+        len(tables), expected_count,
+        'Unexpected table count on %s (not %d): got tables: %s' %
+        (tablet_obj.tablet_alias, expected_count, str(tables)))
 
-    # keyspace: try to apply a keyspace-wide schema change, should fail
-    # as the preflight would be different in shard1 vs the others
-    out, err = utils.run_vtctl(['ApplySchemaKeyspace',
-                                '-sql='+create_vt_select_test[2],
-                                'test_keyspace'],
-                               trap_output=True,
-                               log_level='INFO',
-                               raise_on_error=False)
-    if err.find('ApplySchemaKeyspace Shard 1 has inconsistent schema') == -1:
-      self.fail('Unexpected ApplySchemaKeyspace output: %s' % err)
+  def _apply_schema(self, keyspace, sql, expect_fail=False):
+    return utils.run_vtctl(['ApplySchema',
+                            '-sql=' + sql,
+                            keyspace],
+                           expect_fail=expect_fail, auto_log=True)
 
-    # shard 1: catch it up with simple updates
-    utils.run_vtctl(['ApplySchemaShard',
-                     '-simple',
-                     '-sql='+create_vt_select_test[0],
-                     'test_keyspace/1'],
-                    auto_log=True)
-    utils.run_vtctl(['ApplySchemaShard',
-                     '-simple',
-                     '-sql='+create_vt_select_test[1],
-                     'test_keyspace/1'],
-                    auto_log=True)
-    self._check_tables(shard_1_master, 2)
-    self._check_tables(shard_1_replica1, 2)
+  def _get_schema(self, tablet_alias):
+    return utils.run_vtctl_json(['GetSchema',
+                                 tablet_alias])
 
-    # keyspace: apply a keyspace-wide simple schema change, should work now
-    utils.run_vtctl(['ApplySchemaKeyspace',
-                     '-simple',
-                     '-sql='+create_vt_select_test[2],
-                     'test_keyspace'],
-                    auto_log=True)
+  def _create_test_table_sql(self, table):
+    return (
+        'CREATE TABLE %s (\n'
+        '`id` BIGINT(20) not NULL,\n'
+        '`msg` varchar(64),\n'
+        'PRIMARY KEY (`id`)\n'
+        ') ENGINE=InnoDB') % table
 
-    # check all expected hosts have the change
-    self._check_tables(shard_0_master, 1) # was stuck a long time ago as scrap
-    self._check_tables(shard_0_replica1, 3) # current master
-    self._check_tables(shard_0_replica2, 3)
-    self._check_tables(shard_0_rdonly, 3)
-    self._check_tables(shard_0_backup, 3)
-    self._check_tables(shard_1_master, 3) # current master
-    self._check_tables(shard_1_replica1, 3)
-    self._check_tables(shard_2_master, 3) # current master
-    self._check_tables(shard_2_replica1, 3)
+  def _alter_test_table_sql(self, table, index_column_name):
+    return (
+        'ALTER TABLE %s\n'
+        'ADD COLUMN new_id bigint(20) NOT NULL AUTO_INCREMENT FIRST,\n'
+        'DROP PRIMARY KEY,\n'
+        'ADD PRIMARY KEY (new_id),\n'
+        'ADD INDEX idx_column(%s)\n') % (table, index_column_name)
 
-    # keyspace: apply a keyspace-wide complex schema change, should work too
-    utils.run_vtctl(['ApplySchemaKeyspace',
-                     '-sql='+create_vt_select_test[3],
-                     'test_keyspace'],
-                    auto_log=True)
+  def _apply_initial_schema(self):
+    schema_changes = ';'.join([
+        self._create_test_table_sql('vt_select_test01'),
+        self._create_test_table_sql('vt_select_test02'),
+        self._create_test_table_sql('vt_select_test03'),
+        self._create_test_table_sql('vt_select_test04')])
 
-    # check all expected hosts have the change:
-    # - master won't have it as it's a complex change
-    # - backup won't have it as IsReplicatingType is false
-    self._check_tables(shard_0_master, 1) # was stuck a long time ago as scrap
-    self._check_tables(shard_0_replica1, 3) # current master
-    self._check_tables(shard_0_replica2, 4)
-    self._check_tables(shard_0_rdonly, 4)
-    self._check_tables(shard_0_backup, 4)
-    self._check_tables(shard_1_master, 3) # current master
-    self._check_tables(shard_1_replica1, 4)
-    self._check_tables(shard_2_master, 3) # current master
-    self._check_tables(shard_2_replica1, 4)
+    # apply schema changes to the test keyspace
+    self._apply_schema(test_keyspace, schema_changes)
 
-    utils.pause("Look at schema now!")
+    # check number of tables
+    self._check_tables(shard_0_master, 4)
+    self._check_tables(shard_1_master, 4)
 
-    tablet.kill_tablets([shard_0_master, shard_0_replica1, shard_0_replica2,
-                         shard_0_rdonly, shard_0_backup, shard_1_master,
-                         shard_1_replica1, shard_2_master, shard_2_replica1])
+    # get schema for each shard
+    shard_0_schema = self._get_schema(shard_0_master.tablet_alias)
+    shard_1_schema = self._get_schema(shard_1_master.tablet_alias)
+
+    # all shards should have the same schema
+    self.assertEqual(shard_0_schema, shard_1_schema)
+
+  def test_schema_changes(self):
+    self._apply_initial_schema()
+
+    self._apply_schema(
+        test_keyspace, self._alter_test_table_sql('vt_select_test03', 'msg'))
+
+    shard_0_schema = self._get_schema(shard_0_master.tablet_alias)
+    shard_1_schema = self._get_schema(shard_1_master.tablet_alias)
+
+    # all shards should have the same schema
+    self.assertEqual(shard_0_schema, shard_1_schema)
+
+    # test schema changes
+    os.makedirs(os.path.join(utils.vtctld.schema_change_dir, test_keyspace))
+    input_path = os.path.join(
+        utils.vtctld.schema_change_dir, test_keyspace, 'input')
+    os.makedirs(input_path)
+    sql_path = os.path.join(input_path, 'create_test_table_x.sql')
+    with open(sql_path, 'w') as handler:
+      handler.write('create table test_table_x (id int)')
+
+    # wait until this sql file being consumed by autoschema
+    timeout = 10
+    while os.path.isfile(sql_path):
+      timeout = utils.wait_step(
+          'waiting for vtctld to pick up schema changes',
+          timeout, sleep_time=0.2)
+
+    # check number of tables
+    self._check_tables(shard_0_master, 5)
+    self._check_tables(shard_1_master, 5)
+
+  def test_schema_changes_drop_and_create(self):
+    """Tests that a DROP and CREATE table will pass PreflightSchema check.
+
+    PreflightSchema checks each SQL statement separately. When doing so, it must
+    consider previous statements within the same ApplySchema command. For
+    example, a CREATE after DROP must not fail: When CREATE is checked, DROP
+    must have been executed first.
+    See: https://github.com/vitessio/vitess/issues/1731#issuecomment-222914389
+    """
+    self._apply_initial_schema()
+    self._check_tables(shard_0_master, 4)
+    self._check_tables(shard_1_master, 4)
+
+    drop_and_create = ('DROP TABLE vt_select_test01;\n' +
+                       self._create_test_table_sql('vt_select_test01'))
+    self._apply_schema(test_keyspace, drop_and_create)
+    # check number of tables
+    self._check_tables(shard_0_master, 4)
+    self._check_tables(shard_1_master, 4)
+
+  def test_schema_changes_preflight_errors_partially(self):
+    """Tests that some SQL statements fail properly during PreflightSchema."""
+    self._apply_initial_schema()
+    self._check_tables(shard_0_master, 4)
+    self._check_tables(shard_1_master, 4)
+
+    # Second statement will fail because the table already exists.
+    create_error = (self._create_test_table_sql('vt_select_test05') + ';\n' +
+                    self._create_test_table_sql('vt_select_test01'))
+    stdout = self._apply_schema(test_keyspace, create_error, expect_fail=True)
+    self.assertIn('already exists', ''.join(stdout))
+    # check number of tables
+    self._check_tables(shard_0_master, 4)
+    self._check_tables(shard_1_master, 4)
+
+  def test_schema_changes_drop_nonexistent_tables(self):
+    """Tests the PreflightSchema logic for dropping nonexistent tables.
+
+    If a table does not exist, DROP TABLE should error during preflight
+    because the statement does not change the schema as there is
+    nothing to drop.
+    In case of DROP TABLE IF EXISTS though, it should not error as this
+    is the MySQL behavior the user expects.
+    """
+    self._apply_initial_schema()
+    self._check_tables(shard_0_master, 4)
+    self._check_tables(shard_1_master, 4)
+
+    drop_table = ('DROP TABLE nonexistent_table;')
+    stdout = self._apply_schema(test_keyspace, drop_table, expect_fail=True)
+    self.assertIn('Unknown table', ''.join(stdout))
+
+    # This Query may not result in schema change and should be allowed.
+    drop_if_exists = ('DROP TABLE IF EXISTS nonexistent_table;')
+    self._apply_schema(test_keyspace, drop_if_exists)
+
+    self._check_tables(shard_0_master, 4)
+    self._check_tables(shard_1_master, 4)
+
+  def test_vtctl_copyschemashard_use_tablet_as_source(self):
+    self._test_vtctl_copyschemashard(shard_0_master.tablet_alias)
+
+  def test_vtctl_copyschemashard_use_shard_as_source(self):
+    self._test_vtctl_copyschemashard('test_keyspace/0')
+
+  def _test_vtctl_copyschemashard(self, source):
+    # Apply initial schema to the whole keyspace before creating shard 2.
+    self._apply_initial_schema()
+
+    _setup_shard_2()
+
+    try:
+      # InitShardMaster creates the db, but there shouldn't be any tables yet.
+      self._check_tables(shard_2_master, 0)
+      self._check_tables(shard_2_replica1, 0)
+
+      # Run the command twice to make sure it's idempotent.
+      for _ in range(2):
+        utils.run_vtctl(['CopySchemaShard',
+                         source,
+                         'test_keyspace/2'],
+                        auto_log=True)
+
+        # shard_2_master should look the same as the replica we copied from
+        self._check_tables(shard_2_master, 4)
+        utils.wait_for_replication_pos(shard_2_master, shard_2_replica1)
+        self._check_tables(shard_2_replica1, 4)
+        shard_0_schema = self._get_schema(shard_0_master.tablet_alias)
+        shard_2_schema = self._get_schema(shard_2_master.tablet_alias)
+        self.assertEqual(shard_0_schema, shard_2_schema)
+    finally:
+      _teardown_shard_2()
+
+  def test_vtctl_copyschemashard_different_dbs_should_fail(self):
+    # Apply initial schema to the whole keyspace before creating shard 2.
+    self._apply_initial_schema()
+
+    _setup_shard_2()
+
+    try:
+      # InitShardMaster creates the db, but there shouldn't be any tables yet.
+      self._check_tables(shard_2_master, 0)
+      self._check_tables(shard_2_replica1, 0)
+
+      # Change the db charset on the destination shard from utf8 to latin1.
+      # This will make CopySchemaShard fail during its final diff.
+      # (The different charset won't be corrected on the destination shard
+      #  because we use "CREATE DATABASE IF NOT EXISTS" and this doesn't fail if
+      #  there are differences in the options e.g. the character set.)
+      shard_2_schema = self._get_schema(shard_2_master.tablet_alias)
+      self.assertIn('utf8', shard_2_schema['database_schema'])
+      utils.run_vtctl_json(
+          ['ExecuteFetchAsDba', '-json', shard_2_master.tablet_alias,
+           'ALTER DATABASE vt_test_keyspace CHARACTER SET latin1'])
+
+      _, stderr = utils.run_vtctl(['CopySchemaShard',
+                                   'test_keyspace/0',
+                                   'test_keyspace/2'],
+                                  expect_fail=True,
+                                  auto_log=True)
+      self.assertIn('schemas are different', stderr)
+
+      # shard_2_master should have the same number of tables. Only the db
+      # character set is different.
+      self._check_tables(shard_2_master, 4)
+    finally:
+      _teardown_shard_2()
 
 if __name__ == '__main__':
   utils.main()

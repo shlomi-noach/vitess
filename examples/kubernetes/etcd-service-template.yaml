@@ -1,11 +1,7 @@
-apiVersion: v1beta1
-kind: Service
-id: etcd-{{cell}}
-port: 4001
-containerPort: 4001
-selector:
-  name: etcd
-  cell: {{cell}}
-labels:
-  name: etcd
-  cell: {{cell}}
+apiVersion: "etcd.database.coreos.com/v1beta2"
+kind: "EtcdCluster"
+metadata:
+  name: "etcd-{{cell}}"
+spec:
+  size: {{replicas}}
+  version: "3.1.8"

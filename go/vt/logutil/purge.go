@@ -1,3 +1,19 @@
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreedto in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package logutil
 
 import (
@@ -22,7 +38,7 @@ func parseTimestamp(filename string) (timestamp time.Time, err error) {
 	if len(parts) < 6 {
 		return time.Time{}, fmt.Errorf("malformed logfile name: %v", filename)
 	}
-	return time.Parse("20060102-150405", parts[5])
+	return time.ParseInLocation("20060102-150405", parts[len(parts)-2], time.Now().Location())
 
 }
 
@@ -73,7 +89,7 @@ func PurgeLogs() {
 	program := filepath.Base(os.Args[0])
 
 	timer := time.NewTimer(*purgeLogsInterval)
-	for _ = range timer.C {
+	for range timer.C {
 		purgeLogsOnce(time.Now(), logDir, program, *keepLogs)
 	}
 }

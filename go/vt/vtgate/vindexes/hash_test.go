@@ -1,22 +1,34 @@
-// Copyright 2014, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package vindexes
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
-	"github.com/youtube/vitess/go/vt/key"
-	tproto "github.com/youtube/vitess/go/vt/tabletserver/proto"
-	"github.com/youtube/vitess/go/vt/vtgate/planbuilder"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/key"
 )
 
-var hash planbuilder.Vindex
+var hash Vindex
 
 func init() {
-	hv, err := planbuilder.CreateVindex("hash", map[string]interface{}{"Table": "t", "Column": "c"})
+	hv, err := CreateVindex("hash", "nn", map[string]string{"Table": "t", "Column": "c"})
 	if err != nil {
 		panic(err)
 	}
@@ -29,18 +41,33 @@ func TestHashCost(t *testing.T) {
 	}
 }
 
+func TestHashString(t *testing.T) {
+	if strings.Compare("nn", hash.String()) != 0 {
+		t.Errorf("String(): %s, want hash", hash.String())
+	}
+}
+
 func TestHashMap(t *testing.T) {
-	got, err := hash.(planbuilder.Unique).Map(nil, []interface{}{1, int32(2), int64(3), uint(4), uint32(5), uint64(6)})
+	got, err := hash.Map(nil, []sqltypes.Value{
+		sqltypes.NewInt64(1),
+		sqltypes.NewInt64(2),
+		sqltypes.NewInt64(3),
+		sqltypes.NULL,
+		sqltypes.NewInt64(4),
+		sqltypes.NewInt64(5),
+		sqltypes.NewInt64(6),
+	})
 	if err != nil {
 		t.Error(err)
 	}
-	want := []key.KeyspaceId{
-		"\x16k@\xb4J\xbaK\xd6",
-		"\x06\xe7\xea\"Βp\x8f",
-		"N\xb1\x90ɢ\xfa\x16\x9c",
-		"\xd2\xfd\x88g\xd5\r-\xfe",
-		"p\xbb\x02<\x81\f\xa8z",
-		"\xf0\x98H\n\xc4ľq",
+	want := []key.Destination{
+		key.DestinationKeyspaceID([]byte("\x16k@\xb4J\xbaK\xd6")),
+		key.DestinationKeyspaceID([]byte("\x06\xe7\xea\"Βp\x8f")),
+		key.DestinationKeyspaceID([]byte("N\xb1\x90ɢ\xfa\x16\x9c")),
+		key.DestinationNone{},
+		key.DestinationKeyspaceID([]byte("\xd2\xfd\x88g\xd5\r-\xfe")),
+		key.DestinationKeyspaceID([]byte("p\xbb\x02<\x81\f\xa8z")),
+		key.DestinationKeyspaceID([]byte("\xf0\x98H\n\xc4ľq")),
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("Map(): %#v, want %+v", got, want)
@@ -48,62 +75,40 @@ func TestHashMap(t *testing.T) {
 }
 
 func TestHashVerify(t *testing.T) {
-	success, err := hash.Verify(nil, 1, "\x16k@\xb4J\xbaK\xd6")
+	ids := []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)}
+	ksids := [][]byte{[]byte("\x16k@\xb4J\xbaK\xd6"), []byte("\x16k@\xb4J\xbaK\xd6")}
+	got, err := hash.Verify(nil, ids, ksids)
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
-	if !success {
-		t.Errorf("Verify(): %+v, want true", success)
+	want := []bool{true, false}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("binaryMD5.Verify: %v, want %v", got, want)
+	}
+
+	// Failure test
+	_, err = hash.Verify(nil, []sqltypes.Value{sqltypes.NewVarBinary("aa")}, [][]byte{nil})
+	wantErr := "hash.Verify: could not parse value: 'aa'"
+	if err == nil || err.Error() != wantErr {
+		t.Errorf("hash.Verify err: %v, want %s", err, wantErr)
 	}
 }
 
 func TestHashReverseMap(t *testing.T) {
-	got, err := hash.(planbuilder.Reversible).ReverseMap(nil, "\x16k@\xb4J\xbaK\xd6")
+	got, err := hash.(Reversible).ReverseMap(nil, [][]byte{[]byte("\x16k@\xb4J\xbaK\xd6")})
 	if err != nil {
 		t.Error(err)
 	}
-	if got.(int64) != 1 {
-		t.Errorf("ReverseMap(): %+v, want 1", got)
+	want := []sqltypes.Value{sqltypes.NewUint64(uint64(1))}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ReverseMap(): %v, want %v", got, want)
 	}
 }
 
-func TestHashCreate(t *testing.T) {
-	vc := &vcursor{}
-	err := hash.(planbuilder.Functional).Create(vc, 1)
-	if err != nil {
+func TestHashReverseMapNeg(t *testing.T) {
+	_, err := hash.(Reversible).ReverseMap(nil, [][]byte{[]byte("\x16k@\xb4J\xbaK\xd6\x16k@\xb4J\xbaK\xd6")})
+	want := "invalid keyspace id: 166b40b44aba4bd6166b40b44aba4bd6"
+	if err.Error() != want {
 		t.Error(err)
-	}
-	wantQuery := &tproto.BoundQuery{
-		Sql: "insert into t(c) values(:c)",
-		BindVariables: map[string]interface{}{
-			"c": 1,
-		},
-	}
-	if !reflect.DeepEqual(vc.query, wantQuery) {
-		t.Errorf("vc.query = %#v, want %#v", vc.query, wantQuery)
-	}
-}
-
-func TestHashGenerate(t *testing.T) {
-	_, ok := hash.(planbuilder.FunctionalGenerator)
-	if ok {
-		t.Errorf("hash.(planbuilder.FunctionalGenerator): true, want false")
-	}
-}
-
-func TestHashDelete(t *testing.T) {
-	vc := &vcursor{}
-	err := hash.(planbuilder.Functional).Delete(vc, []interface{}{1}, "")
-	if err != nil {
-		t.Error(err)
-	}
-	wantQuery := &tproto.BoundQuery{
-		Sql: "delete from t where c in ::c",
-		BindVariables: map[string]interface{}{
-			"c": []interface{}{1},
-		},
-	}
-	if !reflect.DeepEqual(vc.query, wantQuery) {
-		t.Errorf("vc.query = %#v, want %#v", vc.query, wantQuery)
 	}
 }

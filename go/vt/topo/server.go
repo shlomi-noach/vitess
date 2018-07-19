@@ -1,341 +1,302 @@
-// Copyright 2013, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+Copyright 2017 Google Inc.
 
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+/*
+Package topo is the module responsible for interacting with the topology
+service. It uses one Conn connection to the global topo service (with
+possibly another one to a read-only version of the global topo service),
+and one to each cell topo service.
+
+It contains the plug-in interfaces Conn, Factory and Version that topo
+implementations will use. We support Zookeeper, etcd, consul as real
+topo servers, and in-memory, tee as test and utility topo servers.
+Implementations are in sub-directories here.
+
+In tests, we do not mock this package. Instead, we just use a memorytopo.
+
+We also support copying data across topo servers (using helpers/copy.go
+and the topo2topo cmd binary), and writing to two topo servers at the same
+time (using helpers/tee.go). This is to facilitate migrations between
+topo servers.
+
+There are two test sub-packages associated with this code:
+- test/ contains a test suite that is run against all of our implementations.
+  It just performs a bunch of common topo server activities (create, list,
+  delete various objects, ...). If a topo implementation passes all these
+  tests, it most likely will work as expected in a real deployment.
+- topotests/ contains tests that use a memorytopo to test the code in this
+  package.
+*/
 package topo
 
 import (
-	"errors"
 	"flag"
 	"fmt"
+	"sync"
 
-	log "github.com/golang/glog"
 	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/log"
 )
+
+const (
+	// GlobalCell is the name of the global cell.  It is special
+	// as it contains the global topology, and references the other cells.
+	GlobalCell = "global"
+
+	// GlobalReadOnlyCell is the name of the global read-only cell
+	// connection cell name.
+	GlobalReadOnlyCell = "global-read-only"
+)
+
+// Filenames for all object types.
+const (
+	CellInfoFile         = "CellInfo"
+	KeyspaceFile         = "Keyspace"
+	ShardFile            = "Shard"
+	VSchemaFile          = "VSchema"
+	ShardReplicationFile = "ShardReplication"
+	TabletFile           = "Tablet"
+	SrvVSchemaFile       = "SrvVSchema"
+	SrvKeyspaceFile      = "SrvKeyspace"
+)
+
+// Path for all object types.
+const (
+	CellsPath     = "cells"
+	KeyspacesPath = "keyspaces"
+	ShardsPath    = "shards"
+	TabletsPath   = "tablets"
+)
+
+// Factory is a factory interface to create Conn objects.
+// Topo implementations will provide an implementation for this.
+type Factory interface {
+	// HasGlobalReadOnlyCell returns true if the global cell
+	// has read-only replicas of the topology data. The global topology
+	// is usually more expensive to read from / write to, as it is
+	// replicated over many cells. Some topology services provide
+	// more efficient way to read the data, like Observer servers
+	// for Zookeeper. If this returns true, we will maintain
+	// two connections for the global topology: the 'global' cell
+	// for consistent reads and writes, and the 'global-read-only'
+	// cell for reads only.
+	HasGlobalReadOnlyCell(serverAddr, root string) bool
+
+	// Create creates a topo.Conn object.
+	Create(cell, serverAddr, root string) (Conn, error)
+}
+
+// Server is the main topo.Server object. We support two ways of creating one:
+// 1. From an implementation, server address, and root path.
+//    This uses a plugin mechanism, and we have implementations for
+//    etcd, zookeeper and consul.
+// 2. Specific implementations may have higher level creation methods
+//    (in which case they may provide a more complex Factory).
+//    We support memorytopo (for tests and processes that only need an
+//    in-memory server), and tee (a helper implementation to transition
+//    between one server implementation and another).
+type Server struct {
+	// globalCell is the main connection to the global topo service.
+	// It is created once at construction time.
+	globalCell Conn
+
+	// globalReadOnlyCell is the read-only connection to the global
+	// topo service. It will be equal to globalCell if we don't distinguish
+	// the two.
+	globalReadOnlyCell Conn
+
+	// factory allows the creation of connections to various backends.
+	// It is set at construction time.
+	factory Factory
+
+	// mu protects the following fields.
+	mu sync.Mutex
+	// cells contains clients configured to talk to a list of
+	// topo instances representing local topo clusters. These
+	// should be accessed with the ConnForCell() method, which
+	// will read the list of addresses for that cell from the
+	// global cluster and create clients as needed.
+	cells map[string]Conn
+}
+
+type cellsToRegionsMap struct {
+	mu sync.Mutex
+	// cellsToRegions contains all cell->region mappings
+	cellsToRegions map[string]string
+}
 
 var (
-	// ErrNodeExists is returned by functions to specify the
-	// requested resource already exists.
-	ErrNodeExists = errors.New("node already exists")
+	// topoImplementation is the flag for which implementation to use.
+	topoImplementation = flag.String("topo_implementation", "zookeeper", "the topology implementation to use")
 
-	// ErrNoNode is returned by functions to specify the requested
-	// resource does not exist.
-	ErrNoNode = errors.New("node doesn't exist")
+	// topoGlobalServerAddress is the address of the global topology
+	// server.
+	topoGlobalServerAddress = flag.String("topo_global_server_address", "", "the address of the global topology server")
 
-	// ErrNotEmpty is returned by functions to specify a child of the
-	// resource is still present and prevents the action from completing.
-	ErrNotEmpty = errors.New("node not empty")
+	// topoGlobalRoot is the root path to use for the global topology
+	// server.
+	topoGlobalRoot = flag.String("topo_global_root", "", "the path of the global topology data in the global topology server")
 
-	// ErrTimeout is returned by functions that wait for a result
-	// when the timeout value is reached.
-	ErrTimeout = errors.New("deadline exceeded")
+	// factories has the factories for the Conn objects.
+	factories = make(map[string]Factory)
 
-	// ErrInterrupted is returned by functions that wait for a result
-	// when they are interrupted.
-	ErrInterrupted = errors.New("interrupted")
-
-	// ErrBadVersion is returned by an update function that
-	// failed to update the data because the version was different
-	ErrBadVersion = errors.New("bad node version")
-
-	// ErrPartialResult is returned by a function that could only
-	// get a subset of its results
-	ErrPartialResult = errors.New("partial result")
+	regions = cellsToRegionsMap{
+		cellsToRegions: make(map[string]string),
+	}
 )
 
-// Server is the interface used to talk to a persistent
-// backend storage server and locking service.
-//
-// Zookeeper is a good example of this, and zktopo contains the
-// implementation for this using zookeeper.
-//
-// Inside Google, we use Chubby.
-type Server interface {
-	// topo.Server management interface.
-	Close()
-
-	//
-	// Cell management, global
-	//
-
-	// GetKnownCells returns the list of known cells running our processes.
-	// It is possible to find all tablets in the entire system
-	// by then calling GetTabletsByCell on every cell, for instance.
-	// They shall be sorted.
-	GetKnownCells() ([]string, error)
-
-	//
-	// Keyspace management, global.
-	//
-
-	// CreateKeyspace creates the given keyspace, assuming it doesn't exist
-	// yet. Can return ErrNodeExists if it already exists.
-	CreateKeyspace(keyspace string, value *Keyspace) error
-
-	// UpdateKeyspace updates the keyspace information
-	// pointed at by ki.keyspace to the *ki value.
-	// This will only be called with a lock on the keyspace.
-	// Can return ErrNoNode if the keyspace doesn't exist yet,
-	// or ErrBadVersion if the version has changed.
-	//
-	// Do not use directly, but instead use topo.UpdateKeyspace.
-	UpdateKeyspace(ki *KeyspaceInfo, existingVersion int64) (newVersion int64, err error)
-
-	// GetKeyspace reads a keyspace and returns it.
-	// Can return ErrNoNode
-	GetKeyspace(keyspace string) (*KeyspaceInfo, error)
-
-	// GetKeyspaces returns the known keyspace names. They shall be sorted.
-	GetKeyspaces() ([]string, error)
-
-	// DeleteKeyspaceShards deletes all the shards in a keyspace.
-	// Use with caution.
-	DeleteKeyspaceShards(keyspace string) error
-
-	//
-	// Shard management, global.
-	//
-
-	// CreateShard creates an empty shard, assuming it doesn't exist
-	// yet. The contents of the shard will be a new Shard{} object,
-	// with KeyRange populated by the result of ValidateShardName().
-	// Can return ErrNodeExists if it already exists.
-	CreateShard(keyspace, shard string, value *Shard) error
-
-	// UpdateShard updates the shard information
-	// pointed at by si.keyspace / si.shard to the *si value.
-	// This will only be called with a lock on the shard.
-	// Can return ErrNoNode if the shard doesn't exist yet,
-	// or ErrBadVersion if the version has changed.
-	//
-	// Do not use directly, but instead use topo.UpdateShard.
-	UpdateShard(si *ShardInfo, existingVersion int64) (newVersion int64, err error)
-
-	// ValidateShard performs routine checks on the shard.
-	ValidateShard(keyspace, shard string) error
-
-	// GetShard reads a shard and returns it.
-	// Can return ErrNoNode
-	GetShard(keyspace, shard string) (*ShardInfo, error)
-
-	// GetShardNames returns the known shards in a keyspace.
-	// Can return ErrNoNode if the keyspace wasn't created,
-	// or if DeleteKeyspaceShards was called. They shall be sorted.
-	GetShardNames(keyspace string) ([]string, error)
-
-	// DeleteShard deletes the provided shard.
-	// Can return ErrNoNode if the shard doesn't exist.
-	DeleteShard(keyspace, shard string) error
-
-	//
-	// Tablet management, per cell.
-	//
-
-	// CreateTablet creates the given tablet, assuming it doesn't exist
-	// yet. It does *not* create the tablet replication paths.
-	// Can return ErrNodeExists if it already exists.
-	CreateTablet(tablet *Tablet) error
-
-	// UpdateTablet updates a given tablet. The version is used
-	// for atomic updates. UpdateTablet will return ErrNoNode if
-	// the tablet doesn't exist and ErrBadVersion if the version
-	// has changed.
-	//
-	// Do not use directly, but instead use topo.UpdateTablet.
-	UpdateTablet(tablet *TabletInfo, existingVersion int64) (newVersion int64, err error)
-
-	// UpdateTabletFields updates the current tablet record
-	// with new values, independently of the version
-	// Can return ErrNoNode if the tablet doesn't exist.
-	UpdateTabletFields(tabletAlias TabletAlias, update func(*Tablet) error) error
-
-	// DeleteTablet removes a tablet from the system.
-	// We assume no RPC is currently running to it.
-	// TODO(alainjobart) verify this assumption, link with RPC code.
-	// Can return ErrNoNode if the tablet doesn't exist.
-	DeleteTablet(alias TabletAlias) error
-
-	// GetTablet returns the tablet data (includes the current version).
-	// Can return ErrNoNode if the tablet doesn't exist.
-	GetTablet(alias TabletAlias) (*TabletInfo, error)
-
-	// GetTabletsByCell returns all the tablets in the given cell.
-	// Can return ErrNoNode if no tablet was ever created in that cell.
-	GetTabletsByCell(cell string) ([]TabletAlias, error)
-
-	//
-	// Replication graph management, per cell.
-	//
-
-	// UpdateShardReplicationFields updates the current
-	// ShardReplication record with new values. If the
-	// ShardReplication object does not exist, an empty one will
-	// be passed to the update function. All necessary directories
-	// need to be created by this method, if applicable.
-	UpdateShardReplicationFields(cell, keyspace, shard string, update func(*ShardReplication) error) error
-
-	// GetShardReplication returns the replication data.
-	// Can return ErrNoNode if the object doesn't exist.
-	GetShardReplication(cell, keyspace, shard string) (*ShardReplicationInfo, error)
-
-	// DeleteShardReplication deletes the replication data.
-	// Can return ErrNoNode if the object doesn't exist.
-	DeleteShardReplication(cell, keyspace, shard string) error
-
-	//
-	// Serving Graph management, per cell.
-	//
-
-	// LockSrvShardForAction locks the serving shard in order to
-	// perform the action described by contents. It will wait for
-	// the lock until at most ctx.Done(). The wait can be interrupted
-	// by cancelling the context. It returns the lock path.
-	//
-	// Can return ErrTimeout or ErrInterrupted.
-	LockSrvShardForAction(ctx context.Context, cell, keyspace, shard, contents string) (string, error)
-
-	// UnlockSrvShardForAction unlocks a serving shard.
-	UnlockSrvShardForAction(cell, keyspace, shard, lockPath, results string) error
-
-	// GetSrvTabletTypesPerShard returns the existing serving types
-	// for a shard.
-	// Can return ErrNoNode.
-	GetSrvTabletTypesPerShard(cell, keyspace, shard string) ([]TabletType, error)
-
-	// UpdateEndPoints updates the serving records for a cell,
-	// keyspace, shard, tabletType.
-	UpdateEndPoints(cell, keyspace, shard string, tabletType TabletType, addrs *EndPoints) error
-
-	// GetEndPoints returns the EndPoints list of serving addresses
-	// for a TabletType inside a shard.
-	// Can return ErrNoNode.
-	GetEndPoints(cell, keyspace, shard string, tabletType TabletType) (*EndPoints, error)
-
-	// DeleteEndPoints deletes the serving records for a cell,
-	// keyspace, shard, tabletType.
-	// Can return ErrNoNode.
-	DeleteEndPoints(cell, keyspace, shard string, tabletType TabletType) error
-
-	// UpdateSrvShard updates the serving records for a cell,
-	// keyspace, shard.
-	UpdateSrvShard(cell, keyspace, shard string, srvShard *SrvShard) error
-
-	// GetSrvShard reads a SrvShard record.
-	// Can return ErrNoNode.
-	GetSrvShard(cell, keyspace, shard string) (*SrvShard, error)
-
-	// DeleteSrvShard deletes a SrvShard record.
-	// Can return ErrNoNode.
-	DeleteSrvShard(cell, keyspace, shard string) error
-
-	// UpdateSrvKeyspace updates the serving records for a cell, keyspace.
-	UpdateSrvKeyspace(cell, keyspace string, srvKeyspace *SrvKeyspace) error
-
-	// GetSrvKeyspace reads a SrvKeyspace record.
-	// Can return ErrNoNode.
-	GetSrvKeyspace(cell, keyspace string) (*SrvKeyspace, error)
-
-	// GetSrvKeyspaceNames returns the list of visible Keyspaces
-	// in this cell. They shall be sorted.
-	GetSrvKeyspaceNames(cell string) ([]string, error)
-
-	// UpdateTabletEndpoint updates a single tablet record in the
-	// already computed serving graph. The update has to be somewhat
-	// atomic, so it requires Server intrisic knowledge.
-	// If the node doesn't exist, it is not updated, this is not an error.
-	UpdateTabletEndpoint(cell, keyspace, shard string, tabletType TabletType, addr *EndPoint) error
-
-	//
-	// Keyspace and Shard locks for actions, global.
-	//
-
-	// LockKeyspaceForAction locks the keyspace in order to
-	// perform the action described by contents. It will wait for
-	// the lock until at most ctx.Done(). The wait can be interrupted
-	// by cancelling the context. It returns the lock path.
-	//
-	// Can return ErrTimeout or ErrInterrupted
-	LockKeyspaceForAction(ctx context.Context, keyspace, contents string) (string, error)
-
-	// UnlockKeyspaceForAction unlocks a keyspace.
-	UnlockKeyspaceForAction(keyspace, lockPath, results string) error
-
-	// LockShardForAction locks the shard in order to
-	// perform the action described by contents. It will wait for
-	// the lock until at most ctx.Done(). The wait can be interrupted
-	// by cancelling the context. It returns the lock path.
-	//
-	// Can return ErrTimeout or ErrInterrupted
-	LockShardForAction(ctx context.Context, keyspace, shard, contents string) (string, error)
-
-	// UnlockShardForAction unlocks a shard.
-	UnlockShardForAction(keyspace, shard, lockPath, results string) error
-
-	//
-	// Supporting the local agent process, local cell.
-	//
-
-	// GetSubprocessFlags returns the flags required to run a
-	// subprocess that uses the same Server parameters as
-	// this process.
-	GetSubprocessFlags() []string
-}
-
-// Registry for Server implementations.
-var serverImpls map[string]Server = make(map[string]Server)
-
-// Which implementation to use
-var topoImplementation = flag.String("topo_implementation", "zookeeper", "the topology implementation to use")
-
-// RegisterServer adds an implementation for a Server.
-// If an implementation with that name already exists, panics.
-// Call this in the 'init' function in your module.
-func RegisterServer(name string, ts Server) {
-	if serverImpls[name] != nil {
-		panic(fmt.Errorf("Duplicate topo.Server registration for %v", name))
+// RegisterFactory registers a Factory for an implementation for a Server.
+// If an implementation with that name already exists, it log.Fatals out.
+// Call this in the 'init' function in your topology implementation module.
+func RegisterFactory(name string, factory Factory) {
+	if factories[name] != nil {
+		log.Fatalf("Duplicate topo.Factory registration for %v", name)
 	}
-	serverImpls[name] = ts
+	factories[name] = factory
 }
 
-// Returns a specific Server by name, or nil.
-func GetServerByName(name string) Server {
-	return serverImpls[name]
+// NewWithFactory creates a new Server based on the given Factory.
+// It also opens the global cell connection.
+func NewWithFactory(factory Factory, serverAddress, root string) (*Server, error) {
+	conn, err := factory.Create(GlobalCell, serverAddress, root)
+	if err != nil {
+		return nil, err
+	}
+
+	var connReadOnly Conn
+	if factory.HasGlobalReadOnlyCell(serverAddress, root) {
+		connReadOnly, err = factory.Create(GlobalReadOnlyCell, serverAddress, root)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		connReadOnly = conn
+	}
+
+	return &Server{
+		globalCell:         conn,
+		globalReadOnlyCell: connReadOnly,
+		factory:            factory,
+		cells:              make(map[string]Conn),
+	}, nil
 }
 
-// GetServer returns 'our' Server, going down this list:
-// - If only one is registered, that's the one.
-// - If more than one are registered, use the 'topo_implementation' flag
-//   (which defaults to zookeeper).
-// - Then panics.
-func GetServer() Server {
-	if len(serverImpls) == 1 {
-		for name, ts := range serverImpls {
-			log.V(6).Infof("Using only topo.Server: %v", name)
-			return ts
+// OpenServer returns a Server using the provided implementation,
+// address and root for the global server.
+func OpenServer(implementation, serverAddress, root string) (*Server, error) {
+	factory, ok := factories[implementation]
+	if !ok {
+		return nil, NewError(NoNode, implementation)
+	}
+	return NewWithFactory(factory, serverAddress, root)
+}
+
+// Open returns a Server using the command line parameter flags
+// for implementation, address and root. It log.Exits out if an error occurs.
+func Open() *Server {
+	ts, err := OpenServer(*topoImplementation, *topoGlobalServerAddress, *topoGlobalRoot)
+	if err != nil {
+		log.Exitf("Failed to open topo server (%v,%v,%v): %v", *topoImplementation, *topoGlobalServerAddress, *topoGlobalRoot, err)
+	}
+	return ts
+}
+
+// ConnForCell returns a Conn object for the given cell.
+// It caches Conn objects from previously requested cells.
+func (ts *Server) ConnForCell(ctx context.Context, cell string) (Conn, error) {
+	// Global cell is the easy case.
+	if cell == GlobalCell {
+		return ts.globalCell, nil
+	}
+
+	// Return a cached client if present.
+	ts.mu.Lock()
+	conn, ok := ts.cells[cell]
+	ts.mu.Unlock()
+	if ok {
+		return conn, nil
+	}
+
+	// Fetch cell cluster addresses from the global cluster.
+	// These can proceed concurrently (we've released the lock).
+	// We can use the GlobalReadOnlyCell for this call.
+	ci, err := ts.GetCellInfo(ctx, cell, false /*strongRead*/)
+	if err != nil {
+		return nil, err
+	}
+
+	// Connect to the cell topo server, while holding the lock.
+	// This ensures only one connection is established at any given time.
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+
+	// Check if another goroutine beat us to creating a client for
+	// this cell.
+	if conn, ok = ts.cells[cell]; ok {
+		return conn, nil
+	}
+
+	// Create the connection.
+	conn, err = ts.factory.Create(cell, ci.ServerAddress, ci.Root)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create topo connection to %v, %v: %v", ci.ServerAddress, ci.Root, err)
+	}
+	ts.cells[cell] = conn
+	return conn, nil
+}
+
+// GetRegionByCell returns the region group this `cell` belongs to, if there's none, it returns the `cell` as region.
+func GetRegionByCell(ctx context.Context, ts *Server, cell string) string {
+	regions.mu.Lock()
+	defer regions.mu.Unlock()
+	if region, ok := regions.cellsToRegions[cell]; ok {
+		return region
+	}
+	if ts != nil {
+		// lazily get the region from cell info if `regions.ts` is available
+		info, err := ts.GetCellInfo(ctx, cell, false)
+		if err == nil && info.Region != "" {
+			regions.cellsToRegions[cell] = info.Region
+			return info.Region
 		}
 	}
-
-	result := serverImpls[*topoImplementation]
-	if result == nil {
-		panic(fmt.Errorf("No topo.Server named %v", *topoImplementation))
-	}
-	log.V(6).Infof("Using topo.Server: %v", *topoImplementation)
-	return result
+	// for backward compatability
+	return cell
 }
 
-// Close all registered Server.
-func CloseServers() {
-	for name, ts := range serverImpls {
-		log.V(6).Infof("Closing topo.Server: %v", name)
-		ts.Close()
-	}
+// UpdateCellsToRegionsForTests overwrites the global map built by topo server init, and is meant for testing purpose only.
+func UpdateCellsToRegionsForTests(cellsToRegions map[string]string) {
+	regions.mu.Lock()
+	defer regions.mu.Unlock()
+	regions.cellsToRegions = cellsToRegions
 }
 
-// GetSubprocessFlags returns all the flags required to launch a subprocess
-// with the exact same topology server as the current process.
-func GetSubprocessFlags() []string {
-	result := []string{
-		"-topo_implementation", *topoImplementation,
+// Close will close all connections to underlying topo Server.
+// It will nil all member variables, so any further access will panic.
+func (ts *Server) Close() {
+	ts.globalCell.Close()
+	if ts.globalReadOnlyCell != ts.globalCell {
+		ts.globalReadOnlyCell.Close()
 	}
-	return append(result, GetServer().GetSubprocessFlags()...)
+	ts.globalCell = nil
+	ts.globalReadOnlyCell = nil
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	for _, conn := range ts.cells {
+		conn.Close()
+	}
+	ts.cells = make(map[string]Conn)
 }

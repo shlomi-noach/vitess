@@ -1,6 +1,18 @@
-// Copyright 2012, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 // mysqlctl initializes and controls mysqld with Vitess-specific configuration.
 package main
@@ -9,16 +21,22 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/netutil"
-	"github.com/youtube/vitess/go/vt/dbconfigs"
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/vt/mysqlctl"
+	"golang.org/x/net/context"
+
+	"vitess.io/vitess/go/exit"
+	"vitess.io/vitess/go/flagutil"
+	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/netutil"
+	"vitess.io/vitess/go/vt/dbconfigs"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/mysqlctl"
 )
 
 var (
-	port        = flag.Int("port", 6612, "vtocc port")
+	port        = flag.Int("port", 6612, "vttablet port")
 	mysqlPort   = flag.Int("mysql_port", 3306, "mysql port")
 	tabletUID   = flag.Uint("tablet_uid", 41983, "tablet uid")
 	mysqlSocket = flag.String("mysql_socket", "", "path to the mysql socket")
@@ -26,137 +44,178 @@ var (
 	tabletAddr string
 )
 
-func initCmd(mysqld *mysqlctl.Mysqld, subFlags *flag.FlagSet, args []string) {
-	waitTime := subFlags.Duration("wait_time", mysqlctl.MysqlWaitTime, "how long to wait for startup")
-	bootstrapArchive := subFlags.String("bootstrap_archive", "mysql-db-dir.tbz", "name of bootstrap archive within vitess/data/bootstrap directory")
-	skipSchema := subFlags.Bool("skip_schema", false, "don't apply initial schema")
+func initConfigCmd(subFlags *flag.FlagSet, args []string) error {
 	subFlags.Parse(args)
 
-	if err := mysqld.Init(*waitTime, *bootstrapArchive, *skipSchema); err != nil {
-		log.Fatalf("failed init mysql: %v", err)
-	}
-}
-
-func restoreCmd(mysqld *mysqlctl.Mysqld, subFlags *flag.FlagSet, args []string) {
-	dontWaitForSlaveStart := subFlags.Bool("dont_wait_for_slave_start", false, "won't wait for replication to start (useful when restoring from master server)")
-	fetchConcurrency := subFlags.Int("fetch_concurrency", 3, "how many files to fetch simultaneously")
-	fetchRetryCount := subFlags.Int("fetch_retry_count", 3, "how many times to retry a failed transfer")
-	subFlags.Parse(args)
-	if subFlags.NArg() != 1 {
-		log.Fatalf("Command restore requires <snapshot manifest file>")
-	}
-
-	rs, err := mysqlctl.ReadSnapshotManifest(subFlags.Arg(0))
-	if err == nil {
-		err = mysqld.RestoreFromSnapshot(logutil.NewConsoleLogger(), rs, *fetchConcurrency, *fetchRetryCount, *dontWaitForSlaveStart, nil)
-	}
+	// Generate my.cnf from scratch and use it to find mysqld.
+	mysqld, err := mysqlctl.CreateMysqld(uint32(*tabletUID), *mysqlSocket, int32(*mysqlPort))
 	if err != nil {
-		log.Fatalf("restore failed: %v", err)
+		return fmt.Errorf("failed to initialize mysql config: %v", err)
 	}
+	defer mysqld.Close()
+	if err := mysqld.InitConfig(); err != nil {
+		return fmt.Errorf("failed to init mysql config: %v", err)
+	}
+	return nil
 }
 
-func shutdownCmd(mysqld *mysqlctl.Mysqld, subFlags *flag.FlagSet, args []string) {
-	waitTime := subFlags.Duration("wait_time", mysqlctl.MysqlWaitTime, "how long to wait for shutdown")
+func initCmd(subFlags *flag.FlagSet, args []string) error {
+	waitTime := subFlags.Duration("wait_time", 5*time.Minute, "how long to wait for startup")
+	initDBSQLFile := subFlags.String("init_db_sql_file", "", "path to .sql file to run after mysql_install_db")
 	subFlags.Parse(args)
 
-	if mysqlErr := mysqld.Shutdown(true, *waitTime); mysqlErr != nil {
-		log.Fatalf("failed shutdown mysql: %v", mysqlErr)
-	}
-}
-
-func snapshotCmd(mysqld *mysqlctl.Mysqld, subFlags *flag.FlagSet, args []string) {
-	concurrency := subFlags.Int("concurrency", 4, "how many compression jobs to run simultaneously")
-	subFlags.Parse(args)
-	if subFlags.NArg() != 1 {
-		log.Fatalf("Command snapshot requires <db name>")
-	}
-
-	filename, _, _, err := mysqld.CreateSnapshot(logutil.NewConsoleLogger(), subFlags.Arg(0), tabletAddr, false, *concurrency, false, nil)
+	// Generate my.cnf from scratch and use it to find mysqld.
+	mysqld, err := mysqlctl.CreateMysqld(uint32(*tabletUID), *mysqlSocket, int32(*mysqlPort))
 	if err != nil {
-		log.Fatalf("snapshot failed: %v", err)
-	} else {
-		log.Infof("manifest location: %v", filename)
+		return fmt.Errorf("failed to initialize mysql config: %v", err)
 	}
+	defer mysqld.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), *waitTime)
+	defer cancel()
+	if err := mysqld.Init(ctx, *initDBSQLFile); err != nil {
+		return fmt.Errorf("failed init mysql: %v", err)
+	}
+	return nil
 }
 
-func snapshotSourceStartCmd(mysqld *mysqlctl.Mysqld, subFlags *flag.FlagSet, args []string) {
-	concurrency := subFlags.Int("concurrency", 4, "how many checksum jobs to run simultaneously")
-	subFlags.Parse(args)
-	if subFlags.NArg() != 1 {
-		log.Fatalf("Command snapshotsourcestart requires <db name>")
-	}
-
-	filename, slaveStartRequired, readOnly, err := mysqld.CreateSnapshot(logutil.NewConsoleLogger(), subFlags.Arg(0), tabletAddr, false, *concurrency, true, nil)
+func reinitConfigCmd(subFlags *flag.FlagSet, args []string) error {
+	// There ought to be an existing my.cnf, so use it to find mysqld.
+	mysqld, err := mysqlctl.OpenMysqld(uint32(*tabletUID))
 	if err != nil {
-		log.Fatalf("snapshot failed: %v", err)
-	} else {
-		log.Infof("manifest location: %v", filename)
-		log.Infof("slave start required: %v", slaveStartRequired)
-		log.Infof("read only: %v", readOnly)
+		return fmt.Errorf("failed to find mysql config: %v", err)
 	}
+	defer mysqld.Close()
+
+	if err := mysqld.ReinitConfig(context.TODO()); err != nil {
+		return fmt.Errorf("failed to reinit mysql config: %v", err)
+	}
+	return nil
 }
 
-func snapshotSourceEndCmd(mysqld *mysqlctl.Mysqld, subFlags *flag.FlagSet, args []string) {
-	slaveStartRequired := subFlags.Bool("slave_start", false, "will restart replication")
-	readWrite := subFlags.Bool("read_write", false, "will make the server read-write")
+func shutdownCmd(subFlags *flag.FlagSet, args []string) error {
+	waitTime := subFlags.Duration("wait_time", 5*time.Minute, "how long to wait for shutdown")
 	subFlags.Parse(args)
 
-	err := mysqld.SnapshotSourceEnd(*slaveStartRequired, !(*readWrite), true, map[string]string{})
+	// There ought to be an existing my.cnf, so use it to find mysqld.
+	mysqld, err := mysqlctl.OpenMysqld(uint32(*tabletUID))
 	if err != nil {
-		log.Fatalf("snapshotsourceend failed: %v", err)
+		return fmt.Errorf("failed to find mysql config: %v", err)
 	}
+	defer mysqld.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), *waitTime)
+	defer cancel()
+	if err := mysqld.Shutdown(ctx, true); err != nil {
+		return fmt.Errorf("failed shutdown mysql: %v", err)
+	}
+	return nil
 }
 
-func startCmd(mysqld *mysqlctl.Mysqld, subFlags *flag.FlagSet, args []string) {
-	waitTime := subFlags.Duration("wait_time", mysqlctl.MysqlWaitTime, "how long to wait for startup")
+func startCmd(subFlags *flag.FlagSet, args []string) error {
+	waitTime := subFlags.Duration("wait_time", 5*time.Minute, "how long to wait for startup")
+	var mysqldArgs flagutil.StringListValue
+	subFlags.Var(&mysqldArgs, "mysqld_args", "List of comma-separated flags to pass additionally to mysqld")
 	subFlags.Parse(args)
 
-	if err := mysqld.Start(*waitTime); err != nil {
-		log.Fatalf("failed start mysql: %v", err)
+	// There ought to be an existing my.cnf, so use it to find mysqld.
+	mysqld, err := mysqlctl.OpenMysqld(uint32(*tabletUID))
+	if err != nil {
+		return fmt.Errorf("failed to find mysql config: %v", err)
 	}
+	defer mysqld.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), *waitTime)
+	defer cancel()
+	if err := mysqld.Start(ctx, mysqldArgs...); err != nil {
+		return fmt.Errorf("failed start mysql: %v", err)
+	}
+	return nil
 }
 
-func teardownCmd(mysqld *mysqlctl.Mysqld, subFlags *flag.FlagSet, args []string) {
+func teardownCmd(subFlags *flag.FlagSet, args []string) error {
+	waitTime := subFlags.Duration("wait_time", 5*time.Minute, "how long to wait for shutdown")
 	force := subFlags.Bool("force", false, "will remove the root directory even if mysqld shutdown fails")
 	subFlags.Parse(args)
 
-	if err := mysqld.Teardown(*force); err != nil {
-		log.Fatalf("failed teardown mysql (forced? %v): %v", *force, err)
+	// There ought to be an existing my.cnf, so use it to find mysqld.
+	mysqld, err := mysqlctl.OpenMysqld(uint32(*tabletUID))
+	if err != nil {
+		return fmt.Errorf("failed to find mysql config: %v", err)
 	}
+	defer mysqld.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), *waitTime)
+	defer cancel()
+	if err := mysqld.Teardown(ctx, *force); err != nil {
+		return fmt.Errorf("failed teardown mysql (forced? %v): %v", *force, err)
+	}
+	return nil
+}
+
+func positionCmd(subFlags *flag.FlagSet, args []string) error {
+	subFlags.Parse(args)
+	if len(args) < 3 {
+		return fmt.Errorf("not enough arguments for position operation")
+	}
+
+	pos1, err := mysql.DecodePosition(args[1])
+	if err != nil {
+		return err
+	}
+
+	switch args[0] {
+	case "equal":
+		pos2, err := mysql.DecodePosition(args[2])
+		if err != nil {
+			return err
+		}
+		fmt.Println(pos1.Equal(pos2))
+	case "at_least":
+		pos2, err := mysql.DecodePosition(args[2])
+		if err != nil {
+			return err
+		}
+		fmt.Println(pos1.AtLeast(pos2))
+	case "append":
+		gtid, err := mysql.DecodeGTID(args[2])
+		if err != nil {
+			return err
+		}
+		fmt.Println(mysql.AppendGTID(pos1, gtid))
+	}
+
+	return nil
 }
 
 type command struct {
 	name   string
-	method func(*mysqlctl.Mysqld, *flag.FlagSet, []string)
+	method func(*flag.FlagSet, []string) error
 	params string
 	help   string
 }
 
 var commands = []command{
-	command{"init", initCmd, "[-wait_time=20s] [-bootstrap_archive=mysql-db-dir.tbz] [-skip_schema]",
+	{"init", initCmd, "[-wait_time=5m] [-init_db_sql_file=]",
 		"Initalizes the directory structure and starts mysqld"},
-	command{"teardown", teardownCmd, "[-force]",
+	{"init_config", initConfigCmd, "",
+		"Initalizes the directory structure, creates my.cnf file, but does not start mysqld"},
+	{"reinit_config", reinitConfigCmd, "",
+		"Reinitalizes my.cnf file with new server_id"},
+	{"teardown", teardownCmd, "[-wait_time=5m] [-force]",
 		"Shuts mysqld down, and removes the directory"},
-	command{"start", startCmd, "[-wait_time=20s]",
+	{"start", startCmd, "[-wait_time=5m]",
 		"Starts mysqld on an already 'init'-ed directory"},
-	command{"shutdown", shutdownCmd, "[-wait_time=20s]",
+	{"shutdown", shutdownCmd, "[-wait_time=5m]",
 		"Shuts down mysqld, does not remove any file"},
 
-	command{"snapshot", snapshotCmd,
-		"[-concurrency=4] <db name>",
-		"Takes a full snapshot, copying the innodb data files"},
-	command{"snapshotsourcestart", snapshotSourceStartCmd,
-		"[-concurrency=4] <db name>",
-		"Enters snapshot server mode (mysqld stopped, serving innodb data files)"},
-	command{"snapshotsourceend", snapshotSourceEndCmd,
-		"[-slave_start] [-read_write]",
-		"Gets out of snapshot server mode"},
-	command{"restore", restoreCmd,
-		"[-fetch_concurrency=3] [-fetch_retry_count=3] [-dont_wait_for_slave_start] <snapshot manifest file>",
-		"Restores a full snapshot"},
+	{"position", positionCmd,
+		"<operation> <pos1> <pos2 | gtid>",
+		"Compute operations on replication positions"},
 }
 
 func main() {
+	defer exit.Recover()
 	defer logutil.Flush()
 
 	flag.Usage = func() {
@@ -176,24 +235,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "\n")
 	}
 
-	flags := dbconfigs.AppConfig | dbconfigs.DbaConfig |
-		dbconfigs.FilteredConfig | dbconfigs.ReplConfig
-	dbconfigs.RegisterFlags(flags)
+	dbconfigs.RegisterFlags(dbconfigs.Dba)
 	flag.Parse()
 
-	tabletAddr = netutil.JoinHostPort("localhost", *port)
-	mycnf := mysqlctl.NewMycnf(uint32(*tabletUID), *mysqlPort)
-
-	if *mysqlSocket != "" {
-		mycnf.SocketFile = *mysqlSocket
-	}
-
-	dbcfgs, err := dbconfigs.Init(mycnf.SocketFile, flags)
-	if err != nil {
-		log.Fatalf("%v", err)
-	}
-	mysqld := mysqlctl.NewMysqld("Dba", mycnf, &dbcfgs.Dba, &dbcfgs.Repl)
-	defer mysqld.Close()
+	tabletAddr = netutil.JoinHostPort("localhost", int32(*port))
 
 	action := flag.Arg(0)
 	for _, cmd := range commands {
@@ -205,9 +250,13 @@ func main() {
 				subFlags.PrintDefaults()
 			}
 
-			cmd.method(mysqld, subFlags, flag.Args()[1:])
+			if err := cmd.method(subFlags, flag.Args()[1:]); err != nil {
+				log.Error(err)
+				exit.Return(1)
+			}
 			return
 		}
 	}
-	log.Fatalf("invalid action: %v", action)
+	log.Errorf("invalid action: %v", action)
+	exit.Return(1)
 }

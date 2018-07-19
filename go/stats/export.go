@@ -1,6 +1,18 @@
-// Copyright 2012, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 // Package stats is a wrapper for expvar. It addtionally
 // exports new types that can be used to track performance.
@@ -18,13 +30,18 @@ package stats
 import (
 	"bytes"
 	"expvar"
+	"flag"
 	"fmt"
 	"strconv"
 	"sync"
 	"time"
 
-	"github.com/youtube/vitess/go/sync2"
+	"vitess.io/vitess/go/vt/log"
 )
+
+var emitStats = flag.Bool("emit_stats", false, "true iff we should emit stats to push-based monitoring/stats backends")
+var statsEmitPeriod = flag.Duration("stats_emit_period", time.Duration(60*time.Second), "Interval between emitting stats to all registered backends")
+var statsBackend = flag.String("stats_backend", "influxdb", "The name of the registered push-based monitoring/stats backend to use")
 
 // NewVarHook is the type of a hook to export variables in a different way
 type NewVarHook func(name string, v expvar.Var)
@@ -56,6 +73,7 @@ func (vg *varGroup) register(nvh NewVarHook) {
 func (vg *varGroup) publish(name string, v expvar.Var) {
 	vg.Lock()
 	defer vg.Unlock()
+
 	expvar.Publish(name, v)
 	if vg.newVarHook != nil {
 		vg.newVarHook(name, v)
@@ -76,7 +94,59 @@ func Register(nvh NewVarHook) {
 
 // Publish is expvar.Publish+hook
 func Publish(name string, v expvar.Var) {
+	publish(name, v)
+}
+
+func publish(name string, v expvar.Var) {
 	defaultVarGroup.publish(name, v)
+}
+
+// PushBackend is an interface for any stats/metrics backend that requires data
+// to be pushed to it. It's used to support push-based metrics backends, as expvar
+// by default only supports pull-based ones.
+type PushBackend interface {
+	// PushAll pushes all stats from expvar to the backend
+	PushAll() error
+}
+
+var pushBackends = make(map[string]PushBackend)
+var pushBackendsLock sync.Mutex
+var once sync.Once
+
+// RegisterPushBackend allows modules to register PushBackend implementations.
+// Should be called on init().
+func RegisterPushBackend(name string, backend PushBackend) {
+	pushBackendsLock.Lock()
+	defer pushBackendsLock.Unlock()
+	if _, ok := pushBackends[name]; ok {
+		log.Fatalf("PushBackend %s already exists; can't register the same name multiple times", name)
+	}
+	pushBackends[name] = backend
+	if *emitStats {
+		// Start a single goroutine to emit stats periodically
+		once.Do(func() {
+			go emitToBackend(statsEmitPeriod)
+		})
+	}
+}
+
+// emitToBackend does a periodic emit to the selected PushBackend. If a push fails,
+// it will be logged as a warning (but things will otherwise proceed as normal).
+func emitToBackend(emitPeriod *time.Duration) {
+	ticker := time.NewTicker(*emitPeriod)
+	defer ticker.Stop()
+	for range ticker.C {
+		backend, ok := pushBackends[*statsBackend]
+		if !ok {
+			log.Errorf("No PushBackend registered with name %s", *statsBackend)
+			return
+		}
+		err := backend.PushAll()
+		if err != nil {
+			// TODO(aaijazi): This might cause log spam...
+			log.Warningf("Pushing stats to backend %v failed: %v", *statsBackend, err)
+		}
+	}
 }
 
 // Float is expvar.Float+Get+hook
@@ -88,7 +158,7 @@ type Float struct {
 // NewFloat creates a new Float and exports it.
 func NewFloat(name string) *Float {
 	v := new(Float)
-	Publish(name, v)
+	publish(name, v)
 	return v
 }
 
@@ -128,88 +198,6 @@ func (f FloatFunc) String() string {
 	return strconv.FormatFloat(f(), 'g', -1, 64)
 }
 
-// Int is expvar.Int+Get+hook
-type Int struct {
-	i sync2.AtomicInt64
-}
-
-// NewInt returns a new Int
-func NewInt(name string) *Int {
-	v := new(Int)
-	Publish(name, v)
-	return v
-}
-
-// Add adds the provided value to the Int
-func (v *Int) Add(delta int64) {
-	v.i.Add(delta)
-}
-
-// Set sets the value
-func (v *Int) Set(value int64) {
-	v.i.Set(value)
-}
-
-// Get returns the value
-func (v *Int) Get() int64 {
-	return v.i.Get()
-}
-
-// String is the implementation of expvar.var
-func (v *Int) String() string {
-	return strconv.FormatInt(v.i.Get(), 10)
-}
-
-// Duration exports a time.Duration
-type Duration struct {
-	i sync2.AtomicDuration
-}
-
-// NewDuration returns a new Duration
-func NewDuration(name string) *Duration {
-	v := new(Duration)
-	Publish(name, v)
-	return v
-}
-
-// Add adds the provided value to the Duration
-func (v *Duration) Add(delta time.Duration) {
-	v.i.Add(delta)
-}
-
-// Set sets the value
-func (v *Duration) Set(value time.Duration) {
-	v.i.Set(value)
-}
-
-// Get returns the value
-func (v *Duration) Get() time.Duration {
-	return v.i.Get()
-}
-
-// String is the implementation of expvar.var
-func (v *Duration) String() string {
-	return strconv.FormatInt(int64(v.i.Get()), 10)
-}
-
-// IntFunc converts a function that returns
-// an int64 as an expvar.
-type IntFunc func() int64
-
-// String is the implementation of expvar.var
-func (f IntFunc) String() string {
-	return strconv.FormatInt(f(), 10)
-}
-
-// DurationFunc converts a function that returns
-// an time.Duration as an expvar.
-type DurationFunc func() time.Duration
-
-// String is the implementation of expvar.var
-func (f DurationFunc) String() string {
-	return strconv.FormatInt(int64(f()), 10)
-}
-
 // String is expvar.String+Get+hook
 type String struct {
 	mu sync.Mutex
@@ -219,7 +207,7 @@ type String struct {
 // NewString returns a new String
 func NewString(name string) *String {
 	v := new(String)
-	Publish(name, v)
+	publish(name, v)
 	return v
 }
 
@@ -252,11 +240,11 @@ func (f StringFunc) String() string {
 	return strconv.Quote(f())
 }
 
-// JsonFunc is the public type for a single function that returns json directly.
-type JsonFunc func() string
+// JSONFunc is the public type for a single function that returns json directly.
+type JSONFunc func() string
 
 // String is the implementation of expvar.var
-func (f JsonFunc) String() string {
+func (f JSONFunc) String() string {
 	return f()
 }
 
@@ -264,7 +252,7 @@ func (f JsonFunc) String() string {
 // a JSON string as a variable. The string is sent to
 // expvar as is.
 func PublishJSONFunc(name string, f func() string) {
-	Publish(name, JsonFunc(f))
+	publish(name, JSONFunc(f))
 }
 
 // StringMap is a map of string -> string
@@ -276,7 +264,7 @@ type StringMap struct {
 // NewStringMap returns a new StringMap
 func NewStringMap(name string) *StringMap {
 	v := &StringMap{values: make(map[string]string)}
-	Publish(name, v)
+	publish(name, v)
 	return v
 }
 

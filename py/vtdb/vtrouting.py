@@ -1,6 +1,16 @@
-# Copyright 2013, Google Inc. All rights reserved.
-# Use of this source code is governed by a BSD-style license that can
-# be found in the LICENSE file.
+# Copyright 2017 Google Inc.
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#     http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 
 """Library for computing the parallization and routing for streaming queries.
@@ -229,7 +239,7 @@ def _create_where_clause_for_str_keyspace(key_range, keyspace_col_name):
     i += 1
     bind_vars[bind_name] = kr_min
   if kr_max != keyrange_constants.MAX_KEY:
-    if where_clause != '':
+    if where_clause:
       where_clause += ' AND '
     bind_name = '%s%d' % (keyspace_col_name, i)
     where_clause += 'hex(%s) < ' % keyspace_col_name + '%(' + bind_name + ')s'
@@ -262,7 +272,7 @@ def _create_where_clause_for_int_keyspace(key_range, keyspace_col_name):
     i += 1
     bind_vars[bind_name] = kr_min
   if kr_max is not None:
-    if where_clause != '':
+    if where_clause:
       where_clause += ' AND '
     bind_name = '%s%d' % (keyspace_col_name, i)
     where_clause += '%s < ' % keyspace_col_name + '%(' + bind_name + ')s'

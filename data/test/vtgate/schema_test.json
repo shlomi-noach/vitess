@@ -1,71 +1,205 @@
 {
-  "Keyspaces": {
+  "keyspaces": {
     "user": {
-      "Sharded": true,
-      "Vindexes": {
+      "sharded": true,
+      "vindexes": {
         "user_index": {
-          "Type": "hash",
-          "Owner": "user"
+          "type": "hash_test",
+          "owner": "user"
+        },
+        "kid_index": {
+          "type": "hash_test",
+          "owner": "multicolvin"
+        },
+        "user_md5_index": {
+          "type": "hash_test"
         },
         "music_user_map": {
-          "Type": "lookup",
-          "Owner": "music"
+          "type": "lookup_test",
+          "owner": "music"
+        },
+        "cola_map": {
+          "type": "lookup_test",
+          "owner": "multicolvin"
+        },
+        "colb_colc_map": {
+          "type": "lookup_test",
+          "owner": "multicolvin"
         },
         "name_user_map": {
-          "Type": "multi",
-          "Owner": "user"
+          "type": "multi",
+          "owner": "user"
+        },
+        "email_user_map": {
+          "type": "lookup_test",
+          "owner": "user_metadata"
+        },
+        "address_user_map": {
+          "type": "lookup_test",
+          "owner": "user_metadata"
+        },
+        "costly_map": {
+          "type": "costly",
+          "owner": "user"
+        },
+        "hash_dup": {
+          "type": "hash_test",
+          "owner": "user"
         }
       },
-      "Tables": {
+      "tables": {
         "user": {
-          "ColVindexes": [
+          "column_vindexes": [
             {
-              "Col": "id",
-              "Name": "user_index"
+              "column": "Id",
+              "name": "user_index"
             },
             {
-              "Col": "name",
-              "Name": "name_user_map"
+              "column": "Name",
+              "name": "name_user_map"
+            },
+            {
+              "column": "Costly",
+              "name": "costly_map"
+            }
+          ],
+          "auto_increment": {
+            "column": "id",
+            "sequence": "seq"
+          },
+          "columns": [
+            {
+              "name": "predef1"
+            },
+            {
+              "name": "predef2"
+            },
+            {
+              "name": "textcol1",
+              "type": "VARCHAR"
+            },
+            {
+              "name": "textcol2",
+              "type": "VARCHAR"
+            }
+          ]
+        },
+        "user_metadata": {
+          "column_vindexes": [
+            {
+              "column": "user_id",
+              "name": "user_index"
+            },
+            {
+              "column": "email",
+              "name": "email_user_map"
+            },
+            {
+              "column": "address",
+              "name": "address_user_map"
+            },
+            {
+              "column": "md5",
+              "name": "user_md5_index"
             }
           ]
         },
         "user_extra": {
-          "ColVindexes": [
+          "column_vindexes": [
             {
-              "Col": "user_id",
-              "Name": "user_index"
+              "column": "user_id",
+              "name": "user_index"
+            }
+          ],
+          "auto_increment": {
+            "column": "extra_id",
+            "sequence": "seq"
+          }
+        },
+        "music": {
+          "column_vindexes": [
+            {
+              "column": "user_id",
+              "name": "user_index"
+            },
+            {
+              "column": "id",
+              "name": "music_user_map"
             }
           ]
         },
-        "music": {
-          "ColVindexes": [
+        "multicolvin": {
+          "column_vindexes": [
             {
-              "Col": "user_id",
-              "Name": "user_index"
+              "column": "kid",
+              "name": "kid_index"
             },
             {
-              "Col": "id",
-              "Name": "music_user_map"
+              "column": "column_a",
+              "name": "cola_map"
+            },
+            {
+              "columns": ["column_b", "column_c"],
+              "name": "colb_colc_map"
             }
           ]
         },
         "music_extra": {
-          "ColVindexes": [
+          "column_vindexes": [
             {
-              "Col": "user_id",
-              "Name": "user_index"
+              "column": "user_id",
+              "name": "user_index"
             },
             {
-              "Col": "music_id",
-              "Name": "music_user_map"
+              "column": "music_id",
+              "name": "music_user_map"
+            }
+          ]
+        },
+        "weird`name": {
+          "column_vindexes": [
+            {
+              "column": "a`b*c",
+              "name": "user_index"
             }
           ]
         }
       }
     },
+    "second_user": {
+      "sharded": true,
+      "vindexes": {
+        "hash_dup": {
+          "type": "hash_test",
+          "owner": "user"
+        }
+      },
+      "tables": {
+      }
+    },
     "main": {
-      "Tables": {
-        "main1": {}
+      "tables": {
+        "unsharded": {
+          "columns": [
+            {
+              "name": "predef1"
+            },
+            {
+              "name": "predef3"
+            }
+          ]
+        },
+        "unsharded_a": {},
+        "unsharded_b": {},
+        "unsharded_auto": {
+          "auto_increment": {
+            "column": "id",
+            "sequence": "seq"
+          }
+        },
+        "seq": {
+          "type": "sequence"
+        }
       }
     }
   }

@@ -1,54 +1,71 @@
-// Copyright 2012, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package binlogplayer
 
 import (
 	"flag"
-	"time"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/vt/binlog/proto"
+	"golang.org/x/net/context"
+
+	"vitess.io/vitess/go/vt/log"
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 /*
 This file contains the API and registration mechanism for binlog player client.
 */
 
-var binlogPlayerProtocol = flag.String("binlog_player_protocol", "gorpc", "the protocol to download binlogs from a vttablet")
-var binlogPlayerConnTimeout = flag.Duration("binlog_player_conn_timeout", 5*time.Second, "binlog player connection timeout")
+var binlogPlayerProtocol = flag.String("binlog_player_protocol", "grpc", "the protocol to download binlogs from a vttablet")
 
-// BinlogPlayerResponse is the return value for streaming events
-type BinlogPlayerResponse interface {
-	Error() error
+// BinlogTransactionStream is the interface of the object returned by
+// StreamTables and StreamKeyRange
+type BinlogTransactionStream interface {
+	// Recv returns the next BinlogTransaction, or an error if the RPC was
+	// interrupted.
+	Recv() (*binlogdatapb.BinlogTransaction, error)
 }
 
-// BinlogPlayerClient is the interface all clients must satisfy
-type BinlogPlayerClient interface {
+// Client is the interface all clients must satisfy
+type Client interface {
 	// Dial a server
-	Dial(addr string, connTimeout time.Duration) error
+	Dial(tablet *topodatapb.Tablet) error
 
 	// Close the connection
 	Close()
 
-	// Ask the server to stream binlog updates
-	ServeUpdateStream(*proto.UpdateStreamRequest, chan *proto.StreamEvent) BinlogPlayerResponse
+	// Ask the server to stream updates related to the provided tables.
+	// Should return context.Canceled if the context is canceled.
+	StreamTables(ctx context.Context, position string, tables []string, charset *binlogdatapb.Charset) (BinlogTransactionStream, error)
 
-	// Ask the server to stream updates related to the provided tables
-	StreamTables(*proto.TablesRequest, chan *proto.BinlogTransaction) BinlogPlayerResponse
-
-	// Ask the server to stream updates related to thee provided keyrange
-	StreamKeyRange(*proto.KeyRangeRequest, chan *proto.BinlogTransaction) BinlogPlayerResponse
+	// Ask the server to stream updates related to the provided keyrange.
+	// Should return context.Canceled if the context is canceled.
+	StreamKeyRange(ctx context.Context, position string, keyRange *topodatapb.KeyRange, charset *binlogdatapb.Charset) (BinlogTransactionStream, error)
 }
 
-type BinlogPlayerClientFactory func() BinlogPlayerClient
+// ClientFactory is the factory method to create a Client
+type ClientFactory func() Client
 
-var binlogPlayerClientFactories = make(map[string]BinlogPlayerClientFactory)
+var clientFactories = make(map[string]ClientFactory)
 
-func RegisterBinlogPlayerClientFactory(name string, factory BinlogPlayerClientFactory) {
-	if _, ok := binlogPlayerClientFactories[name]; ok {
-		log.Fatalf("BinlogPlayerClientFactory %s already exists", name)
+// RegisterClientFactory adds a new factory. Call during init().
+func RegisterClientFactory(name string, factory ClientFactory) {
+	if _, ok := clientFactories[name]; ok {
+		log.Fatalf("ClientFactory %s already exists", name)
 	}
-	binlogPlayerClientFactories[name] = factory
+	clientFactories[name] = factory
 }

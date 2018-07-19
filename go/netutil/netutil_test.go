@@ -1,3 +1,19 @@
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreedto in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package netutil
 
 import (
@@ -54,9 +70,9 @@ func TestUniformity(t *testing.T) {
 func testWeighting(t *testing.T, margin float64) {
 	rand.Seed(1)
 	data := []*net.SRV{
-		&net.SRV{Target: "a", Weight: 60},
-		&net.SRV{Target: "b", Weight: 30},
-		&net.SRV{Target: "c", Weight: 10},
+		{Target: "a", Weight: 60},
+		{Target: "b", Weight: 30},
+		{Target: "c", Weight: 10},
 	}
 	checkDistribution(t, data, margin)
 }
@@ -71,8 +87,10 @@ func TestSplitHostPort(t *testing.T) {
 		port int
 	}
 	table := map[string]addr{
-		"host-name:132": addr{host: "host-name", port: 132},
-		"[::1]:321":     addr{host: "::1", port: 321},
+		"host-name:132":  {host: "host-name", port: 132},
+		"hostname:65535": {host: "hostname", port: 65535},
+		"[::1]:321":      {host: "::1", port: 321},
+		"::1:432":        {host: "::1", port: 432},
 	}
 	for input, want := range table {
 		gotHost, gotPort, err := SplitHostPort(input)
@@ -85,14 +103,28 @@ func TestSplitHostPort(t *testing.T) {
 	}
 }
 
+func TestSplitHostPortFail(t *testing.T) {
+	// These cases should all fail to parse.
+	inputs := []string{
+		"host-name",
+		"host-name:123abc",
+	}
+	for _, input := range inputs {
+		_, _, err := SplitHostPort(input)
+		if err == nil {
+			t.Errorf("expected error from SplitHostPort(%q), but got none", input)
+		}
+	}
+}
+
 func TestJoinHostPort(t *testing.T) {
 	type addr struct {
 		host string
-		port int
+		port int32
 	}
 	table := map[string]addr{
-		"host-name:132": addr{host: "host-name", port: 132},
-		"[::1]:321":     addr{host: "::1", port: 321},
+		"host-name:132": {host: "host-name", port: 132},
+		"[::1]:321":     {host: "::1", port: 321},
 	}
 	for want, input := range table {
 		if got := JoinHostPort(input.host, input.port); got != want {

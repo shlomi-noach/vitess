@@ -1,6 +1,18 @@
-// Copyright 2012, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package stats
 
@@ -10,63 +22,87 @@ import (
 	"time"
 )
 
+// For tests, we want to control exactly the time used by Rates.
+// The way Rates works is:
+// - at creation, do a snapshot.
+// - every interval, do a snapshot.
+// So in these tests, we make sure to always call snapshot() every interval.
+// We do other actions after epsilon, but then wait for intervalMinusEpsilon
+// and call snapshot().
+const (
+	interval             = 1 * time.Second
+	epsilon              = 50 * time.Millisecond
+	intervalMinusEpsilon = interval - epsilon
+)
+
 func TestRates(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping wait-based test in short mode.")
+	now := time.Now()
+	timeNow = func() time.Time {
+		return now
 	}
 
 	clear()
-	c := NewCounters("rcounter1")
-	r := NewRates("rates1", c, 3, 1*time.Second)
-	time.Sleep(50 * time.Millisecond)
+	c := NewCountersWithSingleLabel("rcounter1", "rcounter help", "label")
+	r := NewRates("rates1", c, 3, -1*time.Second)
+	r.snapshot()
+	now = now.Add(epsilon)
 	c.Add("tag1", 0)
 	c.Add("tag2", 0)
-	time.Sleep(1 * time.Second)
-	want := `{"tag1":[0],"tag2":[0]}`
-	if r.String() != want {
-		t.Errorf("want %s, got %s", want, r.String())
-	}
+	now = now.Add(intervalMinusEpsilon)
+	r.snapshot()
+	now = now.Add(epsilon)
+	checkRates(t, r, "after 1s", 0.0, `{"tag1":[0],"tag2":[0]}`)
+
 	c.Add("tag1", 10)
 	c.Add("tag2", 20)
-	time.Sleep(1 * time.Second)
-	want = `{"tag1":[0,10],"tag2":[0,20]}`
-	if r.String() != want {
-		t.Errorf("want %s, got %s", want, r.String())
+	now = now.Add(intervalMinusEpsilon)
+	r.snapshot()
+	now = now.Add(epsilon)
+	checkRates(t, r, "after 2s", 30.0, `{"tag1":[0,10],"tag2":[0,20]}`)
+
+	now = now.Add(intervalMinusEpsilon)
+	r.snapshot()
+	now = now.Add(epsilon)
+	checkRates(t, r, "after 3s", 0.0, `{"tag1":[0,10,0],"tag2":[0,20,0]}`)
+
+	now = now.Add(intervalMinusEpsilon)
+	r.snapshot()
+	now = now.Add(epsilon)
+	checkRates(t, r, "after 4s", 0.0, `{"tag1":[10,0,0],"tag2":[20,0,0]}`)
+}
+
+func checkRates(t *testing.T, r *Rates, desc string, wantRate float64, wantRateMap string) {
+	if got := r.String(); got != wantRateMap {
+		t.Errorf("%v: want %s, got %s", desc, wantRateMap, got)
 	}
-	time.Sleep(1 * time.Second)
-	want = `{"tag1":[0,10,0],"tag2":[0,20,0]}`
-	if r.String() != want {
-		t.Errorf("want %s, got %s", want, r.String())
-	}
-	time.Sleep(1 * time.Second)
-	want = `{"tag1":[10,0,0],"tag2":[20,0,0]}`
-	if r.String() != want {
-		t.Errorf("want %s, got %s", want, r.String())
+	if got := r.TotalRate(); got != wantRate {
+		t.Errorf("%v: want rate %v, got rate %v", desc, wantRate, got)
 	}
 }
 
 func TestRatesConsistency(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping wait-based test in short mode.")
+	now := time.Now()
+	timeNow = func() time.Time {
+		return now
 	}
 
 	// This tests the following invariant: in the time window
 	// covered by rates, the sum of the rates reported must be
 	// equal to the count reported by the counter.
-	const (
-		interval = 1 * time.Second
-		epsilon  = 50 * time.Millisecond
-	)
-
 	clear()
-	c := NewCounters("rcounter4")
-	r := NewRates("rates4", c, 100, interval)
+	c := NewCountersWithSingleLabel("rcounter4", "rcounter4 help", "label")
+	r := NewRates("rates4", c, 100, -1*time.Second)
+	r.snapshot()
 
-	time.Sleep(epsilon)
+	now = now.Add(epsilon)
 	c.Add("a", 1000)
-	time.Sleep(interval)
+	now = now.Add(intervalMinusEpsilon)
+	r.snapshot()
+	now = now.Add(epsilon)
 	c.Add("a", 1)
-	time.Sleep(interval)
+	now = now.Add(intervalMinusEpsilon)
+	r.snapshot()
+	now = now.Add(epsilon)
 
 	result := r.Get()
 	counts := c.Counts()
@@ -87,7 +123,7 @@ func TestRatesConsistency(t *testing.T) {
 
 func TestRatesHook(t *testing.T) {
 	clear()
-	c := NewCounters("rcounter2")
+	c := NewCountersWithSingleLabel("rcounter2", "rcounter2 help", "label")
 	var gotname string
 	var gotv *Rates
 	clear()

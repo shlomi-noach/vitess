@@ -1,6 +1,18 @@
-// Copyright 2012, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 /*
   Generate my.cnf files from templates.
@@ -14,7 +26,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strconv"
 )
 
@@ -22,15 +33,14 @@ import (
 // parameters to start mysqld. It can be used to generate standard
 // my.cnf files from a server id and mysql port. It can also be
 // populated from an existing my.cnf, or by command line parameters.
-// command line parameters.
 type Mycnf struct {
-	// ServerId is the unique id for this server.
+	// ServerID is the unique id for this server.
 	// Used to create a bunch of named directories.
-	ServerId uint32
+	ServerID uint32
 
 	// MysqlPort is the port for the MySQL server running on this machine.
 	// It is mainly used to communicate with topology server.
-	MysqlPort int
+	MysqlPort int32
 
 	// DataDir is where the table files are
 	// (used by vt software for Clone)
@@ -47,6 +57,11 @@ type Mycnf struct {
 	// SocketFile is the path to the local mysql.sock file.
 	// (used by vt software to check server is running)
 	SocketFile string
+
+	// GeneralLogPath is the path to store general logs at,
+	// if general-log is enabled.
+	// (unused by vt software for now)
+	GeneralLogPath string
 
 	// ErrorLogPath is the path to store error logs at.
 	// (unused by vt software for now)
@@ -69,7 +84,7 @@ type Mycnf struct {
 	RelayLogInfoPath string
 
 	// BinLogPath is the base path for binlogs
-	// (used by vt software for binlog streaming and rowcache invalidation)
+	// (used by vt software for binlog streaming)
 	BinLogPath string
 
 	// MasterInfoFile is the master.info file location.
@@ -92,13 +107,32 @@ type Mycnf struct {
 	path     string // the actual path that represents this mycnf
 }
 
-func (cnf *Mycnf) lookupAndCheck(key string) string {
+func (cnf *Mycnf) lookup(key string) string {
 	key = normKey([]byte(key))
-	val := cnf.mycnfMap[key]
+	return cnf.mycnfMap[key]
+}
+
+func (cnf *Mycnf) lookupWithDefault(key, defaultVal string) (string, error) {
+	val := cnf.lookup(key)
 	if val == "" {
-		panic(fmt.Errorf("Value for key '%v' not set", key))
+		if defaultVal == "" {
+			return "", fmt.Errorf("value for key '%v' not set and no default value set", key)
+		}
+		return defaultVal, nil
 	}
-	return val
+	return val, nil
+}
+
+func (cnf *Mycnf) lookupInt(key string) (int, error) {
+	val, err := cnf.lookupWithDefault(key, "")
+	if err != nil {
+		return 0, err
+	}
+	ival, err := strconv.Atoi(val)
+	if err != nil {
+		return 0, fmt.Errorf("failed to convert %s: %v", key, err)
+	}
+	return ival, nil
 }
 
 func normKey(bkey []byte) string {
@@ -107,23 +141,16 @@ func normKey(bkey []byte) string {
 	return string(bytes.Replace(bytes.TrimSpace(bkey), []byte("_"), []byte("-"), -1))
 }
 
-// ReadMycnf will read an existing my.cnf from disk, and create a Mycnf object.
-func ReadMycnf(cnfFile string) (mycnf *Mycnf, err error) {
-	defer func(err *error) {
-		if x := recover(); x != nil {
-			*err = x.(error)
-		}
-	}(&err)
-
-	f, err := os.Open(cnfFile)
+// ReadMycnf will read an existing my.cnf from disk, and update the passed in Mycnf object
+// with values from the my.cnf on disk.
+func ReadMycnf(mycnf *Mycnf) (*Mycnf, error) {
+	f, err := os.Open(mycnf.path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
 	buf := bufio.NewReader(f)
-	mycnf = new(Mycnf)
-	mycnf.path, err = filepath.Abs(cnfFile)
 	if err != nil {
 		return nil, err
 	}
@@ -147,31 +174,42 @@ func ReadMycnf(cnfFile string) (mycnf *Mycnf, err error) {
 		mycnf.mycnfMap[lval] = rval
 	}
 
-	serverIdStr := mycnf.lookupAndCheck("server-id")
-	serverId, err := strconv.Atoi(serverIdStr)
+	serverID, err := mycnf.lookupInt("server-id")
 	if err != nil {
-		return nil, fmt.Errorf("Failed to convert server-id %v", err)
+		return nil, err
 	}
-	mycnf.ServerId = uint32(serverId)
+	mycnf.ServerID = uint32(serverID)
 
-	portStr := mycnf.lookupAndCheck("port")
-	port, err := strconv.Atoi(portStr)
+	port, err := mycnf.lookupInt("port")
 	if err != nil {
-		return nil, fmt.Errorf("Failed: failed to convert port %v", err)
+		return nil, err
 	}
-	mycnf.MysqlPort = port
-	mycnf.DataDir = mycnf.lookupAndCheck("datadir")
-	mycnf.InnodbDataHomeDir = mycnf.lookupAndCheck("innodb_data_home_dir")
-	mycnf.InnodbLogGroupHomeDir = mycnf.lookupAndCheck("innodb_log_group_home_dir")
-	mycnf.SocketFile = mycnf.lookupAndCheck("socket")
-	mycnf.ErrorLogPath = mycnf.lookupAndCheck("log-error")
-	mycnf.SlowLogPath = mycnf.lookupAndCheck("slow-query-log-file")
-	mycnf.RelayLogPath = mycnf.lookupAndCheck("relay-log")
-	mycnf.RelayLogIndexPath = mycnf.lookupAndCheck("relay-log-index")
-	mycnf.RelayLogInfoPath = mycnf.lookupAndCheck("relay-log-info-file")
-	mycnf.BinLogPath = mycnf.lookupAndCheck("log-bin")
-	mycnf.MasterInfoFile = mycnf.lookupAndCheck("master-info-file")
-	mycnf.PidFile = mycnf.lookupAndCheck("pid-file")
+	mycnf.MysqlPort = int32(port)
+
+	mapping := map[string]*string{
+		"datadir":                   &mycnf.DataDir,
+		"innodb_data_home_dir":      &mycnf.InnodbDataHomeDir,
+		"innodb_log_group_home_dir": &mycnf.InnodbLogGroupHomeDir,
+		"socket":                    &mycnf.SocketFile,
+		"general_log_file":          &mycnf.GeneralLogPath,
+		"log-error":                 &mycnf.ErrorLogPath,
+		"slow-query-log-file":       &mycnf.SlowLogPath,
+		"relay-log":                 &mycnf.RelayLogPath,
+		"relay-log-index":           &mycnf.RelayLogIndexPath,
+		"relay-log-info-file":       &mycnf.RelayLogInfoPath,
+		"log-bin":                   &mycnf.BinLogPath,
+		"master-info-file":          &mycnf.MasterInfoFile,
+		"pid-file":                  &mycnf.PidFile,
+		"tmpdir":                    &mycnf.TmpDir,
+		"slave_load_tmpdir":         &mycnf.SlaveLoadTmpDir,
+	}
+	for key, member := range mapping {
+		val, err := mycnf.lookupWithDefault(key, *member)
+		if err != nil {
+			return nil, err
+		}
+		*member = val
+	}
 
 	return mycnf, nil
 }

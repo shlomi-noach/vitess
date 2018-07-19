@@ -1,6 +1,18 @@
-// Copyright 2014, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 // mysqlctld is a daemon that starts or initializes mysqld and provides an RPC
 // interface for vttablet to stop and start mysqld from a different container
@@ -10,13 +22,15 @@ package main
 import (
 	"flag"
 	"os"
+	"time"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/exit"
-	"github.com/youtube/vitess/go/vt/dbconfigs"
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/vt/mysqlctl"
-	"github.com/youtube/vitess/go/vt/servenv"
+	"golang.org/x/net/context"
+	"vitess.io/vitess/go/exit"
+	"vitess.io/vitess/go/vt/dbconfigs"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/mysqlctl"
+	"vitess.io/vitess/go/vt/servenv"
 )
 
 var (
@@ -24,67 +38,86 @@ var (
 	mysqld *mysqlctl.Mysqld
 
 	mysqlPort   = flag.Int("mysql_port", 3306, "mysql port")
-	tabletUid   = flag.Uint("tablet_uid", 41983, "tablet uid")
+	tabletUID   = flag.Uint("tablet_uid", 41983, "tablet uid")
 	mysqlSocket = flag.String("mysql_socket", "", "path to the mysql socket")
 
 	// mysqlctl init flags
-	waitTime         = flag.Duration("wait_time", mysqlctl.MysqlWaitTime, "how long to wait for mysqld startup or shutdown")
-	bootstrapArchive = flag.String("bootstrap_archive", "mysql-db-dir.tbz", "name of bootstrap archive within vitess/data/bootstrap directory")
-	skipSchema       = flag.Bool("skip_schema", false, "don't apply initial schema")
+	waitTime      = flag.Duration("wait_time", 5*time.Minute, "how long to wait for mysqld startup or shutdown")
+	initDBSQLFile = flag.String("init_db_sql_file", "", "path to .sql file to run after mysql_install_db")
 )
 
 func init() {
 	servenv.RegisterDefaultFlags()
 	servenv.RegisterDefaultSocketFileFlags()
-
-	// Enable only for unix socket by default, can be changed on the command-line.
-	servenv.ServiceMap["bsonrpc-unix-mysqlctl"] = true
 }
 
 func main() {
 	defer exit.Recover()
 	defer logutil.Flush()
 
-	flags := dbconfigs.AppConfig | dbconfigs.DbaConfig |
-		dbconfigs.FilteredConfig | dbconfigs.ReplConfig
-	dbconfigs.RegisterFlags(flags)
-	flag.Parse()
+	// mysqlctld only starts and stops mysql, only needs dba.
+	dbconfigs.RegisterFlags(dbconfigs.Dba)
+	servenv.ParseFlags("mysqlctld")
 
-	mycnf := mysqlctl.NewMycnf(uint32(*tabletUid), *mysqlPort)
-	if *mysqlSocket != "" {
-		mycnf.SocketFile = *mysqlSocket
-	}
-
-	dbcfgs, err := dbconfigs.Init(mycnf.SocketFile, flags)
-	if err != nil {
-		log.Errorf("%v", err)
-		exit.Return(255)
-	}
-	mysqld = mysqlctl.NewMysqld("Dba", mycnf, &dbcfgs.Dba, &dbcfgs.Repl)
-
-	// Register OnTerm handler before mysqld starts, so we get notified if mysqld
-	// dies on its own without us (or our RPC client) telling it to.
+	// We'll register this OnTerm handler before mysqld starts, so we get notified
+	// if mysqld dies on its own without us (or our RPC client) telling it to.
 	mysqldTerminated := make(chan struct{})
-	mysqld.OnTerm(func() {
+	onTermFunc := func() {
 		close(mysqldTerminated)
-	})
+	}
 
 	// Start or Init mysqld as needed.
-	if _, err = os.Stat(mycnf.DataDir); os.IsNotExist(err) {
-		log.Infof("mysql data dir (%s) doesn't exist, initializing", mycnf.DataDir)
-		mysqld.Init(*waitTime, *bootstrapArchive, *skipSchema)
+	ctx, cancel := context.WithTimeout(context.Background(), *waitTime)
+	mycnfFile := mysqlctl.MycnfFile(uint32(*tabletUID))
+	if _, statErr := os.Stat(mycnfFile); os.IsNotExist(statErr) {
+		// Generate my.cnf from scratch and use it to find mysqld.
+		log.Infof("mycnf file (%s) doesn't exist, initializing", mycnfFile)
+
+		var err error
+		mysqld, err = mysqlctl.CreateMysqld(uint32(*tabletUID), *mysqlSocket, int32(*mysqlPort))
+		if err != nil {
+			log.Errorf("failed to initialize mysql config: %v", err)
+			exit.Return(1)
+		}
+		mysqld.OnTerm(onTermFunc)
+
+		if err := mysqld.Init(ctx, *initDBSQLFile); err != nil {
+			log.Errorf("failed to initialize mysql data dir and start mysqld: %v", err)
+			exit.Return(1)
+		}
 	} else {
-		log.Infof("mysql data dir (%s) already exists, starting without init", mycnf.DataDir)
-		mysqld.Start(*waitTime)
+		// There ought to be an existing my.cnf, so use it to find mysqld.
+		log.Infof("mycnf file (%s) already exists, starting without init", mycnfFile)
+
+		var err error
+		mysqld, err = mysqlctl.OpenMysqld(uint32(*tabletUID))
+		if err != nil {
+			log.Errorf("failed to find mysql config: %v", err)
+			exit.Return(1)
+		}
+		mysqld.OnTerm(onTermFunc)
+
+		err = mysqld.RefreshConfig(ctx)
+		if err != nil {
+			log.Errorf("failed to refresh config: %v", err)
+			exit.Return(1)
+		}
+
+		if err := mysqld.Start(ctx); err != nil {
+			log.Errorf("failed to start mysqld: %v", err)
+			exit.Return(1)
+		}
 	}
+	cancel()
 
 	servenv.Init()
 	defer servenv.Close()
 
 	// Take mysqld down with us on SIGTERM before entering lame duck.
-	servenv.OnTerm(func() {
+	servenv.OnTermSync(func() {
 		log.Infof("mysqlctl received SIGTERM, shutting down mysqld first")
-		mysqld.Shutdown(false, 0)
+		ctx := context.Background()
+		mysqld.Shutdown(ctx, true)
 	})
 
 	// Start RPC server and wait for SIGTERM.

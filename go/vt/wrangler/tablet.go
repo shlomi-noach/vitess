@@ -1,16 +1,32 @@
-// Copyright 2012, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package wrangler
 
 import (
 	"fmt"
 
-	mproto "github.com/youtube/vitess/go/mysql/proto"
-	"github.com/youtube/vitess/go/vt/tabletmanager/actionnode"
-	"github.com/youtube/vitess/go/vt/topo"
-	"github.com/youtube/vitess/go/vt/topotools"
+	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/key"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/topotools"
+
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 // Tablet related methods for wrangler
@@ -19,259 +35,137 @@ import (
 // in the tablet, and the tablet has a slave type, we will find the
 // appropriate parent. If createShardAndKeyspace is true and the
 // parent keyspace or shard don't exist, they will be created.  If
-// update is true, and a tablet with the same ID exists, update it.
-// If Force is true, and a tablet with the same ID already exists, it
-// will be scrapped and deleted, and then recreated.
-func (wr *Wrangler) InitTablet(tablet *topo.Tablet, force, createShardAndKeyspace, update bool) error {
-	if err := tablet.Complete(); err != nil {
+// allowUpdate is true, and a tablet with the same ID exists, just update it.
+// If a tablet is created as master, and there is already a different
+// master in the shard, allowMasterOverride must be set.
+func (wr *Wrangler) InitTablet(ctx context.Context, tablet *topodatapb.Tablet, allowMasterOverride, createShardAndKeyspace, allowUpdate bool) error {
+	shard, kr, err := topo.ValidateShardName(tablet.Shard)
+	if err != nil {
 		return err
 	}
+	tablet.Shard = shard
+	tablet.KeyRange = kr
 
-	if tablet.IsInReplicationGraph() {
+	// get the shard, possibly creating it
+	var si *topo.ShardInfo
+
+	if createShardAndKeyspace {
 		// create the parent keyspace and shard if needed
-		if createShardAndKeyspace {
-			if err := wr.ts.CreateKeyspace(tablet.Keyspace, &topo.Keyspace{}); err != nil && err != topo.ErrNodeExists {
-				return err
-			}
-
-			if err := topo.CreateShard(wr.ts, tablet.Keyspace, tablet.Shard); err != nil && err != topo.ErrNodeExists {
-				return err
-			}
-		}
-
-		// get the shard, checks a couple things
-		si, err := wr.ts.GetShard(tablet.Keyspace, tablet.Shard)
-		if err != nil {
+		si, err = wr.ts.GetOrCreateShard(ctx, tablet.Keyspace, tablet.Shard)
+	} else {
+		si, err = wr.ts.GetShard(ctx, tablet.Keyspace, tablet.Shard)
+		if topo.IsErrType(err, topo.NoNode) {
 			return fmt.Errorf("missing parent shard, use -parent option to create it, or CreateKeyspace / CreateShard")
 		}
-		if si.KeyRange != tablet.KeyRange {
-			return fmt.Errorf("shard %v/%v has a different KeyRange: %v != %v", tablet.Keyspace, tablet.Shard, si.KeyRange, tablet.KeyRange)
-		}
-		if tablet.Type == topo.TYPE_MASTER && !si.MasterAlias.IsZero() && si.MasterAlias != tablet.Alias && !force {
-			return fmt.Errorf("creating this tablet would override old master %v in shard %v/%v", si.MasterAlias, tablet.Keyspace, tablet.Shard)
-		}
-
-		// update the shard record if needed
-		if err := wr.updateShardCellsAndMaster(si, tablet.Alias, tablet.Type, force); err != nil {
-			return err
-		}
 	}
 
-	err := topo.CreateTablet(wr.ts, tablet)
-	if err != nil && err == topo.ErrNodeExists {
-		// Try to update nicely, but if it fails fall back to force behavior.
-		if update || force {
-			oldTablet, err := wr.ts.GetTablet(tablet.Alias)
-			if err != nil {
-				wr.Logger().Warningf("failed reading tablet %v: %v", tablet.Alias, err)
-			} else {
-				if oldTablet.Keyspace == tablet.Keyspace && oldTablet.Shard == tablet.Shard {
-					*(oldTablet.Tablet) = *tablet
-					if err := topo.UpdateTablet(wr.ctx, wr.ts, oldTablet); err != nil {
-						wr.Logger().Warningf("failed updating tablet %v: %v", tablet.Alias, err)
-						// now fall through the Scrap case
-					} else {
-						if !tablet.IsInReplicationGraph() {
-							return nil
-						}
+	// get the shard, checks a couple things
+	if err != nil {
+		return fmt.Errorf("cannot get (or create) shard %v/%v: %v", tablet.Keyspace, tablet.Shard, err)
+	}
+	if !key.KeyRangeEqual(si.KeyRange, tablet.KeyRange) {
+		return fmt.Errorf("shard %v/%v has a different KeyRange: %v != %v", tablet.Keyspace, tablet.Shard, si.KeyRange, tablet.KeyRange)
+	}
+	if tablet.Type == topodatapb.TabletType_MASTER && si.HasMaster() && !topoproto.TabletAliasEqual(si.MasterAlias, tablet.Alias) && !allowMasterOverride {
+		return fmt.Errorf("creating this tablet would override old master %v in shard %v/%v, use allow_master_override flag", topoproto.TabletAliasString(si.MasterAlias), tablet.Keyspace, tablet.Shard)
+	}
 
-						if err := topo.UpdateTabletReplicationData(wr.ctx, wr.ts, tablet); err != nil {
-							wr.Logger().Warningf("failed updating tablet replication data for %v: %v", tablet.Alias, err)
-							// now fall through the Scrap case
-						} else {
-							return nil
-						}
-					}
-				}
-			}
+	// update the shard record if needed
+	if err := wr.updateShardCellsAndMaster(ctx, si, tablet.Alias, tablet.Type, allowMasterOverride); err != nil {
+		return err
+	}
+
+	err = wr.ts.CreateTablet(ctx, tablet)
+	if topo.IsErrType(err, topo.NodeExists) && allowUpdate {
+		// Try to update then
+		oldTablet, err := wr.ts.GetTablet(ctx, tablet.Alias)
+		if err != nil {
+			return fmt.Errorf("failed reading existing tablet %v: %v", topoproto.TabletAliasString(tablet.Alias), err)
 		}
-		if force {
-			if err = wr.Scrap(tablet.Alias, force, false); err != nil {
-				wr.Logger().Errorf("failed scrapping tablet %v: %v", tablet.Alias, err)
-				return err
-			}
-			if err := wr.ts.DeleteTablet(tablet.Alias); err != nil {
-				// we ignore this
-				wr.Logger().Errorf("failed deleting tablet %v: %v", tablet.Alias, err)
-			}
-			return topo.CreateTablet(wr.ts, tablet)
+
+		// Check we have the same keyspace / shard, and if not,
+		// require the allowDifferentShard flag.
+		if oldTablet.Keyspace != tablet.Keyspace || oldTablet.Shard != tablet.Shard {
+			return fmt.Errorf("old tablet has shard %v/%v. Cannot override with shard %v/%v. Delete and re-add tablet if you want to change the tablet's keyspace/shard", oldTablet.Keyspace, oldTablet.Shard, tablet.Keyspace, tablet.Shard)
 		}
+
+		*(oldTablet.Tablet) = *tablet
+		if err := wr.ts.UpdateTablet(ctx, oldTablet); err != nil {
+			return fmt.Errorf("failed updating tablet %v: %v", topoproto.TabletAliasString(tablet.Alias), err)
+		}
+		return nil
 	}
 	return err
 }
 
-// Scrap a tablet. If force is used, we write to topo.Server
-// directly and don't remote-execute the command.
-//
-// If we scrap the master for a shard, we will clear its record
-// from the Shard object (only if that was the right master)
-func (wr *Wrangler) Scrap(tabletAlias topo.TabletAlias, force, skipRebuild bool) error {
+// DeleteTablet removes a tablet from a shard.
+// - if allowMaster is set, we can Delete a master tablet (and clear
+// its record from the Shard record if it was the master).
+func (wr *Wrangler) DeleteTablet(ctx context.Context, tabletAlias *topodatapb.TabletAlias, allowMaster bool) (err error) {
 	// load the tablet, see if we'll need to rebuild
-	ti, err := wr.ts.GetTablet(tabletAlias)
+	ti, err := wr.ts.GetTablet(ctx, tabletAlias)
 	if err != nil {
 		return err
 	}
-	rebuildRequired := ti.Tablet.IsInServingGraph()
-	wasMaster := ti.Type == topo.TYPE_MASTER
-
-	if force {
-		err = topotools.Scrap(wr.ctx, wr.ts, ti.Alias, force)
-	} else {
-		err = wr.tmc.Scrap(wr.ctx, ti)
+	wasMaster := ti.Type == topodatapb.TabletType_MASTER
+	if wasMaster && !allowMaster {
+		return fmt.Errorf("cannot delete tablet %v as it is a master, use allow_master flag", topoproto.TabletAliasString(tabletAlias))
 	}
-	if err != nil {
+
+	// remove the record and its replication graph entry
+	if err := topotools.DeleteTablet(ctx, wr.ts, ti.Tablet); err != nil {
 		return err
 	}
 
-	if !rebuildRequired {
-		wr.Logger().Infof("Rebuild not required")
-		return nil
-	}
-	if skipRebuild {
-		wr.Logger().Warningf("Rebuild required, but skipping it")
-		return nil
-	}
-
-	// update the Shard object if the master was scrapped
+	// update the Shard object if the master was scrapped.
 	if wasMaster {
-		actionNode := actionnode.UpdateShard()
-		lockPath, err := wr.lockShard(ti.Keyspace, ti.Shard, actionNode)
-		if err != nil {
-			return err
+		// We lock the shard to not conflict with reparent operations.
+		ctx, unlock, lockErr := wr.ts.LockShard(ctx, ti.Keyspace, ti.Shard, fmt.Sprintf("DeleteTablet(%v)", topoproto.TabletAliasString(tabletAlias)))
+		if lockErr != nil {
+			return lockErr
 		}
+		defer unlock(&err)
 
-		// read the shard with the lock
-		si, err := wr.ts.GetShard(ti.Keyspace, ti.Shard)
-		if err != nil {
-			return wr.unlockShard(ti.Keyspace, ti.Shard, actionNode, lockPath, err)
-		}
-
-		// update it if the right alias is there
-		if si.MasterAlias == tabletAlias {
-			si.MasterAlias = topo.TabletAlias{}
-
-			// write it back
-			if err := topo.UpdateShard(wr.ctx, wr.ts, si); err != nil {
-				return wr.unlockShard(ti.Keyspace, ti.Shard, actionNode, lockPath, err)
+		// update the shard record's master
+		_, err = wr.ts.UpdateShardFields(ctx, ti.Keyspace, ti.Shard, func(si *topo.ShardInfo) error {
+			if !topoproto.TabletAliasEqual(si.MasterAlias, tabletAlias) {
+				wr.Logger().Warningf("Deleting master %v from shard %v/%v but master in Shard object was %v", topoproto.TabletAliasString(tabletAlias), ti.Keyspace, ti.Shard, topoproto.TabletAliasString(si.MasterAlias))
+				return topo.NewError(topo.NoUpdateNeeded, si.Keyspace()+"/"+si.ShardName())
 			}
-		} else {
-			wr.Logger().Warningf("Scrapping master %v from shard %v/%v but master in Shard object was %v", tabletAlias, ti.Keyspace, ti.Shard, si.MasterAlias)
-		}
-
-		// and unlock
-		if err := wr.unlockShard(ti.Keyspace, ti.Shard, actionNode, lockPath, err); err != nil {
-			return err
-		}
-	}
-
-	// and rebuild the original shard / keyspace
-	_, err = wr.RebuildShardGraph(ti.Keyspace, ti.Shard, []string{ti.Alias.Cell})
-	return err
-}
-
-// ChangeType changes the type of tablet and recompute all necessary derived paths in the
-// serving graph. If force is true, it will bypass the RPC action
-// system and make the data change directly, and not run the remote
-// hooks.
-//
-// Note we don't update the master record in the Shard here, as we
-// can't ChangeType from and out of master anyway.
-func (wr *Wrangler) ChangeType(tabletAlias topo.TabletAlias, tabletType topo.TabletType, force bool) error {
-	rebuildRequired, cell, keyspace, shard, err := wr.ChangeTypeNoRebuild(tabletAlias, tabletType, force)
-	if err != nil {
+			si.MasterAlias = nil
+			return nil
+		})
 		return err
 	}
-	if rebuildRequired {
-		_, err = wr.RebuildShardGraph(keyspace, shard, []string{cell})
-		return err
-	}
+
 	return nil
 }
 
-// ChangeTypeNoRebuild changes a tablet's type, and returns whether
-// there's a shard that should be rebuilt, along with its cell,
-// keyspace, and shard. If force is true, it will bypass the RPC action
-// system and make the data change directly, and not run the remote
-// hooks.
+// ChangeSlaveType changes the type of tablet and recomputes all
+// necessary derived paths in the serving graph, if necessary.
 //
 // Note we don't update the master record in the Shard here, as we
 // can't ChangeType from and out of master anyway.
-func (wr *Wrangler) ChangeTypeNoRebuild(tabletAlias topo.TabletAlias, tabletType topo.TabletType, force bool) (rebuildRequired bool, cell, keyspace, shard string, err error) {
-	// Load tablet to find keyspace and shard assignment.
-	// Don't load after the ChangeType which might have unassigned
-	// the tablet.
-	ti, err := wr.ts.GetTablet(tabletAlias)
-	if err != nil {
-		return false, "", "", "", err
-	}
-
-	if force {
-		if err := topotools.ChangeType(wr.ctx, wr.ts, tabletAlias, tabletType, nil, false); err != nil {
-			return false, "", "", "", err
-		}
-	} else {
-		if err := wr.tmc.ChangeType(wr.ctx, ti, tabletType); err != nil {
-			return false, "", "", "", err
-		}
-	}
-
-	if !ti.Tablet.IsInServingGraph() {
-		// re-read the tablet, see if we become serving
-		ti, err = wr.ts.GetTablet(tabletAlias)
-		if err != nil {
-			return false, "", "", "", err
-		}
-		if !ti.Tablet.IsInServingGraph() {
-			return false, "", "", "", nil
-		}
-	}
-	return true, ti.Alias.Cell, ti.Keyspace, ti.Shard, nil
-
-}
-
-// same as ChangeType, but assume we already have the shard lock,
-// and do not have the option to force anything.
-func (wr *Wrangler) changeTypeInternal(tabletAlias topo.TabletAlias, dbType topo.TabletType) error {
-	ti, err := wr.ts.GetTablet(tabletAlias)
+func (wr *Wrangler) ChangeSlaveType(ctx context.Context, tabletAlias *topodatapb.TabletAlias, tabletType topodatapb.TabletType) error {
+	// Load tablet to find endpoint, and keyspace and shard assignment.
+	ti, err := wr.ts.GetTablet(ctx, tabletAlias)
 	if err != nil {
 		return err
 	}
-	rebuildRequired := ti.Tablet.IsInServingGraph()
 
-	// change the type
-	if err := wr.tmc.ChangeType(wr.ctx, ti, dbType); err != nil {
-		return err
+	if !topo.IsTrivialTypeChange(ti.Type, tabletType) {
+		return fmt.Errorf("tablet %v type change %v -> %v is not an allowed transition for ChangeSlaveType", tabletAlias, ti.Type, tabletType)
 	}
 
-	// rebuild if necessary
-	if rebuildRequired {
-		_, err = wr.RebuildShardGraph(ti.Keyspace, ti.Shard, []string{ti.Alias.Cell})
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	// and ask the tablet to make the change
+	return wr.tmc.ChangeType(ctx, ti.Tablet, tabletType)
 }
 
-// DeleteTablet will get the tablet record, and if it's scrapped, will
-// delete the record from the topology.
-func (wr *Wrangler) DeleteTablet(tabletAlias topo.TabletAlias) error {
-	ti, err := wr.ts.GetTablet(tabletAlias)
-	if err != nil {
-		return err
-	}
-	// refuse to delete tablets that are not scrapped
-	if ti.Type != topo.TYPE_SCRAP {
-		return fmt.Errorf("Can only delete scrapped tablets")
-	}
-	return wr.TopoServer().DeleteTablet(tabletAlias)
-}
-
-// ExecuteFetch will get data from a remote tablet
-func (wr *Wrangler) ExecuteFetch(tabletAlias topo.TabletAlias, query string, maxRows int, wantFields, disableBinlogs bool) (*mproto.QueryResult, error) {
-	ti, err := wr.ts.GetTablet(tabletAlias)
+// ExecuteFetchAsDba executes a query remotely using the DBA pool
+func (wr *Wrangler) ExecuteFetchAsDba(ctx context.Context, tabletAlias *topodatapb.TabletAlias, query string, maxRows int, disableBinlogs bool, reloadSchema bool) (*querypb.QueryResult, error) {
+	ti, err := wr.ts.GetTablet(ctx, tabletAlias)
 	if err != nil {
 		return nil, err
 	}
-	return wr.tmc.ExecuteFetch(wr.ctx, ti, query, maxRows, wantFields, disableBinlogs)
+	return wr.tmc.ExecuteFetchAsDba(ctx, ti.Tablet, false, []byte(query), maxRows, disableBinlogs, reloadSchema)
 }

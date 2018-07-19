@@ -1,96 +1,37 @@
-// Copyright 2013, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package helpers
 
 import (
-	"fmt"
 	"testing"
 
-	"golang.org/x/net/context"
-
-	"github.com/youtube/vitess/go/vt/topo"
-	"github.com/youtube/vitess/go/vt/topo/test"
-	"github.com/youtube/vitess/go/vt/zktopo"
-	"github.com/youtube/vitess/go/zk"
-	"github.com/youtube/vitess/go/zk/fakezk"
-	"launchpad.net/gozk/zookeeper"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo/memorytopo"
+	"vitess.io/vitess/go/vt/topo/test"
 )
 
-type fakeServer struct {
-	topo.Server
-	localCells []string
-}
-
-func (s fakeServer) GetKnownCells() ([]string, error) {
-	return s.localCells, nil
-}
-
-func newFakeTeeServer(t *testing.T) topo.Server {
-	cells := []string{"test", "global"} // global has to be last
-
-	zconn1 := fakezk.NewConn()
-	zconn2 := fakezk.NewConn()
-
-	for _, cell := range cells {
-		if _, err := zk.CreateRecursive(zconn1, fmt.Sprintf("/zk/%v/vt", cell), "", 0, zookeeper.WorldACL(zookeeper.PERM_ALL)); err != nil {
-			t.Fatalf("cannot init ZooKeeper: %v", err)
+func TestTeeTopo(t *testing.T) {
+	test.TopoServerTestSuite(t, func() *topo.Server {
+		s1 := memorytopo.NewServer(test.LocalCellName)
+		s2 := memorytopo.NewServer(test.LocalCellName)
+		tee, err := NewTee(s1, s2, false)
+		if err != nil {
+			t.Fatalf("NewTee() failed: %v", err)
 		}
-		if _, err := zk.CreateRecursive(zconn2, fmt.Sprintf("/zk/%v/vt", cell), "", 0, zookeeper.WorldACL(zookeeper.PERM_ALL)); err != nil {
-			t.Fatalf("cannot init ZooKeeper: %v", err)
-		}
-	}
-	s1 := fakeServer{Server: zktopo.NewServer(zconn1), localCells: cells[:len(cells)-1]}
-	s2 := fakeServer{Server: zktopo.NewServer(zconn2), localCells: cells[:len(cells)-1]}
-
-	return NewTee(s1, s2, false)
-}
-
-func TestKeyspace(t *testing.T) {
-	ts := newFakeTeeServer(t)
-	test.CheckKeyspace(t, ts)
-}
-
-func TestShard(t *testing.T) {
-	ts := newFakeTeeServer(t)
-	test.CheckShard(t, ts)
-}
-
-func TestTablet(t *testing.T) {
-	ts := newFakeTeeServer(t)
-	test.CheckTablet(context.Background(), t, ts)
-}
-
-func TestServingGraph(t *testing.T) {
-	ts := newFakeTeeServer(t)
-	test.CheckServingGraph(t, ts)
-}
-
-func TestShardReplication(t *testing.T) {
-	ts := newFakeTeeServer(t)
-	test.CheckShardReplication(t, ts)
-}
-
-func TestKeyspaceLock(t *testing.T) {
-	ts := newFakeTeeServer(t)
-	test.CheckKeyspaceLock(t, ts)
-}
-
-func TestShardLock(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping wait-based test in short mode.")
-	}
-
-	ts := newFakeTeeServer(t)
-	test.CheckShardLock(t, ts)
-}
-
-func TestSrvShardLock(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping wait-based test in short mode.")
-	}
-
-	ts := newFakeTeeServer(t)
-	test.CheckSrvShardLock(t, ts)
+		return tee
+	})
 }

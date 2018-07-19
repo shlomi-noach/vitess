@@ -1,10 +1,27 @@
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreedto in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package logutil
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
-	log "github.com/golang/glog"
+	"vitess.io/vitess/go/vt/log"
 )
 
 // ThrottledLogger will allow logging of messages but won't spam the
@@ -29,12 +46,12 @@ func NewThrottledLogger(name string, maxInterval time.Duration) *ThrottledLogger
 	}
 }
 
-type logFunc func(string, ...interface{})
+type logFunc func(int, ...interface{})
 
 var (
-	infof    = log.Infof
-	warningf = log.Warningf
-	errorf   = log.Errorf
+	infoDepth    = log.InfoDepth
+	warningDepth = log.WarningDepth
+	errorDepth   = log.ErrorDepth
 )
 
 func (tl *ThrottledLogger) log(logF logFunc, format string, v ...interface{}) {
@@ -45,7 +62,7 @@ func (tl *ThrottledLogger) log(logF logFunc, format string, v ...interface{}) {
 	logWaitTime := tl.maxInterval - (now.Sub(tl.lastlogTime))
 	if logWaitTime < 0 {
 		tl.lastlogTime = now
-		logF(tl.name+":"+format, v...)
+		logF(2, fmt.Sprintf(tl.name+": "+format, v...))
 		return
 	}
 	// If this is the first message to be skipped, start a goroutine
@@ -55,7 +72,9 @@ func (tl *ThrottledLogger) log(logF logFunc, format string, v ...interface{}) {
 			time.Sleep(d)
 			tl.mu.Lock()
 			defer tl.mu.Unlock()
-			logF("%v: skipped %v log messages", tl.name, tl.skippedCount)
+			// Because of the go func(), we lose the stack trace,
+			// so we just use the current line for this.
+			logF(0, fmt.Sprintf("%v: skipped %v log messages", tl.name, tl.skippedCount))
 			tl.skippedCount = 0
 		}(logWaitTime)
 	}
@@ -64,15 +83,15 @@ func (tl *ThrottledLogger) log(logF logFunc, format string, v ...interface{}) {
 
 // Infof logs an info if not throttled.
 func (tl *ThrottledLogger) Infof(format string, v ...interface{}) {
-	tl.log(infof, format, v...)
+	tl.log(infoDepth, format, v...)
 }
 
 // Warningf logs a warning if not throttled.
 func (tl *ThrottledLogger) Warningf(format string, v ...interface{}) {
-	tl.log(warningf, format, v...)
+	tl.log(warningDepth, format, v...)
 }
 
 // Errorf logs an error if not throttled.
 func (tl *ThrottledLogger) Errorf(format string, v ...interface{}) {
-	tl.log(errorf, format, v...)
+	tl.log(errorDepth, format, v...)
 }

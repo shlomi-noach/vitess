@@ -17,11 +17,11 @@ some of MySQL's consistency features in order to achieve the
 kind of scalability that NoSQL databases provide.
 
 ### Priorities
+
 * *Scalability*: This is achieved by replication and sharding.
-* *Efficiency*: This is achieved by a proxy server (vttablet) that mediates
-all queries and connections.
-It also utilizes a more efficient rowcache to short-cut some of the queries.
-This effectively increases a typical MySQL's serving capacity.
+* *Efficiency*: This is achieved by a proxy server (vttablet) that
+multiplexes queries into a fixed-size connection pool, and rewrites
+updates by primary key to speed up slave applier threads.
 * *Manageability*: As soon as you add replication and sharding that span
 across multiple data centers, the number of servers spirals out of control.
 Vitess provides a set of tools backed by a lockserver (zookeeper) to
@@ -32,7 +32,9 @@ The vtgate servers give you a unified view of the fleet that makes
 it feel like you're just interacting with one database.
 
 ### Trade-offs
+
 Scalability and availability require some trade-offs:
+
 * *Consistency*: In a typical web application, not all reads have to be
 fully consistent.
 Vitess lets you specify the kind of consistency you want on your read.
@@ -53,8 +55,10 @@ However, they make up for the fact that you can extract more throughput from
 MySQL than you would otherwise be able to without them.
 
 ### Preserved MySQL features
+
 Since the underlying storage layer is still MySQL, we still get to preserve
 its other important features:
+
 * *Indexes*: You can create secondary indexes on your tables. This allows you
 to efficiently query rows using more than one key.
 * *Joins*:  MySQL allows you to split one-to-many and many-to-many relational data
@@ -63,6 +67,7 @@ This flexibility generally results in more efficient storage as each piece of
 data is stored only once, and fetched only if needed.
 
 ### The Vitess spectrum
+
 The following diagram illustrates where vitess fits in the spectrum of storage solutions:
 
-![Spectrum](https://raw.github.com/youtube/vitess/master/doc/VitessSpectrum.png)
+![Spectrum](https://raw.github.com/vitessio/vitess/master/doc/VitessSpectrum.png)

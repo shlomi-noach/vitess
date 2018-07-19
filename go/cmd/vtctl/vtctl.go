@@ -1,6 +1,18 @@
-// Copyright 2012, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package main
 
@@ -10,23 +22,24 @@ import (
 	"log/syslog"
 	"os"
 	"os/signal"
-	"sort"
 	"strings"
 	"syscall"
 	"time"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/exit"
-	"github.com/youtube/vitess/go/vt/logutil"
-	myproto "github.com/youtube/vitess/go/vt/mysqlctl/proto"
-	"github.com/youtube/vitess/go/vt/topo"
-	"github.com/youtube/vitess/go/vt/vtctl"
-	"github.com/youtube/vitess/go/vt/wrangler"
+	"golang.org/x/net/context"
+	"vitess.io/vitess/go/exit"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/vtctl"
+	"vitess.io/vitess/go/vt/vttablet/tmclient"
+	"vitess.io/vitess/go/vt/workflow"
+	"vitess.io/vitess/go/vt/wrangler"
 )
 
 var (
-	waitTime        = flag.Duration("wait-time", 24*time.Hour, "time to wait on an action")
-	lockWaitTimeout = flag.Duration("lock-wait-timeout", time.Minute, "time to wait for a lock before starting an action")
+	waitTime = flag.Duration("wait-time", 24*time.Hour, "time to wait on an action")
 )
 
 func init() {
@@ -42,13 +55,13 @@ func init() {
 }
 
 // signal handling, centralized here
-func installSignalHandlers(wr *wrangler.Wrangler) {
+func installSignalHandlers(cancel func()) {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		<-sigChan
-		// we got a signal, cancel the current wrangler context
-		wr.Cancel()
+		// we got a signal, cancel the current ctx
+		cancel()
 	}()
 }
 
@@ -56,12 +69,7 @@ func main() {
 	defer exit.RecoverAll()
 	defer logutil.Flush()
 
-	flag.Parse()
-	args := flag.Args()
-	if len(args) == 0 {
-		flag.Usage()
-		exit.Return(1)
-	}
+	args := servenv.ParseFlagsWithArgs("vtctl")
 	action := args[0]
 
 	startMsg := fmt.Sprintf("USER=%v SUDO_USER=%v %v", os.Getenv("USER"), os.Getenv("SUDO_USER"), strings.Join(os.Args, " "))
@@ -72,13 +80,19 @@ func main() {
 		log.Warningf("cannot connect to syslog: %v", err)
 	}
 
-	topoServer := topo.GetServer()
-	defer topo.CloseServers()
+	servenv.FireRunHooks()
 
-	wr := wrangler.New(logutil.NewConsoleLogger(), topoServer, *waitTime, *lockWaitTimeout)
-	installSignalHandlers(wr)
+	ts := topo.Open()
+	defer ts.Close()
 
-	err := vtctl.RunCommand(wr, args)
+	vtctl.WorkflowManager = workflow.NewManager(ts)
+
+	ctx, cancel := context.WithTimeout(context.Background(), *waitTime)
+	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
+	installSignalHandlers(cancel)
+
+	err := vtctl.RunCommand(ctx, wr, args)
+	cancel()
 	switch err {
 	case vtctl.ErrUnknownCommand:
 		flag.Usage()
@@ -89,53 +103,4 @@ func main() {
 		log.Errorf("action failed: %v %v", action, err)
 		exit.Return(255)
 	}
-}
-
-type rTablet struct {
-	*topo.TabletInfo
-	*myproto.ReplicationStatus
-}
-
-type rTablets []*rTablet
-
-func (rts rTablets) Len() int { return len(rts) }
-
-func (rts rTablets) Swap(i, j int) { rts[i], rts[j] = rts[j], rts[i] }
-
-// Sort for tablet replication.
-// master first, then i/o position, then sql position
-func (rts rTablets) Less(i, j int) bool {
-	// NOTE: Swap order of unpack to reverse sort
-	l, r := rts[j], rts[i]
-	// l or r ReplicationPosition would be nil if we failed to get
-	// the position (put them at the beginning of the list)
-	if l.ReplicationStatus == nil {
-		return r.ReplicationStatus != nil
-	}
-	if r.ReplicationStatus == nil {
-		return false
-	}
-	var lTypeMaster, rTypeMaster int
-	if l.Type == topo.TYPE_MASTER {
-		lTypeMaster = 1
-	}
-	if r.Type == topo.TYPE_MASTER {
-		rTypeMaster = 1
-	}
-	if lTypeMaster < rTypeMaster {
-		return true
-	}
-	if lTypeMaster == rTypeMaster {
-		return !l.Position.AtLeast(r.Position)
-	}
-	return false
-}
-
-func sortReplicatingTablets(tablets []*topo.TabletInfo, stats []*myproto.ReplicationStatus) []*rTablet {
-	rtablets := make([]*rTablet, len(tablets))
-	for i, status := range stats {
-		rtablets[i] = &rTablet{tablets[i], status}
-	}
-	sort.Sort(rTablets(rtablets))
-	return rtablets
 }

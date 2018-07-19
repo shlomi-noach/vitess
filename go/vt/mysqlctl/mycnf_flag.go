@@ -1,14 +1,25 @@
-// Copyright 2014, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package mysqlctl
 
 import (
 	"flag"
-	"fmt"
 
-	log "github.com/golang/glog"
+	"vitess.io/vitess/go/vt/log"
 )
 
 // This file handles using command line flags to create a Mycnf object.
@@ -17,12 +28,13 @@ import (
 
 var (
 	// the individual command line parameters
-	flagServerId              *int
+	flagServerID              *int
 	flagMysqlPort             *int
 	flagDataDir               *string
 	flagInnodbDataHomeDir     *string
 	flagInnodbLogGroupHomeDir *string
 	flagSocketFile            *string
+	flagGeneralLogPath        *string
 	flagErrorLogPath          *string
 	flagSlowLogPath           *string
 	flagRelayLogPath          *string
@@ -42,12 +54,13 @@ var (
 // specifying the values of a mycnf config file. See NewMycnfFromFlags
 // to get the supported modes.
 func RegisterFlags() {
-	flagServerId = flag.Int("mycnf_server_id", 0, "mysql server id of the server (if specified, mycnf-file will be ignored)")
+	flagServerID = flag.Int("mycnf_server_id", 0, "mysql server id of the server (if specified, mycnf-file will be ignored)")
 	flagMysqlPort = flag.Int("mycnf_mysql_port", 0, "port mysql is listening on")
 	flagDataDir = flag.String("mycnf_data_dir", "", "data directory for mysql")
 	flagInnodbDataHomeDir = flag.String("mycnf_innodb_data_home_dir", "", "Innodb data home directory")
 	flagInnodbLogGroupHomeDir = flag.String("mycnf_innodb_log_group_home_dir", "", "Innodb log group home directory")
 	flagSocketFile = flag.String("mycnf_socket_file", "", "mysql socket file")
+	flagGeneralLogPath = flag.String("mycnf_general_log_path", "", "mysql general log path")
 	flagErrorLogPath = flag.String("mycnf_error_log_path", "", "mysql error log path")
 	flagSlowLogPath = flag.String("mycnf_slow_log_path", "", "mysql slow query log path")
 	flagRelayLogPath = flag.String("mycnf_relay_log_path", "", "mysql relay log path")
@@ -77,15 +90,16 @@ func RegisterFlags() {
 // RegisterCommandLineFlags should have been called before calling
 // this, otherwise we'll panic.
 func NewMycnfFromFlags(uid uint32) (mycnf *Mycnf, err error) {
-	if *flagServerId != 0 {
+	if *flagServerID != 0 {
 		log.Info("mycnf_server_id is specified, using command line parameters for mysql config")
 		return &Mycnf{
-			ServerId:              uint32(*flagServerId),
-			MysqlPort:             *flagMysqlPort,
+			ServerID:              uint32(*flagServerID),
+			MysqlPort:             int32(*flagMysqlPort),
 			DataDir:               *flagDataDir,
 			InnodbDataHomeDir:     *flagInnodbDataHomeDir,
 			InnodbLogGroupHomeDir: *flagInnodbLogGroupHomeDir,
 			SocketFile:            *flagSocketFile,
+			GeneralLogPath:        *flagGeneralLogPath,
 			ErrorLogPath:          *flagErrorLogPath,
 			SlowLogPath:           *flagSlowLogPath,
 			RelayLogPath:          *flagRelayLogPath,
@@ -100,51 +114,20 @@ func NewMycnfFromFlags(uid uint32) (mycnf *Mycnf, err error) {
 			// This is probably not going to be used by anybody,
 			// but fill in a default value. (Note it's used by
 			// mysqld.Start, in which case it is correct).
-			path: mycnfFile(uint32(*flagServerId)),
+			path: MycnfFile(uint32(*flagServerID)),
 		}, nil
+	}
+
+	if *flagMycnfFile == "" {
+		if uid == 0 {
+			log.Exitf("No mycnf_server_id, no mycnf-file, and no backup server id to use")
+		}
+		*flagMycnfFile = MycnfFile(uid)
+		log.Infof("No mycnf_server_id, no mycnf-file specified, using default config for server id %v: %v", uid, *flagMycnfFile)
 	} else {
-		if *flagMycnfFile == "" {
-			if uid == 0 {
-				log.Fatalf("No mycnf_server_id, no mycnf-file, and no backup server id to use")
-			}
-			*flagMycnfFile = mycnfFile(uid)
-			log.Infof("No mycnf_server_id, no mycnf-file specified, using default config for server id %v: %v", uid, *flagMycnfFile)
-		} else {
-			log.Infof("No mycnf_server_id specified, using mycnf-file file %v", *flagMycnfFile)
-		}
-		return ReadMycnf(*flagMycnfFile)
+		log.Infof("No mycnf_server_id specified, using mycnf-file file %v", *flagMycnfFile)
 	}
-}
-
-// GetSubprocessFlags returns the flags to pass to a subprocess to
-// have the exact same mycnf config as us.
-//
-// RegisterCommandLineFlags and NewMycnfFromFlags should have been
-// called before this.
-func GetSubprocessFlags() []string {
-	if *flagServerId != 0 {
-		// all from command line
-		return []string{
-			"-mycnf_server_id", fmt.Sprintf("%v", *flagServerId),
-			"-mycnf_mysql_port", fmt.Sprintf("%v", *flagMysqlPort),
-			"-mycnf_data_dir", *flagDataDir,
-			"-mycnf_innodb_data_home_dir", *flagInnodbDataHomeDir,
-			"-mycnf_innodb_log_group_home_dir", *flagInnodbLogGroupHomeDir,
-			"-mycnf_socket_file", *flagSocketFile,
-			"-mycnf_error_log_path", *flagErrorLogPath,
-			"-mycnf_slow_log_path", *flagSlowLogPath,
-			"-mycnf_relay_log_path", *flagRelayLogPath,
-			"-mycnf_relay_log_index_path", *flagRelayLogIndexPath,
-			"-mycnf_relay_log_info_path", *flagRelayLogInfoPath,
-			"-mycnf_bin_log_path", *flagBinLogPath,
-			"-mycnf_master_info_file", *flagMasterInfoFile,
-			"-mycnf_pid_file", *flagPidFile,
-			"-mycnf_tmp_dir", *flagTmpDir,
-			"-mycnf_slave_load_tmp_dir", *flagSlaveLoadTmpDir,
-		}
-	}
-
-	// Just pass through the mycnf-file param, it has been altered
-	// if we didn't get it but guessed it from uid.
-	return []string{"-mycnf-file", *flagMycnfFile}
+	mycnf = NewMycnf(uid, 0)
+	mycnf.path = *flagMycnfFile
+	return ReadMycnf(mycnf)
 }

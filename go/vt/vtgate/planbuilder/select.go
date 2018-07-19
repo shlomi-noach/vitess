@@ -1,116 +1,229 @@
-// Copyright 2014, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package planbuilder
 
-import "github.com/youtube/vitess/go/vt/sqlparser"
+import (
+	"errors"
+	"fmt"
 
-func buildSelectPlan(sel *sqlparser.Select, schema *Schema) *Plan {
-	plan := &Plan{ID: NoPlan}
-	tablename, _ := analyzeFrom(sel.From)
-	plan.Table, plan.Reason = schema.FindTable(tablename)
-	if plan.Reason != "" {
-		return plan
+	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vtgate/engine"
+)
+
+// buildSelectPlan is the new function to build a Select plan.
+func buildSelectPlan(sel *sqlparser.Select, vschema ContextVSchema) (primitive engine.Primitive, err error) {
+	pb := newPrimitiveBuilder(vschema, newJointab(sqlparser.GetBindvars(sel)))
+	if err := pb.processSelect(sel, nil); err != nil {
+		return nil, err
 	}
-	if !plan.Table.Keyspace.Sharded {
-		plan.ID = SelectUnsharded
-		return plan
+	if err := pb.bldr.Wireup(pb.bldr, pb.jt); err != nil {
+		return nil, err
+	}
+	return pb.bldr.Primitive(), nil
+}
+
+// processSelect builds a primitive tree for the given query or subquery.
+// The tree built by this function has the following general structure:
+//
+// The leaf nodes can be a route, vindexFunc or subquery. In the symtab,
+// the tables map has columns that point to these leaf nodes. A subquery
+// itself contains a builder tree, but it's opaque and is made to look
+// like a table for the analysis of the current tree.
+//
+// The leaf nodes are usually tied together by join nodes. While the join
+// nodes are built, they have ON clauses. Those are analyzed and pushed
+// down into the leaf nodes as the tree is formed. Join nodes are formed
+// during analysis of the FROM clause.
+//
+// During the WHERE clause analysis, the target leaf node is identified
+// for each part, and the PushFilter function is used to push the condition
+// down. The same strategy is used for the other clauses.
+//
+// So, a typical plan would either be a simple leaf node, or may consist
+// of leaf nodes tied together by join nodes.
+//
+// If a query has aggregates that cannot be pushed down, an aggregator
+// primitive is built. The current orderedAggregate primitive can only
+// be built on top of a route. The orderedAggregate expects the rows
+// to be ordered as they are returned. This work is performed by the
+// underlying route. This means that a compatible ORDER BY clause
+// can also be handled by this combination of primitives. In this case,
+// the tree would consist of an orderedAggregate whose input is a route.
+//
+// If a query has an ORDER BY, but the route is a scatter, then the
+// ordering is pushed down into the route itself. This results in a simple
+// route primitive.
+//
+// The LIMIT clause is the last construct of a query. If it cannot be
+// pushed into a route, then a primitve is created on top of any
+// of the above trees to make it discard unwanted rows.
+func (pb *primitiveBuilder) processSelect(sel *sqlparser.Select, outer *symtab) error {
+	if err := pb.processTableExprs(sel.From); err != nil {
+		return err
 	}
 
-	getWhereRouting(sel.Where, plan, false)
-	if plan.IsMulti() {
-		if hasPostProcessing(sel) {
-			plan.ID = NoPlan
-			plan.Reason = "multi-shard query has post-processing constructs"
-			return plan
+	if rb, ok := pb.bldr.(*route); ok {
+		directives := sqlparser.ExtractCommentDirectives(sel.Comments)
+		rb.ERoute.QueryTimeout = queryTimeout(directives)
+		if rb.ERoute.TargetDestination != nil {
+			return errors.New("unsupported: SELECT with a target destination")
 		}
 	}
-	// The where clause might have changed.
-	plan.Rewritten = generateQuery(sel)
-	return plan
+	// Set the outer symtab after processing of FROM clause.
+	// This is because correlation is not allowed there.
+	pb.st.Outer = outer
+	if sel.Where != nil {
+		if err := pb.pushFilter(sel.Where.Expr, sqlparser.WhereStr); err != nil {
+			return err
+		}
+	}
+	grouper, err := pb.checkAggregates(sel)
+	if err != nil {
+		return err
+	}
+	if err := pb.pushSelectExprs(sel, grouper); err != nil {
+		return err
+	}
+	if sel.Having != nil {
+		if err := pb.pushFilter(sel.Having.Expr, sqlparser.HavingStr); err != nil {
+			return err
+		}
+	}
+	if err := pb.pushOrderBy(sel.OrderBy); err != nil {
+		return err
+	}
+	if err := pb.pushLimit(sel.Limit); err != nil {
+		return err
+	}
+	pb.bldr.PushMisc(sel)
+	return nil
 }
 
-// TODO(sougou): Copied from tabletserver. Reuse.
-func analyzeFrom(tableExprs sqlparser.TableExprs) (tablename string, hasHints bool) {
-	if len(tableExprs) > 1 {
-		return "", false
+// pushFilter identifies the target route for the specified bool expr,
+// pushes it down, and updates the route info if the new constraint improves
+// the primitive. This function can push to a WHERE or HAVING clause.
+func (pb *primitiveBuilder) pushFilter(boolExpr sqlparser.Expr, whereType string) error {
+	filters := splitAndExpression(nil, boolExpr)
+	reorderBySubquery(filters)
+	for _, filter := range filters {
+		origin, expr, err := pb.findOrigin(filter)
+		if err != nil {
+			return err
+		}
+		if err := pb.bldr.PushFilter(pb, expr, whereType, origin); err != nil {
+			return err
+		}
 	}
-	node, ok := tableExprs[0].(*sqlparser.AliasedTableExpr)
-	if !ok {
-		return "", false
-	}
-	return sqlparser.GetTableName(node.Expr), node.Hints != nil
+	return nil
 }
 
-func hasAggregates(node sqlparser.SelectExprs) bool {
-	for _, node := range node {
+// reorderBySubquery reorders the filters by pushing subqueries
+// to the end. This allows the non-subquery filters to be
+// pushed first because they can potentially improve the routing
+// plan, which can later allow a filter containing a subquery
+// to successfully merge with the corresponding route.
+func reorderBySubquery(filters []sqlparser.Expr) {
+	max := len(filters)
+	for i := 0; i < max; i++ {
+		if !hasSubquery(filters[i]) {
+			continue
+		}
+		saved := filters[i]
+		for j := i; j < len(filters)-1; j++ {
+			filters[j] = filters[j+1]
+		}
+		filters[len(filters)-1] = saved
+		max--
+	}
+}
+
+// pushSelectExprs identifies the target route for the
+// select expressions and pushes them down.
+func (pb *primitiveBuilder) pushSelectExprs(sel *sqlparser.Select, grouper groupByHandler) error {
+	resultColumns, err := pb.pushSelectRoutes(sel.SelectExprs)
+	if err != nil {
+		return err
+	}
+	pb.st.SetResultColumns(resultColumns)
+	return pb.pushGroupBy(sel, grouper)
+}
+
+// pusheSelectRoutes is a convenience function that pushes all the select
+// expressions and returns the list of resultColumns generated for it.
+func (pb *primitiveBuilder) pushSelectRoutes(selectExprs sqlparser.SelectExprs) ([]*resultColumn, error) {
+	resultColumns := make([]*resultColumn, len(selectExprs))
+	for i, node := range selectExprs {
 		switch node := node.(type) {
-		case *sqlparser.NonStarExpr:
-			if exprHasAggregates(node.Expr) {
-				return true
+		case *sqlparser.AliasedExpr:
+			origin, expr, err := pb.findOrigin(node.Expr)
+			if err != nil {
+				return nil, err
 			}
-		}
-	}
-	return false
-}
-
-func exprHasAggregates(node sqlparser.Expr) bool {
-	switch node := node.(type) {
-	case *sqlparser.AndExpr:
-		return exprHasAggregates(node.Left) || exprHasAggregates(node.Right)
-	case *sqlparser.OrExpr:
-		return exprHasAggregates(node.Left) || exprHasAggregates(node.Right)
-	case *sqlparser.NotExpr:
-		return exprHasAggregates(node.Expr)
-	case *sqlparser.ParenBoolExpr:
-		return exprHasAggregates(node.Expr)
-	case *sqlparser.ComparisonExpr:
-		return exprHasAggregates(node.Left) || exprHasAggregates(node.Right)
-	case *sqlparser.RangeCond:
-		return exprHasAggregates(node.Left) || exprHasAggregates(node.From) || exprHasAggregates(node.To)
-	case *sqlparser.NullCheck:
-		return exprHasAggregates(node.Expr)
-	case *sqlparser.ExistsExpr:
-		return false
-	case sqlparser.StrVal, sqlparser.NumVal, sqlparser.ValArg,
-		*sqlparser.NullVal, *sqlparser.ColName, sqlparser.ValTuple,
-		sqlparser.ListArg:
-		return false
-	case *sqlparser.Subquery:
-		return false
-	case *sqlparser.BinaryExpr:
-		return exprHasAggregates(node.Left) || exprHasAggregates(node.Right)
-	case *sqlparser.UnaryExpr:
-		return exprHasAggregates(node.Expr)
-	case *sqlparser.FuncExpr:
-		if node.IsAggregate() {
-			return true
-		}
-		for _, expr := range node.Exprs {
-			switch expr := expr.(type) {
-			case *sqlparser.NonStarExpr:
-				if exprHasAggregates(expr.Expr) {
-					return true
+			node.Expr = expr
+			resultColumns[i], _, err = pb.bldr.PushSelect(node, origin)
+			if err != nil {
+				return nil, err
+			}
+		case *sqlparser.StarExpr:
+			// We'll allow select * for simple routes.
+			rb, ok := pb.bldr.(*route)
+			if !ok {
+				return nil, errors.New("unsupported: '*' expression in cross-shard query")
+			}
+			// Validate keyspace reference if any.
+			if !node.TableName.IsEmpty() {
+				if qual := node.TableName.Qualifier; !qual.IsEmpty() {
+					if qual.String() != rb.ERoute.Keyspace.Name {
+						return nil, fmt.Errorf("cannot resolve %s to keyspace %s", sqlparser.String(node), rb.ERoute.Keyspace.Name)
+					}
 				}
 			}
-		}
-		return false
-	case *sqlparser.CaseExpr:
-		if exprHasAggregates(node.Expr) || exprHasAggregates(node.Else) {
-			return true
-		}
-		for _, expr := range node.Whens {
-			if exprHasAggregates(expr.Cond) || exprHasAggregates(expr.Val) {
-				return true
+			resultColumns[i] = rb.PushAnonymous(node)
+		case sqlparser.Nextval:
+			rb, ok := pb.bldr.(*route)
+			if !ok {
+				// This code is unreachable because the parser doesn't allow joins for next val statements.
+				return nil, errors.New("unsupported: SELECT NEXT query in cross-shard query")
 			}
+			if err := rb.SetOpcode(engine.SelectNext); err != nil {
+				return nil, err
+			}
+			resultColumns[i] = rb.PushAnonymous(node)
+		default:
+			panic(fmt.Sprintf("BUG: unexpceted select expression type: %T", node))
 		}
-		return false
-	default:
-		panic("unexpected")
 	}
+	return resultColumns, nil
 }
 
-func hasPostProcessing(sel *sqlparser.Select) bool {
-	return hasAggregates(sel.SelectExprs) || sel.Distinct != "" || sel.GroupBy != nil || sel.Having != nil || sel.OrderBy != nil || sel.Limit != nil
+// queryTimeout returns DirectiveQueryTimeout value if set, otherwise returns 0.
+func queryTimeout(d sqlparser.CommentDirectives) int {
+	if d == nil {
+		return 0
+	}
+
+	val, ok := d[sqlparser.DirectiveQueryTimeout]
+	if !ok {
+		return 0
+	}
+
+	intVal, ok := val.(int)
+	if ok {
+		return intVal
+	}
+	return 0
 }

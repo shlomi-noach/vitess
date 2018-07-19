@@ -1,294 +1,93 @@
-// Copyright 2013, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package topo
 
 import (
 	"fmt"
-	"reflect"
-	"sort"
-	"strconv"
-	"strings"
+	"path"
 	"sync"
 
 	"golang.org/x/net/context"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/jscfg"
-	"github.com/youtube/vitess/go/netutil"
-	"github.com/youtube/vitess/go/trace"
-	"github.com/youtube/vitess/go/vt/key"
+	"github.com/golang/protobuf/proto"
+	"vitess.io/vitess/go/event"
+	"vitess.io/vitess/go/netutil"
+	"vitess.io/vitess/go/trace"
+	"vitess.io/vitess/go/vt/log"
+
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/topo/events"
+	"vitess.io/vitess/go/vt/topo/topoproto"
 )
-
-const (
-	// According to docs, the tablet uid / (mysql server id) is uint32.
-	// However, zero appears to be a sufficiently degenerate value to use
-	// as a marker for not having a parent server id.
-	// http://dev.mysql.com/doc/refman/5.1/en/replication-options.html
-	NO_TABLET = 0
-
-	// Default name for databases is the prefix plus keyspace
-	vtDbPrefix = "vt_"
-)
-
-// TabletAlias is the minimum required information to locate a tablet.
-//
-// Tablets are really globally unique, but crawling every cell to find
-// out where it lives is time consuming and expensive. This is only
-// needed during complex operations.  Tablet cell assignments don't
-// change that often, thus using a TabletAlias is efficient.
-type TabletAlias struct {
-	Cell string
-	Uid  uint32
-}
-
-// IsZero returns true iff cell and uid are empty
-func (ta TabletAlias) IsZero() bool {
-	return ta.Cell == "" && ta.Uid == 0
-}
-
-// String formats a TabletAlias
-func (ta TabletAlias) String() string {
-	return fmtAlias(ta.Cell, ta.Uid)
-}
-
-// TabletUIDStr returns a string version of the uid
-func (ta TabletAlias) TabletUIDStr() string {
-	return tabletUIDStr(ta.Uid)
-}
-
-// ParseTabletAliasString returns a TabletAlias for the input string,
-// of the form <cell>-<uid>
-func ParseTabletAliasString(aliasStr string) (result TabletAlias, err error) {
-	nameParts := strings.Split(aliasStr, "-")
-	if len(nameParts) != 2 {
-		err = fmt.Errorf("invalid tablet alias: %v", aliasStr)
-		return
-	}
-	result.Cell = nameParts[0]
-	result.Uid, err = ParseUID(nameParts[1])
-	if err != nil {
-		err = fmt.Errorf("invalid tablet uid %v: %v", aliasStr, err)
-		return
-	}
-	return
-}
-
-func tabletUIDStr(uid uint32) string {
-	return fmt.Sprintf("%010d", uid)
-}
-
-// ParseUID parses just the uid (a number)
-func ParseUID(value string) (uint32, error) {
-	uid, err := strconv.ParseUint(value, 10, 32)
-	if err != nil {
-		return 0, fmt.Errorf("bad tablet uid %v", err)
-	}
-	return uint32(uid), nil
-}
-
-func fmtAlias(cell string, uid uint32) string {
-	return fmt.Sprintf("%v-%v", cell, tabletUIDStr(uid))
-}
-
-// TabletAliasList is used mainly for sorting
-type TabletAliasList []TabletAlias
-
-// Len is part of sort.Interface
-func (tal TabletAliasList) Len() int {
-	return len(tal)
-}
-
-// Less is part of sort.Interface
-func (tal TabletAliasList) Less(i, j int) bool {
-	if tal[i].Cell < tal[j].Cell {
-		return true
-	} else if tal[i].Cell > tal[j].Cell {
-		return false
-	}
-	return tal[i].Uid < tal[j].Uid
-}
-
-// Swap is part of sort.Interface
-func (tal TabletAliasList) Swap(i, j int) {
-	tal[i], tal[j] = tal[j], tal[i]
-}
-
-// TabletType is the main type for a tablet. It has an implication on:
-// - the replication graph
-// - the services run by vttablet on a tablet
-// - the uptime expectancy
-type TabletType string
-
-//go:generate bsongen -file $GOFILE -type TabletType -o tablet_type_bson.go
-
-const (
-	// idle -  no keyspace, shard or type assigned
-	TYPE_IDLE = TabletType("idle")
-
-	// primary copy of data
-	TYPE_MASTER = TabletType("master")
-
-	// a slaved copy of the data ready to be promoted to master
-	TYPE_REPLICA = TabletType("replica")
-
-	// a slaved copy of the data for olap load patterns.
-	// too many aliases for olap - need to pick one
-	TYPE_RDONLY = TabletType("rdonly")
-	TYPE_BATCH  = TabletType("batch")
-
-	// a slaved copy of the data ready, but not serving query traffic
-	// could be a potential master.
-	TYPE_SPARE = TabletType("spare")
-
-	// a slaved copy of the data ready, but not serving query traffic
-	// implies something abnormal about the setup - don't consider it
-	// a potential master and don't worry about lag when reparenting.
-	TYPE_EXPERIMENTAL = TabletType("experimental")
-
-	// a slaved copy of the data intentionally lagged for pseudo backup
-	TYPE_LAG = TabletType("lag")
-	// when a reparent occurs, the tablet goes into lag_orphan state until
-	// it can be reparented properly
-	TYPE_LAG_ORPHAN = TabletType("lag_orphan")
-
-	// a slaved copy of the data that was serving but is now applying
-	// a schema change. Will go bak to its serving type after the
-	// upgrade
-	TYPE_SCHEMA_UPGRADE = TabletType("schema_apply")
-
-	// a slaved copy of the data, but offline to queries other than backup
-	// replication sql thread may be stopped
-	TYPE_BACKUP = TabletType("backup")
-
-	// a slaved copy of the data, where mysqld is *not* running,
-	// and we are serving our data files to clone slaves
-	// use 'vtctl Snapshot -server-mode ...' to get in this mode
-	// use 'vtctl SnapshotSourceEnd ...' to get out of this mode
-	TYPE_SNAPSHOT_SOURCE = TabletType("snapshot_source")
-
-	// A tablet that has not been in the replication graph and is restoring
-	// from a snapshot.  idle -> restore -> spare
-	TYPE_RESTORE = TabletType("restore")
-
-	// A tablet that is running a checker process. It is probably
-	// lagging in replication.
-	TYPE_CHECKER = TabletType("checker")
-
-	// a machine with data that needs to be wiped
-	TYPE_SCRAP = TabletType("scrap")
-)
-
-// AllTabletTypes lists all the possible tablet types
-var AllTabletTypes = []TabletType{TYPE_IDLE,
-	TYPE_MASTER,
-	TYPE_REPLICA,
-	TYPE_RDONLY,
-	TYPE_BATCH,
-	TYPE_SPARE,
-	TYPE_EXPERIMENTAL,
-	TYPE_LAG,
-	TYPE_LAG_ORPHAN,
-	TYPE_SCHEMA_UPGRADE,
-	TYPE_BACKUP,
-	TYPE_SNAPSHOT_SOURCE,
-	TYPE_RESTORE,
-	TYPE_CHECKER,
-	TYPE_SCRAP,
-}
-
-// SlaveTabletTypes list all the types that are replication slaves
-var SlaveTabletTypes = []TabletType{
-	TYPE_REPLICA,
-	TYPE_RDONLY,
-	TYPE_BATCH,
-	TYPE_SPARE,
-	TYPE_EXPERIMENTAL,
-	TYPE_LAG,
-	TYPE_LAG_ORPHAN,
-	TYPE_SCHEMA_UPGRADE,
-	TYPE_BACKUP,
-	TYPE_SNAPSHOT_SOURCE,
-	TYPE_RESTORE,
-	TYPE_CHECKER,
-}
-
-// IsTypeInList returns true if the given type is in the list.
-// Use it with AllTabletType and SlaveTabletType for instance.
-func IsTypeInList(tabletType TabletType, types []TabletType) bool {
-	for _, t := range types {
-		if tabletType == t {
-			return true
-		}
-	}
-	return false
-}
-
-// IsSlaveType returns true iff the type is a mysql replication slave.
-func (tt TabletType) IsSlaveType() bool {
-	return IsTypeInList(tt, SlaveTabletTypes)
-}
-
-// MakeStringTypeList returns a list of strings that match the input list.
-func MakeStringTypeList(types []TabletType) []string {
-	strs := make([]string, len(types))
-	for i, t := range types {
-		strs[i] = string(t)
-	}
-	sort.Strings(strs)
-	return strs
-}
 
 // IsTrivialTypeChange returns if this db type be trivially reassigned
 // without changes to the replication graph
-func IsTrivialTypeChange(oldTabletType, newTabletType TabletType) bool {
+func IsTrivialTypeChange(oldTabletType, newTabletType topodatapb.TabletType) bool {
 	switch oldTabletType {
-	case TYPE_REPLICA, TYPE_RDONLY, TYPE_BATCH, TYPE_SPARE, TYPE_LAG, TYPE_LAG_ORPHAN, TYPE_BACKUP, TYPE_SNAPSHOT_SOURCE, TYPE_EXPERIMENTAL, TYPE_SCHEMA_UPGRADE, TYPE_CHECKER:
+	case topodatapb.TabletType_REPLICA, topodatapb.TabletType_RDONLY, topodatapb.TabletType_SPARE, topodatapb.TabletType_BACKUP, topodatapb.TabletType_EXPERIMENTAL, topodatapb.TabletType_DRAINED:
 		switch newTabletType {
-		case TYPE_REPLICA, TYPE_RDONLY, TYPE_BATCH, TYPE_SPARE, TYPE_LAG, TYPE_LAG_ORPHAN, TYPE_BACKUP, TYPE_SNAPSHOT_SOURCE, TYPE_EXPERIMENTAL, TYPE_SCHEMA_UPGRADE, TYPE_CHECKER:
+		case topodatapb.TabletType_REPLICA, topodatapb.TabletType_RDONLY, topodatapb.TabletType_SPARE, topodatapb.TabletType_BACKUP, topodatapb.TabletType_EXPERIMENTAL, topodatapb.TabletType_DRAINED:
 			return true
 		}
-	case TYPE_SCRAP:
-		return newTabletType == TYPE_IDLE
-	case TYPE_RESTORE:
+	case topodatapb.TabletType_RESTORE:
 		switch newTabletType {
-		case TYPE_SPARE, TYPE_IDLE:
+		case topodatapb.TabletType_SPARE:
 			return true
 		}
 	}
 	return false
 }
 
-// IsValidTypeChange returns if we should we allow this transition at
-// all.  Most transitions are allowed, but some don't make sense under
-// any circumstances. If a transition could be forced, don't disallow
-// it here.
-func IsValidTypeChange(oldTabletType, newTabletType TabletType) bool {
-	switch oldTabletType {
-	case TYPE_SNAPSHOT_SOURCE:
-		switch newTabletType {
-		case TYPE_BACKUP, TYPE_SNAPSHOT_SOURCE:
-			return false
-		}
-	}
-
-	return true
-}
-
 // IsInServingGraph returns if a tablet appears in the serving graph
-func IsInServingGraph(tt TabletType) bool {
+func IsInServingGraph(tt topodatapb.TabletType) bool {
 	switch tt {
-	case TYPE_MASTER, TYPE_REPLICA, TYPE_RDONLY, TYPE_BATCH:
+	case topodatapb.TabletType_MASTER, topodatapb.TabletType_REPLICA, topodatapb.TabletType_RDONLY:
 		return true
 	}
 	return false
 }
 
 // IsRunningQueryService returns if a tablet is running the query service
-func IsRunningQueryService(tt TabletType) bool {
+func IsRunningQueryService(tt topodatapb.TabletType) bool {
 	switch tt {
-	case TYPE_MASTER, TYPE_REPLICA, TYPE_RDONLY, TYPE_BATCH, TYPE_CHECKER:
+	case topodatapb.TabletType_MASTER, topodatapb.TabletType_REPLICA, topodatapb.TabletType_RDONLY, topodatapb.TabletType_EXPERIMENTAL, topodatapb.TabletType_DRAINED:
+		return true
+	}
+	return false
+}
+
+// IsSubjectToLameduck returns if a tablet is subject to being
+// lameduck.  Lameduck is a transition period where we are still
+// allowed to serve, but we tell the clients we are going away
+// soon. Typically, a vttablet will still serve, but broadcast a
+// non-serving state through its health check. then vtgate will ctahc
+// that non-serving state, and stop sending queries.
+//
+// Masters are not subject to lameduck, as we usually want to transition
+// them as fast as possible.
+//
+// Replica and rdonly will use lameduck when going from healthy to
+// unhealhty (either because health check fails, or they're shutting down).
+//
+// Other types are probably not serving user visible traffic, so they
+// need to transition as fast as possible too.
+func IsSubjectToLameduck(tt topodatapb.TabletType) bool {
+	switch tt {
+	case topodatapb.TabletType_REPLICA, topodatapb.TabletType_RDONLY:
 		return true
 	}
 	return false
@@ -296,320 +95,231 @@ func IsRunningQueryService(tt TabletType) bool {
 
 // IsRunningUpdateStream returns if a tablet is running the update stream
 // RPC service.
-func IsRunningUpdateStream(tt TabletType) bool {
+func IsRunningUpdateStream(tt topodatapb.TabletType) bool {
 	switch tt {
-	case TYPE_MASTER, TYPE_REPLICA, TYPE_RDONLY, TYPE_BATCH:
+	case topodatapb.TabletType_MASTER, topodatapb.TabletType_REPLICA, topodatapb.TabletType_RDONLY:
 		return true
 	}
 	return false
 }
 
-// IsInReplicationGraph returns if this tablet appears in the replication graph
-// Only IDLE and SCRAP are not in the replication graph.
-// The other non-obvious types are BACKUP, SNAPSHOT_SOURCE, RESTORE
-// and LAG_ORPHAN: these have had a master at some point (or were the
-// master), so they are in the graph.
-func IsInReplicationGraph(tt TabletType) bool {
-	switch tt {
-	case TYPE_IDLE, TYPE_SCRAP:
-		return false
-	}
-	return true
-}
-
 // IsSlaveType returns if this type should be connected to a master db
 // and actively replicating?
 // MASTER is not obviously (only support one level replication graph)
-// IDLE and SCRAP are not either
-// BACKUP, RESTORE, LAG_ORPHAN, TYPE_CHECKER may or may not be, but we don't know for sure
-func IsSlaveType(tt TabletType) bool {
+// BACKUP, RESTORE, DRAINED may or may not be, but we don't know for sure
+func IsSlaveType(tt topodatapb.TabletType) bool {
 	switch tt {
-	case TYPE_MASTER, TYPE_IDLE, TYPE_SCRAP, TYPE_BACKUP, TYPE_RESTORE, TYPE_LAG_ORPHAN, TYPE_CHECKER:
+	case topodatapb.TabletType_MASTER, topodatapb.TabletType_BACKUP, topodatapb.TabletType_RESTORE, topodatapb.TabletType_DRAINED:
 		return false
 	}
 	return true
 }
 
-// TabletState describe if the tablet is read-only or read-write.
-type TabletState string
-
-const (
-	// STATE_READ_WRITE is the normal state for a master
-	STATE_READ_WRITE = TabletState("ReadWrite")
-
-	// STATE_READ_ONLY is the normal state for a slave, or temporarily a master.
-	// Not to be confused with type, which implies a workload.
-	STATE_READ_ONLY = TabletState("ReadOnly")
-)
-
-// Tablet is a pure data struct for information serialized into json
-// and stored into topo.Server
-type Tablet struct {
-	// What is this tablet?
-	Alias TabletAlias
-
-	// Location of the tablet
-	Hostname string
-	IPAddr   string
-
-	// Named port names. Currently supported ports: vt, vts,
-	// mysql.
-	Portmap map[string]int
-
-	// Tags contain freeform information about the tablet.
-	Tags map[string]string
-
-	// Health tracks how healthy the tablet is. Clients may decide
-	// to use this information to make educated decisions on which
-	// tablet to connect to.
-	Health map[string]string
-
-	// Information about the tablet inside a keyspace/shard
-	Keyspace string
-	Shard    string
-	Type     TabletType
-
-	// Is the tablet read-only?
-	State TabletState
-
-	// Normally the database name is implied by "vt_" + keyspace. I
-	// really want to remove this but there are some databases that are
-	// hard to rename.
-	DbNameOverride string
-	KeyRange       key.KeyRange
+// NewTablet create a new Tablet record with the given id, cell, and hostname.
+func NewTablet(uid uint32, cell, host string) *topodatapb.Tablet {
+	return &topodatapb.Tablet{
+		Alias: &topodatapb.TabletAlias{
+			Cell: cell,
+			Uid:  uid,
+		},
+		Hostname: host,
+		PortMap:  make(map[string]int32),
+	}
 }
 
-// ValidatePortmap returns an error if the tablet's portmap doesn't
-// contain all the necessary ports for the tablet to be fully
-// operational. We only care about vt port now, as mysql may not even
-// be running.
-func (tablet *Tablet) ValidatePortmap() error {
-	if _, ok := tablet.Portmap["vt"]; !ok {
-		return fmt.Errorf("no vt port available")
+// TabletEquality returns true iff two Tablet are representing the same tablet
+// process: same uid/cell, running on the same host / ports.
+func TabletEquality(left, right *topodatapb.Tablet) bool {
+	if !topoproto.TabletAliasEqual(left.Alias, right.Alias) {
+		return false
 	}
-	return nil
-}
-
-// EndPoint returns an EndPoint associated with the tablet record
-func (tablet *Tablet) EndPoint() (*EndPoint, error) {
-	entry := NewEndPoint(tablet.Alias.Uid, tablet.Hostname)
-	if err := tablet.ValidatePortmap(); err != nil {
-		return nil, err
+	if left.Hostname != right.Hostname {
+		return false
 	}
-
-	entry.NamedPortMap = map[string]int{}
-
-	if port, ok := tablet.Portmap["vt"]; ok {
-		entry.NamedPortMap["_vtocc"] = port
-		entry.NamedPortMap["vt"] = port
+	if left.MysqlHostname != right.MysqlHostname {
+		return false
 	}
-	if port, ok := tablet.Portmap["mysql"]; ok {
-		entry.NamedPortMap["_mysql"] = port
-		entry.NamedPortMap["mysql"] = port
+	if left.MysqlPort != right.MysqlPort {
+		return false
 	}
-	if port, ok := tablet.Portmap["vts"]; ok {
-		entry.NamedPortMap["_vts"] = port
-		entry.NamedPortMap["vts"] = port
+	if len(left.PortMap) != len(right.PortMap) {
+		return false
 	}
-
-	if len(tablet.Health) > 0 {
-		entry.Health = make(map[string]string, len(tablet.Health))
-		for k, v := range tablet.Health {
-			entry.Health[k] = v
+	for key, lvalue := range left.PortMap {
+		rvalue, ok := right.PortMap[key]
+		if !ok {
+			return false
+		}
+		if lvalue != rvalue {
+			return false
 		}
 	}
-	return entry, nil
-}
-
-// Addr returns hostname:vt port.
-func (tablet *Tablet) Addr() string {
-	return netutil.JoinHostPort(tablet.Hostname, tablet.Portmap["vt"])
-}
-
-// MysqlAddr returns hostname:mysql port.
-func (tablet *Tablet) MysqlAddr() string {
-	return netutil.JoinHostPort(tablet.Hostname, tablet.Portmap["mysql"])
-}
-
-// MysqlIPAddr returns ip:mysql port.
-func (tablet *Tablet) MysqlIPAddr() string {
-	return netutil.JoinHostPort(tablet.IPAddr, tablet.Portmap["mysql"])
-}
-
-// DbName is usually implied by keyspace. Having the shard information in the
-// database name complicates mysql replication.
-func (tablet *Tablet) DbName() string {
-	if tablet.DbNameOverride != "" {
-		return tablet.DbNameOverride
-	}
-	if tablet.Keyspace == "" {
-		return ""
-	}
-	return vtDbPrefix + tablet.Keyspace
-}
-
-// IsInServingGraph returns if this tablet is in the serving graph
-func (tablet *Tablet) IsInServingGraph() bool {
-	return IsInServingGraph(tablet.Type)
-}
-
-// IsRunningQueryService returns if this tablet should be running
-// the query service.
-func (tablet *Tablet) IsRunningQueryService() bool {
-	return IsRunningQueryService(tablet.Type)
-}
-
-// IsInReplicationGraph returns if this tablet is in the replication graph.
-func (tablet *Tablet) IsInReplicationGraph() bool {
-	return IsInReplicationGraph(tablet.Type)
-}
-
-// IsSlaveType returns if this tablet's type is a slave
-func (tablet *Tablet) IsSlaveType() bool {
-	return IsSlaveType(tablet.Type)
-}
-
-// IsAssigned returns if this tablet ever assigned data? A "scrap" node will
-// show up as assigned even though its data cannot be used for serving.
-func (tablet *Tablet) IsAssigned() bool {
-	return tablet.Keyspace != "" && tablet.Shard != ""
-}
-
-// String returns a string describing the tablet.
-func (tablet *Tablet) String() string {
-	return fmt.Sprintf("Tablet{%v}", tablet.Alias)
-}
-
-// JSON returns a json verison of the tablet.
-func (tablet *Tablet) JSON() string {
-	return jscfg.ToJson(tablet)
+	return true
 }
 
 // TabletInfo is the container for a Tablet, read from the topology server.
 type TabletInfo struct {
-	version int64 // node version - used to prevent stomping concurrent writes
-	*Tablet
+	version Version // node version - used to prevent stomping concurrent writes
+	*topodatapb.Tablet
+}
+
+// String returns a string describing the tablet.
+func (ti *TabletInfo) String() string {
+	return fmt.Sprintf("Tablet{%v}", topoproto.TabletAliasString(ti.Alias))
+}
+
+// AliasString returns the string representation of the tablet alias
+func (ti *TabletInfo) AliasString() string {
+	return topoproto.TabletAliasString(ti.Alias)
+}
+
+// Addr returns hostname:vt port.
+func (ti *TabletInfo) Addr() string {
+	return netutil.JoinHostPort(ti.Hostname, int32(ti.PortMap["vt"]))
+}
+
+// MysqlAddr returns hostname:mysql port.
+func (ti *TabletInfo) MysqlAddr() string {
+	return netutil.JoinHostPort(topoproto.MysqlHostname(ti.Tablet), topoproto.MysqlPort(ti.Tablet))
+}
+
+// DbName is usually implied by keyspace. Having the shard information in the
+// database name complicates mysql replication.
+func (ti *TabletInfo) DbName() string {
+	return topoproto.TabletDbName(ti.Tablet)
 }
 
 // Version returns the version of this tablet from last time it was read or
 // updated.
-func (ti *TabletInfo) Version() int64 {
+func (ti *TabletInfo) Version() Version {
 	return ti.version
 }
 
-// Complete validates and normalizes the tablet. If the shard name
-// contains a '-' it is going to try to infer the keyrange from it.
-func (tablet *Tablet) Complete() error {
-	switch tablet.Type {
-	case TYPE_MASTER:
-		tablet.State = STATE_READ_WRITE
-	case TYPE_IDLE:
-		fallthrough
-	default:
-		tablet.State = STATE_READ_ONLY
-	}
-
-	var err error
-	tablet.Shard, tablet.KeyRange, err = ValidateShardName(tablet.Shard)
-	return err
+// IsInServingGraph returns if this tablet is in the serving graph
+func (ti *TabletInfo) IsInServingGraph() bool {
+	return IsInServingGraph(ti.Type)
 }
 
-// IsHealthEqual compares the tablet's health with the passed one, and
-// returns true if they're equivalent.
-func (tablet *Tablet) IsHealthEqual(health map[string]string) bool {
-	if len(health) == 0 && len(tablet.Health) == 0 {
-		return true
-	}
-
-	return reflect.DeepEqual(health, tablet.Health)
+// IsSlaveType returns if this tablet's type is a slave
+func (ti *TabletInfo) IsSlaveType() bool {
+	return IsSlaveType(ti.Type)
 }
 
 // NewTabletInfo returns a TabletInfo basing on tablet with the
 // version set. This function should be only used by Server
 // implementations.
-func NewTabletInfo(tablet *Tablet, version int64) *TabletInfo {
+func NewTabletInfo(tablet *topodatapb.Tablet, version Version) *TabletInfo {
 	return &TabletInfo{version: version, Tablet: tablet}
 }
 
-// UpdateTablet updates the tablet data only - not associated replication paths.
-func UpdateTablet(ctx context.Context, ts Server, tablet *TabletInfo) error {
+// GetTablet is a high level function to read tablet data.
+// It generates trace spans.
+func (ts *Server) GetTablet(ctx context.Context, alias *topodatapb.TabletAlias) (*TabletInfo, error) {
+	conn, err := ts.ConnForCell(ctx, alias.Cell)
+	if err != nil {
+		return nil, err
+	}
+
 	span := trace.NewSpanFromContext(ctx)
-	span.StartClient("TopoServer.UpdateTablet")
-	span.Annotate("tablet", tablet.Alias.String())
+	span.StartClient("TopoServer.GetTablet")
+	span.Annotate("tablet", topoproto.TabletAliasString(alias))
 	defer span.Finish()
 
-	var version int64 = -1
-	if tablet.version != 0 {
-		version = tablet.version
+	tabletPath := path.Join(TabletsPath, topoproto.TabletAliasString(alias), TabletFile)
+	data, version, err := conn.Get(ctx, tabletPath)
+	if err != nil {
+		return nil, err
+	}
+	tablet := &topodatapb.Tablet{}
+	if err := proto.Unmarshal(data, tablet); err != nil {
+		return nil, err
 	}
 
-	newVersion, err := ts.UpdateTablet(tablet, version)
-	if err == nil {
-		tablet.version = newVersion
-	}
-	return err
+	return &TabletInfo{
+		version: version,
+		Tablet:  tablet,
+	}, nil
 }
 
-// Validate makes sure a tablet is represented correctly in the topology server.
-func Validate(ts Server, tabletAlias TabletAlias) error {
-	// read the tablet record, make sure it parses
-	tablet, err := ts.GetTablet(tabletAlias)
+// UpdateTablet updates the tablet data only - not associated replication paths.
+// It also uses a span, and sends the event.
+func (ts *Server) UpdateTablet(ctx context.Context, ti *TabletInfo) error {
+	conn, err := ts.ConnForCell(ctx, ti.Tablet.Alias.Cell)
 	if err != nil {
 		return err
 	}
 
-	// Some tablets have no information to generate valid replication paths.
-	// We have three cases to handle:
-	// - we are a master, in which case we may have an entry or not
-	// (we are in the process of adding entries to the graph for masters)
-	// - we are a slave in the replication graph, and should have
-	// replication data (second case below)
-	// - we are a master, or in scrap mode but used to be assigned
-	// in the graph somewhere (third case below)
-	// Idle tablets are just not in any graph at all, we don't even know
-	// their keyspace / shard to know where to check.
-	if tablet.Type == TYPE_MASTER {
-		si, err := ts.GetShardReplication(tablet.Alias.Cell, tablet.Keyspace, tablet.Shard)
+	span := trace.NewSpanFromContext(ctx)
+	span.StartClient("TopoServer.UpdateTablet")
+	span.Annotate("tablet", topoproto.TabletAliasString(ti.Alias))
+	defer span.Finish()
+
+	data, err := proto.Marshal(ti.Tablet)
+	if err != nil {
+		return err
+	}
+	tabletPath := path.Join(TabletsPath, topoproto.TabletAliasString(ti.Tablet.Alias), TabletFile)
+	newVersion, err := conn.Update(ctx, tabletPath, data, ti.version)
+	if err != nil {
+		return err
+	}
+	ti.version = newVersion
+
+	event.Dispatch(&events.TabletChange{
+		Tablet: *ti.Tablet,
+		Status: "updated",
+	})
+	return nil
+}
+
+// UpdateTabletFields is a high level helper to read a tablet record, call an
+// update function on it, and then write it back. If the write fails due to
+// a version mismatch, it will re-read the record and retry the update.
+// If the update succeeds, it returns the updated tablet.
+// If the update method returns ErrNoUpdateNeeded, nothing is written,
+// and nil,nil is returned.
+func (ts *Server) UpdateTabletFields(ctx context.Context, alias *topodatapb.TabletAlias, update func(*topodatapb.Tablet) error) (*topodatapb.Tablet, error) {
+	span := trace.NewSpanFromContext(ctx)
+	span.StartClient("TopoServer.UpdateTabletFields")
+	span.Annotate("tablet", topoproto.TabletAliasString(alias))
+	defer span.Finish()
+
+	for {
+		ti, err := ts.GetTablet(ctx, alias)
 		if err != nil {
-			log.Warningf("master tablet %v with no ShardReplication object, assuming it's because of transition", tabletAlias)
-			return nil
+			return nil, err
 		}
+		if err = update(ti.Tablet); err != nil {
+			if IsErrType(err, NoUpdateNeeded) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		if err = ts.UpdateTablet(ctx, ti); !IsErrType(err, BadVersion) {
+			return ti.Tablet, err
+		}
+	}
+}
 
-		_, err = si.GetReplicationLink(tabletAlias)
-		if err != nil {
-			log.Warningf("master tablet %v with no ReplicationLink entry, assuming it's because of transition", tabletAlias)
-			return nil
-		}
+// Validate makes sure a tablet is represented correctly in the topology server.
+func Validate(ctx context.Context, ts *Server, tabletAlias *topodatapb.TabletAlias) error {
+	// read the tablet record, make sure it parses
+	tablet, err := ts.GetTablet(ctx, tabletAlias)
+	if err != nil {
+		return err
+	}
+	if !topoproto.TabletAliasEqual(tablet.Alias, tabletAlias) {
+		return fmt.Errorf("bad tablet alias data for tablet %v: %#v", topoproto.TabletAliasString(tabletAlias), tablet.Alias)
+	}
 
-	} else if tablet.IsInReplicationGraph() {
-		if err = ts.ValidateShard(tablet.Keyspace, tablet.Shard); err != nil {
-			return err
-		}
+	// Validate the entry in the shard replication nodes
+	si, err := ts.GetShardReplication(ctx, tablet.Alias.Cell, tablet.Keyspace, tablet.Shard)
+	if err != nil {
+		return err
+	}
 
-		si, err := ts.GetShardReplication(tablet.Alias.Cell, tablet.Keyspace, tablet.Shard)
-		if err != nil {
-			return err
-		}
-
-		_, err = si.GetReplicationLink(tabletAlias)
-		if err != nil {
-			return fmt.Errorf("tablet %v not found in cell %v shard replication: %v", tabletAlias, tablet.Alias.Cell, err)
-		}
-
-	} else if tablet.IsAssigned() {
-		// this case is to make sure a scrap node that used to be in
-		// a replication graph doesn't leave a node behind.
-		// However, while an action is running, there is some
-		// time where this might be inconsistent.
-		si, err := ts.GetShardReplication(tablet.Alias.Cell, tablet.Keyspace, tablet.Shard)
-		if err != nil {
-			return err
-		}
-
-		rl, err := si.GetReplicationLink(tabletAlias)
-		if err != ErrNoNode {
-			return fmt.Errorf("unexpected replication data found(possible pending action?): %v (%v)", rl, tablet.Type)
-		}
+	if _, err = si.GetShardReplicationNode(tabletAlias); err != nil {
+		return fmt.Errorf("tablet %v not found in cell %v shard replication: %v", tabletAlias, tablet.Alias.Cell, err)
 	}
 
 	return nil
@@ -617,37 +327,87 @@ func Validate(ts Server, tabletAlias TabletAlias) error {
 
 // CreateTablet creates a new tablet and all associated paths for the
 // replication graph.
-func CreateTablet(ts Server, tablet *Tablet) error {
-	// Have the Server create the tablet
-	err := ts.CreateTablet(tablet)
+func (ts *Server) CreateTablet(ctx context.Context, tablet *topodatapb.Tablet) error {
+	conn, err := ts.ConnForCell(ctx, tablet.Alias.Cell)
 	if err != nil {
 		return err
 	}
 
-	// Then add the tablet to the replication graphs
-	if !tablet.IsInReplicationGraph() {
-		return nil
+	data, err := proto.Marshal(tablet)
+	if err != nil {
+		return err
+	}
+	tabletPath := path.Join(TabletsPath, topoproto.TabletAliasString(tablet.Alias), TabletFile)
+	if _, err = conn.Create(ctx, tabletPath, data); err != nil && !IsErrType(err, NodeExists) {
+		return err
 	}
 
-	return UpdateTabletReplicationData(context.TODO(), ts, tablet)
+	// Update ShardReplication in any case, to be sure.  This is
+	// meant to fix the case when a Tablet record was created, but
+	// then the ShardReplication record was not (because for
+	// instance of a startup timeout). Upon running this code
+	// again, we want to fix ShardReplication.
+	if updateErr := UpdateTabletReplicationData(ctx, ts, tablet); updateErr != nil {
+		return updateErr
+	}
+
+	if err == nil {
+		event.Dispatch(&events.TabletChange{
+			Tablet: *tablet,
+			Status: "created",
+		})
+	}
+	return err
+}
+
+// DeleteTablet wraps the underlying conn.Delete
+// and dispatches the event.
+func (ts *Server) DeleteTablet(ctx context.Context, tabletAlias *topodatapb.TabletAlias) error {
+	conn, err := ts.ConnForCell(ctx, tabletAlias.Cell)
+	if err != nil {
+		return err
+	}
+
+	// get the current tablet record, if any, to log the deletion
+	ti, tErr := ts.GetTablet(ctx, tabletAlias)
+
+	tabletPath := path.Join(TabletsPath, topoproto.TabletAliasString(tabletAlias), TabletFile)
+	if err := conn.Delete(ctx, tabletPath, nil); err != nil {
+		return err
+	}
+
+	// Only try to log if we have the required info.
+	if tErr == nil {
+		// Only copy the identity info for the tablet. The rest has been deleted.
+		event.Dispatch(&events.TabletChange{
+			Tablet: topodatapb.Tablet{
+				Alias:    tabletAlias,
+				Keyspace: ti.Tablet.Keyspace,
+				Shard:    ti.Tablet.Shard,
+			},
+			Status: "deleted",
+		})
+	}
+	return nil
 }
 
 // UpdateTabletReplicationData creates or updates the replication
 // graph data for a tablet
-func UpdateTabletReplicationData(ctx context.Context, ts Server, tablet *Tablet) error {
+func UpdateTabletReplicationData(ctx context.Context, ts *Server, tablet *topodatapb.Tablet) error {
 	return UpdateShardReplicationRecord(ctx, ts, tablet.Keyspace, tablet.Shard, tablet.Alias)
 }
 
 // DeleteTabletReplicationData deletes replication data.
-func DeleteTabletReplicationData(ts Server, tablet *Tablet) error {
-	return RemoveShardReplicationRecord(ts, tablet.Alias.Cell, tablet.Keyspace, tablet.Shard, tablet.Alias)
+func DeleteTabletReplicationData(ctx context.Context, ts *Server, tablet *topodatapb.Tablet) error {
+	return RemoveShardReplicationRecord(ctx, ts, tablet.Alias.Cell, tablet.Keyspace, tablet.Shard, tablet.Alias)
 }
 
 // GetTabletMap tries to read all the tablets in the provided list,
 // and returns them all in a map.
 // If error is ErrPartialResult, the results in the dictionary are
 // incomplete, meaning some tablets couldn't be read.
-func GetTabletMap(ctx context.Context, ts Server, tabletAliases []TabletAlias) (map[TabletAlias]*TabletInfo, error) {
+// The map is indexed by topoproto.TabletAliasString(tablet alias).
+func (ts *Server) GetTabletMap(ctx context.Context, tabletAliases []*topodatapb.TabletAlias) (map[string]*TabletInfo, error) {
 	span := trace.NewSpanFromContext(ctx)
 	span.StartLocal("topo.GetTabletMap")
 	span.Annotate("num_tablets", len(tabletAliases))
@@ -656,27 +416,57 @@ func GetTabletMap(ctx context.Context, ts Server, tabletAliases []TabletAlias) (
 	wg := sync.WaitGroup{}
 	mutex := sync.Mutex{}
 
-	tabletMap := make(map[TabletAlias]*TabletInfo)
+	tabletMap := make(map[string]*TabletInfo)
 	var someError error
 
 	for _, tabletAlias := range tabletAliases {
 		wg.Add(1)
-		go func(tabletAlias TabletAlias) {
+		go func(tabletAlias *topodatapb.TabletAlias) {
 			defer wg.Done()
-			tabletInfo, err := ts.GetTablet(tabletAlias)
+			tabletInfo, err := ts.GetTablet(ctx, tabletAlias)
 			mutex.Lock()
 			if err != nil {
 				log.Warningf("%v: %v", tabletAlias, err)
 				// There can be data races removing nodes - ignore them for now.
-				if err != ErrNoNode {
-					someError = ErrPartialResult
+				if !IsErrType(err, NoNode) {
+					someError = NewError(PartialResult, "")
 				}
 			} else {
-				tabletMap[tabletAlias] = tabletInfo
+				tabletMap[topoproto.TabletAliasString(tabletAlias)] = tabletInfo
 			}
 			mutex.Unlock()
 		}(tabletAlias)
 	}
 	wg.Wait()
 	return tabletMap, someError
+}
+
+// GetTabletsByCell returns all the tablets in a cell.
+// It returns ErrNode if the cell doesn't exist.
+// It returns (nil, nil) if the cell exists, but there are no tablets.
+func (ts *Server) GetTabletsByCell(ctx context.Context, cell string) ([]*topodatapb.TabletAlias, error) {
+	// If the cell doesn't exist, this will return ErrNoNode.
+	conn, err := ts.ConnForCell(ctx, cell)
+	if err != nil {
+		return nil, err
+	}
+
+	// List the directory, and parse the aliases
+	children, err := conn.ListDir(ctx, TabletsPath, false /*full*/)
+	if err != nil {
+		if IsErrType(err, NoNode) {
+			// directory doesn't exist, empty list, no error.
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	result := make([]*topodatapb.TabletAlias, len(children))
+	for i, child := range children {
+		result[i], err = topoproto.ParseTabletAlias(child.Name)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
 }

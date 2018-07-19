@@ -1,16 +1,34 @@
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreedto in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package topotools
 
 import (
+	"encoding/hex"
 	"testing"
 
-	"github.com/youtube/vitess/go/vt/key"
-	"github.com/youtube/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo"
+
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 // helper methods for tests to be shorter
 
-func hki(hexValue string) key.KeyspaceId {
-	k, err := key.HexKeyspaceId(hexValue).Unhex()
+func hki(hexValue string) []byte {
+	k, err := hex.DecodeString(hexValue)
 	if err != nil {
 		panic(err)
 	}
@@ -19,13 +37,13 @@ func hki(hexValue string) key.KeyspaceId {
 
 func si(start, end string) *topo.ShardInfo {
 	s := hki(start)
-	e := hki((end))
-	return topo.NewShardInfo("keyspace", s.String()+"-"+e.String(), &topo.Shard{
-		KeyRange: key.KeyRange{
+	e := hki(end)
+	return topo.NewShardInfo("keyspace", start+"-"+end, &topodatapb.Shard{
+		KeyRange: &topodatapb.KeyRange{
 			Start: s,
 			End:   e,
 		},
-	}, 0)
+	}, nil)
 }
 
 type expectedOverlappingShard struct {
@@ -90,7 +108,7 @@ func TestFindOverlappingShardsNoOverlap(t *testing.T) {
 
 	// just one shard, full keyrange
 	shardMap = map[string]*topo.ShardInfo{
-		"0": &topo.ShardInfo{},
+		"0": {},
 	}
 	os, err = findOverlappingShards(shardMap)
 	if len(os) != 0 || err != nil {
@@ -162,7 +180,7 @@ func TestFindOverlappingShardsOverlap(t *testing.T) {
 		t.Errorf("split in progress: %v %v", os, err)
 	}
 	compareResultLists(t, os, []expectedOverlappingShard{
-		expectedOverlappingShard{
+		{
 			left:  []string{"", "80"},
 			right: []string{"", "40", "80"},
 		},
@@ -181,7 +199,7 @@ func TestFindOverlappingShardsOverlap(t *testing.T) {
 		t.Errorf("1 to 4 split: %v %v", os, err)
 	}
 	compareResultLists(t, os, []expectedOverlappingShard{
-		expectedOverlappingShard{
+		{
 			left:  []string{"", ""},
 			right: []string{"", "40", "80", "c0", ""},
 		},
@@ -201,7 +219,7 @@ func TestFindOverlappingShardsOverlap(t *testing.T) {
 		t.Errorf("2 to 3 split: %v %v", os, err)
 	}
 	compareResultLists(t, os, []expectedOverlappingShard{
-		expectedOverlappingShard{
+		{
 			left:  []string{"", "40", "80"},
 			right: []string{"", "30", "60", "80"},
 		},
@@ -221,11 +239,11 @@ func TestFindOverlappingShardsOverlap(t *testing.T) {
 		t.Errorf("2 to 3 split: %v %v", os, err)
 	}
 	compareResultLists(t, os, []expectedOverlappingShard{
-		expectedOverlappingShard{
+		{
 			left:  []string{"", "80"},
 			right: []string{"", "40", "80"},
 		},
-		expectedOverlappingShard{
+		{
 			left:  []string{"80", ""},
 			right: []string{"80", "c0", ""},
 		},
@@ -240,7 +258,7 @@ func TestFindOverlappingShardsOverlap(t *testing.T) {
 	} else {
 		compareResultLists(t, []*OverlappingShards{o},
 			[]expectedOverlappingShard{
-				expectedOverlappingShard{
+				{
 					left:  []string{"", "80"},
 					right: []string{"", "40", "80"},
 				},

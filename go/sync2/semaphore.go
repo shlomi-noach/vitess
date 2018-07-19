@@ -1,6 +1,18 @@
-// Copyright 2012, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package sync2
 
@@ -49,9 +61,25 @@ func (sem *Semaphore) Acquire() bool {
 	}
 }
 
+// TryAcquire acquires a semaphore if it's immediately available.
+// It returns false otherwise.
+func (sem *Semaphore) TryAcquire() bool {
+	select {
+	case <-sem.slots:
+		return true
+	default:
+		return false
+	}
+}
+
 // Release releases the acquired semaphore. You must
 // not release more than the number of semaphores you've
 // acquired.
 func (sem *Semaphore) Release() {
 	sem.slots <- struct{}{}
+}
+
+// Size returns the current number of available slots.
+func (sem *Semaphore) Size() int {
+	return len(sem.slots)
 }

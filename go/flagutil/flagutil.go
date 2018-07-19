@@ -1,9 +1,25 @@
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreedto in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 // Package flagutil contains flags that parse string lists and string
 // maps.
 package flagutil
 
 import (
-	_ "flag"
+	"flag"
 	"sort"
 	"strings"
 )
@@ -13,6 +29,7 @@ import (
 // it with a backslash '\'.
 type StringListValue []string
 
+// Get returns the []string value of this flag.
 func (value StringListValue) Get() interface{} {
 	return []string(value)
 }
@@ -44,11 +61,13 @@ func parseListWithEscapes(v string, delimiter rune) (value []string) {
 	return value
 }
 
+// Set sets the value of this flag from parsing the given string.
 func (value *StringListValue) Set(v string) error {
 	*value = parseListWithEscapes(v, ',')
 	return nil
 }
 
+// String returns the string representation of this flag.
 func (value StringListValue) String() string {
 	parts := make([]string, len(value))
 	for i, v := range value {
@@ -58,11 +77,19 @@ func (value StringListValue) String() string {
 
 }
 
+// StringListVar defines a []string flag with the specified name, value and usage
+// string. The argument 'p' points to a []string in which to store the value of the flag.
+func StringListVar(p *[]string, name string, defaultValue []string, usage string) {
+	*p = defaultValue
+	flag.Var((*StringListValue)(p), name, usage)
+}
+
 // StringMapValue is a map[string]string flag. It accepts a
 // comma-separated list of key value pairs, of the form key:value. The
 // keys cannot contain colons.
 type StringMapValue map[string]string
 
+// Set sets the value of this flag from parsing the given string.
 func (value *StringMapValue) Set(v string) error {
 	dict := make(map[string]string)
 	pairs := parseListWithEscapes(v, ',')
@@ -74,10 +101,12 @@ func (value *StringMapValue) Set(v string) error {
 	return nil
 }
 
+// Get returns the map[string]string value of this flag.
 func (value StringMapValue) Get() interface{} {
 	return map[string]string(value)
 }
 
+// String returns the string representation of this flag.
 func (value StringMapValue) String() string {
 	parts := make([]string, 0)
 	for k, v := range value {

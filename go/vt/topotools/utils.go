@@ -1,6 +1,18 @@
-// Copyright 2012, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package topotools
 
@@ -11,36 +23,39 @@ import (
 
 	"golang.org/x/net/context"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo/topoproto"
+
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
-// FindTabletByIPAddrAndPort searches within a tablet map for tablets
-func FindTabletByIPAddrAndPort(tabletMap map[topo.TabletAlias]*topo.TabletInfo, addr, portName string, port int) (topo.TabletAlias, error) {
-	for alias, ti := range tabletMap {
-		if ti.IPAddr == addr && ti.Portmap[portName] == port {
-			return alias, nil
+// FindTabletByHostAndPort searches within a tablet map for tablets.
+func FindTabletByHostAndPort(tabletMap map[string]*topo.TabletInfo, addr, portName string, port int32) (*topodatapb.TabletAlias, error) {
+	for _, ti := range tabletMap {
+		if ti.Hostname == addr && ti.PortMap[portName] == port {
+			return ti.Alias, nil
 		}
 	}
-	return topo.TabletAlias{}, topo.ErrNoNode
+	return nil, topo.NewError(topo.NoNode, addr+":"+portName)
 }
 
 // GetAllTablets returns a sorted list of tablets.
-func GetAllTablets(ctx context.Context, ts topo.Server, cell string) ([]*topo.TabletInfo, error) {
-	aliases, err := ts.GetTabletsByCell(cell)
+func GetAllTablets(ctx context.Context, ts *topo.Server, cell string) ([]*topo.TabletInfo, error) {
+	aliases, err := ts.GetTabletsByCell(ctx, cell)
 	if err != nil {
 		return nil, err
 	}
-	sort.Sort(topo.TabletAliasList(aliases))
+	sort.Sort(topoproto.TabletAliasList(aliases))
 
-	tabletMap, err := topo.GetTabletMap(ctx, ts, aliases)
+	tabletMap, err := ts.GetTabletMap(ctx, aliases)
 	if err != nil {
 		// we got another error than topo.ErrNoNode
 		return nil, err
 	}
 	tablets := make([]*topo.TabletInfo, 0, len(aliases))
 	for _, tabletAlias := range aliases {
-		tabletInfo, ok := tabletMap[tabletAlias]
+		tabletInfo, ok := tabletMap[topoproto.TabletAliasString(tabletAlias)]
 		if !ok {
 			// tablet disappeared on us (GetTabletMap ignores
 			// topo.ErrNoNode), just echo a warning
@@ -55,8 +70,8 @@ func GetAllTablets(ctx context.Context, ts topo.Server, cell string) ([]*topo.Ta
 
 // GetAllTabletsAcrossCells returns all tablets from known cells.
 // If it returns topo.ErrPartialResult, then the list is valid, but partial.
-func GetAllTabletsAcrossCells(ctx context.Context, ts topo.Server) ([]*topo.TabletInfo, error) {
-	cells, err := ts.GetKnownCells()
+func GetAllTabletsAcrossCells(ctx context.Context, ts *topo.Server) ([]*topo.TabletInfo, error) {
+	cells, err := ts.GetKnownCells(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -79,7 +94,7 @@ func GetAllTabletsAcrossCells(ctx context.Context, ts topo.Server) ([]*topo.Tabl
 		if errors[i] == nil {
 			allTablets = append(allTablets, results[i]...)
 		} else {
-			err = topo.ErrPartialResult
+			err = topo.NewError(topo.PartialResult, "")
 		}
 	}
 	return allTablets, err
@@ -91,14 +106,14 @@ func GetAllTabletsAcrossCells(ctx context.Context, ts topo.Server) ([]*topo.Tabl
 // - The masterMap contains all the tablets without parents
 //   (scrapped or not). This can be used to special case
 //   the old master, and any tablet in a weird state, left over, ...
-func SortedTabletMap(tabletMap map[topo.TabletAlias]*topo.TabletInfo) (map[topo.TabletAlias]*topo.TabletInfo, map[topo.TabletAlias]*topo.TabletInfo) {
-	slaveMap := make(map[topo.TabletAlias]*topo.TabletInfo)
-	masterMap := make(map[topo.TabletAlias]*topo.TabletInfo)
+func SortedTabletMap(tabletMap map[string]*topo.TabletInfo) (map[string]*topo.TabletInfo, map[string]*topo.TabletInfo) {
+	slaveMap := make(map[string]*topo.TabletInfo)
+	masterMap := make(map[string]*topo.TabletInfo)
 	for alias, ti := range tabletMap {
-		if ti.Type != topo.TYPE_MASTER && ti.Type != topo.TYPE_SCRAP {
-			slaveMap[alias] = ti
-		} else {
+		if ti.Type == topodatapb.TabletType_MASTER {
 			masterMap[alias] = ti
+		} else {
+			slaveMap[alias] = ti
 		}
 	}
 	return slaveMap, masterMap

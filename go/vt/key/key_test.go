@@ -1,110 +1,179 @@
-// Copyright 2012, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package key
 
 import (
-	"encoding/json"
+	"encoding/hex"
+	"strings"
 	"testing"
+
+	"github.com/golang/protobuf/proto"
+
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 func TestKey(t *testing.T) {
-	k0 := Uint64Key(0).KeyspaceId()
-	k1 := Uint64Key(1).KeyspaceId()
-	k2 := Uint64Key(0x7FFFFFFFFFFFFFFF).KeyspaceId()
-	k3 := Uint64Key(0x8000000000000000).KeyspaceId()
-	k4 := Uint64Key(0xFFFFFFFFFFFFFFFF).KeyspaceId()
+	k0 := Uint64Key(0)
+	k1 := Uint64Key(1)
+	k2 := Uint64Key(0x7FFFFFFFFFFFFFFF)
+	k3 := Uint64Key(0x8000000000000000)
+	k4 := Uint64Key(0xFFFFFFFFFFFFFFFF)
 
-	f := func(k KeyspaceId, x string) {
-		if x != string(k) {
+	f := func(k Uint64Key, x string) {
+		hexK := hex.EncodeToString(k.Bytes())
+		if x != hexK {
 			t.Errorf("byte mismatch %#v != %#v", k, x)
 		}
-		data, err := json.MarshalIndent(k, "  ", "  ")
-		if err != nil {
-			t.Errorf("serialize error: %v", err)
-		} else {
-			t.Logf("json: %v", string(data))
-		}
-
-		k_r := new(KeyspaceId)
-		err = json.Unmarshal(data, k_r)
-		if err != nil {
-			t.Errorf("reserialize error: %v", err)
-		}
-
-		if k != *k_r {
-			t.Errorf("keyspace compare failed: %#v != %#v", k, k_r)
-		}
 	}
 
-	f(MinKey, "")
-	f(k0, "\x00\x00\x00\x00\x00\x00\x00\x00")
-	f(k1, "\x00\x00\x00\x00\x00\x00\x00\x01")
-	f(k2, "\x7f\xff\xff\xff\xff\xff\xff\xff")
-	f(k3, "\x80\x00\x00\x00\x00\x00\x00\x00")
-	f(k4, "\xff\xff\xff\xff\xff\xff\xff\xff")
+	f(k0, "0000000000000000")
+	f(k1, "0000000000000001")
+	f(k2, "7fffffffffffffff")
+	f(k3, "8000000000000000")
+	f(k4, "ffffffffffffffff")
+}
 
-	hv := k4.Hex()
-	if hv != "ffffffffffffffff" {
-		t.Errorf("Was expecting ffffffffffffffff but got %v", hv)
+func TestEvenShardsKeyRange(t *testing.T) {
+	testCases := []struct {
+		i, n     int
+		wantSpec string
+		want     *topodatapb.KeyRange
+	}{
+		{0, 1,
+			"-",
+			&topodatapb.KeyRange{},
+		},
+		{0, 2,
+			"-80",
+			&topodatapb.KeyRange{
+				End: []byte{0x80},
+			},
+		},
+		{1, 2,
+			"80-",
+			&topodatapb.KeyRange{
+				Start: []byte{0x80},
+			},
+		},
+		{1, 4,
+			"40-80",
+			&topodatapb.KeyRange{
+				Start: []byte{0x40},
+				End:   []byte{0x80},
+			},
+		},
+		{2, 4,
+			"80-c0",
+			&topodatapb.KeyRange{
+				Start: []byte{0x80},
+				End:   []byte{0xc0},
+			},
+		},
+		{1, 256,
+			"01-02",
+			&topodatapb.KeyRange{
+				Start: []byte{0x01},
+				End:   []byte{0x02},
+			},
+		},
+		{256, 512,
+			"8000-8080",
+			&topodatapb.KeyRange{
+				Start: []byte{0x80, 0x00},
+				End:   []byte{0x80, 0x80},
+			},
+		},
+		// Second to last shard out of 512.
+		{510, 512,
+			"ff00-ff80",
+			&topodatapb.KeyRange{
+				Start: []byte{0xff, 0x00},
+				End:   []byte{0xff, 0x80},
+			},
+		},
+		// Last out of 512 shards.
+		{511, 512,
+			"ff80-",
+			&topodatapb.KeyRange{
+				Start: []byte{0xff, 0x80},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		got, err := EvenShardsKeyRange(tc.i, tc.n)
+		if err != nil {
+			t.Fatalf("EvenShardsKeyRange(%v, %v) returned unexpected error: %v", tc.i, tc.n, err)
+		}
+		if !proto.Equal(got, tc.want) {
+			t.Errorf("EvenShardsKeyRange(%v, %v) = (%x, %x), want = (%x, %x)", tc.i, tc.n, got.Start, got.End, tc.want.Start, tc.want.End)
+		}
+
+		// Check if the string representation is equal as well.
+		if gotStr, want := KeyRangeString(got), tc.wantSpec; gotStr != want {
+			t.Errorf("EvenShardsKeyRange(%v) = %v, want = %v", got, gotStr, want)
+		}
+
+		// Now verify that ParseKeyRangeParts() produces the same KeyRange object as
+		// we do.
+		parts := strings.Split(tc.wantSpec, "-")
+		kr, err := ParseKeyRangeParts(parts[0], parts[1])
+		if !proto.Equal(got, kr) {
+			t.Errorf("EvenShardsKeyRange(%v, %v) != ParseKeyRangeParts(%v, %v): (%x, %x) != (%x, %x)", tc.i, tc.n, parts[0], parts[1], got.Start, got.End, kr.Start, kr.End)
+		}
 	}
 }
 
-func TestKeyUint64Sort(t *testing.T) {
-	k0 := Uint64Key(0).KeyspaceId()
-	k1 := Uint64Key(1).KeyspaceId()
-	k2 := Uint64Key(0x7FFFFFFFFFFFFFFF).KeyspaceId()
-	k3 := Uint64Key(0x8000000000000000).KeyspaceId()
-	k4 := Uint64Key(0xFFFFFFFFFFFFFFFF).KeyspaceId()
-	kl := make([]KeyspaceId, 0, 16)
-	klSorted := make([]KeyspaceId, 0, 16)
-	kl = append(kl, MinKey, MaxKey, k4, k3, k2, k1, k0)
-	klSorted = append(kl, MinKey, k0, k1, k2, k3, k4, MaxKey)
-	KeyspaceIdArray(kl).Sort()
-
-	for i, k := range kl {
-		if k != klSorted[i] {
-			t.Errorf("key order error: %d %v %v", i, k, klSorted[i])
-		}
+func TestEvenShardsKeyRange_Error(t *testing.T) {
+	testCases := []struct {
+		i, n      int
+		wantError string
+	}{
+		{
+			-1, 0,
+			"the shard count must be > 0",
+		},
+		{
+			32, 8,
+			"must be less than",
+		},
+		{
+			1, 6,
+			"must be a power of two",
+		},
 	}
-}
 
-func TestKeyStringSort(t *testing.T) {
-	k0 := KeyspaceId("0")
-	k1 := KeyspaceId("9")
-	k2 := KeyspaceId("Zzzz")
-	k3 := KeyspaceId("a")
-	k4 := KeyspaceId("z")
-	kl := make([]KeyspaceId, 0, 16)
-	klSorted := make([]KeyspaceId, 0, 16)
-	kl = append(kl, MinKey, MaxKey, k4, k3, k2, k1, k0)
-	klSorted = append(kl, MinKey, k0, k1, k2, k3, k4, MaxKey)
-	KeyspaceIdArray(kl).Sort()
-
-	for i, k := range kl {
-		if k != klSorted[i] {
-			t.Errorf("key order error: %d %v %v", i, k, klSorted[i])
+	for _, tc := range testCases {
+		kr, err := EvenShardsKeyRange(tc.i, tc.n)
+		if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+			t.Fatalf("EvenShardsKeyRange(%v, %v) = (%v, %v) want error = %v", tc.i, tc.n, kr, err, tc.wantError)
 		}
 	}
 }
 
 func TestParseShardingSpec(t *testing.T) {
-	x40, err := HexKeyspaceId("4000000000000000").Unhex()
-	if err != nil {
-		t.Errorf("Unexpected error: %v.", err)
-	}
-	x80, err := HexKeyspaceId("8000000000000000").Unhex()
-	if err != nil {
-		t.Errorf("Unexpected error: %v.", err)
-	}
-
-	goodTable := map[string][]KeyRange{
-		"-": {{Start: MinKey, End: MaxKey}},
+	x40 := []byte{0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	x80 := []byte{0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	goodTable := map[string][]*topodatapb.KeyRange{
+		"-": {{}},
 		"-4000000000000000-8000000000000000-": {
-			{Start: MinKey, End: x40},
+			{End: x40},
 			{Start: x40, End: x80},
-			{Start: x80, End: MaxKey},
+			{Start: x80},
 		},
 	}
 	badTable := []string{
@@ -123,8 +192,8 @@ func TestParseShardingSpec(t *testing.T) {
 			continue
 		}
 		for i, w := range wanted {
-			if r[i] != w {
-				t.Errorf("Wrong result: wanted %v, got %v", wanted, r)
+			if !proto.Equal(r[i], w) {
+				t.Errorf("Wrong result: wanted %v, got %v", w, r[i])
 				break
 			}
 		}
@@ -151,21 +220,27 @@ func TestContains(t *testing.T) {
 	}
 
 	for _, el := range table {
-		s, err := HexKeyspaceId(el.start).Unhex()
+		s, err := hex.DecodeString(el.start)
 		if err != nil {
 			t.Errorf("Unexpected error: %v", err)
 		}
-		e, err := HexKeyspaceId(el.end).Unhex()
+		e, err := hex.DecodeString(el.end)
 		if err != nil {
 			t.Errorf("Unexpected error: %v", err)
 		}
-		kr := KeyRange{Start: s, End: e}
-		k, err := HexKeyspaceId(el.kid).Unhex()
+		kr := &topodatapb.KeyRange{
+			Start: s,
+			End:   e,
+		}
+		k, err := hex.DecodeString(el.kid)
 		if err != nil {
 			t.Errorf("Unexpected error: %v", err)
 		}
-		if c := kr.Contains(k); c != el.contained {
+		if c := KeyRangeContains(kr, k); c != el.contained {
 			t.Errorf("Unexpected result: contains for %v and (%v-%v) yields %v.", el.kid, el.start, el.end, c)
+		}
+		if !KeyRangeContains(nil, k) {
+			t.Errorf("KeyRangeContains(nil, x) should always be true")
 		}
 	}
 }
@@ -196,24 +271,24 @@ func TestIntersectOverlap(t *testing.T) {
 	}
 
 	for _, el := range table {
-		a, err := HexKeyspaceId(el.a).Unhex()
+		a, err := hex.DecodeString(el.a)
 		if err != nil {
 			t.Errorf("Unexpected error: %v", err)
 		}
-		b, err := HexKeyspaceId(el.b).Unhex()
+		b, err := hex.DecodeString(el.b)
 		if err != nil {
 			t.Errorf("Unexpected error: %v", err)
 		}
-		left := KeyRange{Start: a, End: b}
-		c, err := HexKeyspaceId(el.c).Unhex()
+		left := &topodatapb.KeyRange{Start: a, End: b}
+		c, err := hex.DecodeString(el.c)
 		if err != nil {
 			t.Errorf("Unexpected error: %v", err)
 		}
-		d, err := HexKeyspaceId(el.d).Unhex()
+		d, err := hex.DecodeString(el.d)
 		if err != nil {
 			t.Errorf("Unexpected error: %v", err)
 		}
-		right := KeyRange{Start: c, End: d}
+		right := &topodatapb.KeyRange{Start: c, End: d}
 		if c := KeyRangesIntersect(left, right); c != el.intersects {
 			t.Errorf("Unexpected result: KeyRangesIntersect for %v and %v yields %v.", left, right, c)
 		}
@@ -222,7 +297,7 @@ func TestIntersectOverlap(t *testing.T) {
 			if err != nil {
 				t.Errorf("Unexpected result: KeyRangesOverlap for overlapping %v and %v returned an error: %v", left, right, err)
 			} else {
-				got := string(overlap.Start.Hex()) + "-" + string(overlap.End.Hex())
+				got := hex.EncodeToString(overlap.Start) + "-" + hex.EncodeToString(overlap.End)
 				if got != el.overlap {
 					t.Errorf("Unexpected result: KeyRangesOverlap for overlapping %v and %v should have returned: %v but got: %v", left, right, el.overlap, got)
 				}
@@ -232,5 +307,131 @@ func TestIntersectOverlap(t *testing.T) {
 				t.Errorf("Unexpected result: KeyRangesOverlap for non-overlapping %v and %v should have returned an error", left, right)
 			}
 		}
+	}
+}
+
+func TestKeyRangeIncludes(t *testing.T) {
+	var table = []struct {
+		name     string
+		big      string
+		small    string
+		expected bool
+	}{
+		{"big nil, small nil", "nil", "nil", true},
+		{"big nil, small non nil, fully partial", "nil", "80-c0", true},
+		{"big nil, small non nil, full start", "nil", "-c0", true},
+		{"big nil, small non nil, full end", "nil", "80-", true},
+		{"big non-nil, fully partial, small nil", "80-c0", "nil", false},
+		{"big non-nil, full start, small nil", "-c0", "nil", false},
+		{"big non-nil, full end, small nil", "80-", "nil", false},
+		{"big full, small full", "-", "-", true},
+		{"big full, small partial", "-", "40-60", true},
+		{"big partial, small full", "40-60", "-", false},
+
+		{"big partial, small to the end", "40-60", "40-", false},
+		{"big partial, small bigger to the right", "40-60", "40-80", false},
+		{"big partial, small equal", "40-60", "40-60", true},
+		{"big partial, small smaller right", "40-60", "40-50", true},
+
+		{"big partial, small to the beginning", "40-60", "-60", false},
+		{"big partial, small smaller to the left", "40-60", "20-60", false},
+		{"big partial, small bigger left", "40-60", "50-60", true},
+	}
+
+	var err error
+	for _, tc := range table {
+		var big, small *topodatapb.KeyRange
+		if tc.big != "nil" {
+			parts := strings.Split(tc.big, "-")
+			big, err = ParseKeyRangeParts(parts[0], parts[1])
+			if err != nil {
+				t.Fatalf("test data error in %v: %v", tc.big, err)
+			}
+		}
+		if tc.small != "nil" {
+			parts := strings.Split(tc.small, "-")
+			small, err = ParseKeyRangeParts(parts[0], parts[1])
+			if err != nil {
+				t.Fatalf("test data error in %v: %v", tc.small, err)
+			}
+		}
+		got := KeyRangeIncludes(big, small)
+		if got != tc.expected {
+			t.Errorf("KeyRangeIncludes for test case '%v' returned %v but expected %v", tc.name, got, tc.expected)
+		}
+	}
+}
+
+func BenchmarkUint64KeyBytes(b *testing.B) {
+	keys := []Uint64Key{
+		0, 1, 0x7FFFFFFFFFFFFFFF, 0x8000000000000000, 0xFFFFFFFFFFFFFFFF,
+	}
+
+	for i := 0; i < b.N; i++ {
+		for _, key := range keys {
+			key.Bytes()
+		}
+	}
+}
+
+func BenchmarkUint64KeyString(b *testing.B) {
+	keys := []Uint64Key{
+		0, 1, 0x7FFFFFFFFFFFFFFF, 0x8000000000000000, 0xFFFFFFFFFFFFFFFF,
+	}
+
+	for i := 0; i < b.N; i++ {
+		for _, key := range keys {
+			key.String()
+		}
+	}
+}
+
+func BenchmarkKeyRangeContains(b *testing.B) {
+	kr := &topodatapb.KeyRange{
+		Start: []byte{0x40, 0, 0, 0, 0, 0, 0, 0},
+		End:   []byte{0x80, 0, 0, 0, 0, 0, 0, 0},
+	}
+	keys := [][]byte{
+		{0x30, 0, 0, 0, 0, 0, 0, 0},
+		{0x40, 0, 0, 0, 0, 0, 0, 0},
+		{0x50, 0, 0, 0, 0, 0, 0, 0},
+		{0x80, 0, 0, 0, 0, 0, 0, 0},
+		{0x90, 0, 0, 0, 0, 0, 0, 0},
+	}
+
+	for i := 0; i < b.N; i++ {
+		for _, key := range keys {
+			KeyRangeContains(kr, key)
+		}
+	}
+}
+
+func BenchmarkKeyRangesIntersect(b *testing.B) {
+	kr1 := &topodatapb.KeyRange{
+		Start: []byte{0x40, 0, 0, 0, 0, 0, 0, 0},
+		End:   []byte{0x80, 0, 0, 0, 0, 0, 0, 0},
+	}
+	kr2 := &topodatapb.KeyRange{
+		Start: []byte{0x30, 0, 0, 0, 0, 0, 0, 0},
+		End:   []byte{0x50, 0, 0, 0, 0, 0, 0, 0},
+	}
+
+	for i := 0; i < b.N; i++ {
+		KeyRangesIntersect(kr1, kr2)
+	}
+}
+
+func BenchmarkKeyRangesOverlap(b *testing.B) {
+	kr1 := &topodatapb.KeyRange{
+		Start: []byte{0x40, 0, 0, 0, 0, 0, 0, 0},
+		End:   []byte{0x80, 0, 0, 0, 0, 0, 0, 0},
+	}
+	kr2 := &topodatapb.KeyRange{
+		Start: []byte{0x30, 0, 0, 0, 0, 0, 0, 0},
+		End:   []byte{0x50, 0, 0, 0, 0, 0, 0, 0},
+	}
+
+	for i := 0; i < b.N; i++ {
+		KeyRangesOverlap(kr1, kr2)
 	}
 }

@@ -1,6 +1,18 @@
-// Copyright 2012, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 // zkctl initializes and controls ZooKeeper with Vitess-specific configuration.
 package main
@@ -10,11 +22,11 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"strings"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/zk/zkctl"
+	"vitess.io/vitess/go/exit"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/zkctl"
 )
 
 var usage = `
@@ -26,9 +38,8 @@ Commands:
 var (
 	zkCfg = flag.String("zk.cfg", "6@<hostname>:3801:3802:3803",
 		"zkid@server1:leaderPort1:electionPort1:clientPort1,...)")
-	myId = flag.Uint("zk.myid", 0,
+	myID = flag.Uint("zk.myid", 0,
 		"which server do you want to be? only needed when running multiple instance on one box, otherwise myid is implied by hostname")
-	force = flag.Bool("force", false, "force action, no prompting")
 
 	stdin *bufio.Reader
 )
@@ -42,17 +53,8 @@ func init() {
 	stdin = bufio.NewReader(os.Stdin)
 }
 
-func confirm(prompt string) bool {
-	if *force {
-		return true
-	}
-	fmt.Fprintf(os.Stderr, prompt+" [NO/yes] ")
-
-	line, _ := stdin.ReadString('\n')
-	return strings.ToLower(strings.TrimSpace(line)) == "yes"
-}
-
 func main() {
+	defer exit.Recover()
 	defer logutil.Flush()
 
 	flag.Parse()
@@ -60,10 +62,10 @@ func main() {
 
 	if len(args) == 0 {
 		flag.Usage()
-		os.Exit(1)
+		exit.Return(1)
 	}
 
-	zkConfig := zkctl.MakeZkConfigFromString(*zkCfg, uint32(*myId))
+	zkConfig := zkctl.MakeZkConfigFromString(*zkCfg, uint32(*myID))
 	zkd := zkctl.NewZkd(zkConfig)
 
 	action := flag.Arg(0)
@@ -78,9 +80,11 @@ func main() {
 	case "teardown":
 		err = zkd.Teardown()
 	default:
-		log.Fatalf("invalid action: %v", action)
+		log.Errorf("invalid action: %v", action)
+		exit.Return(1)
 	}
 	if err != nil {
-		log.Fatalf("failed %v: %v", action, err)
+		log.Errorf("failed %v: %v", action, err)
+		exit.Return(1)
 	}
 }

@@ -1,64 +1,46 @@
-// Copyright 2013, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package topo
 
 import (
 	"fmt"
+	"path"
 	"sync"
 
-	log "github.com/golang/glog"
+	"github.com/golang/protobuf/proto"
+	"golang.org/x/net/context"
 
-	"github.com/youtube/vitess/go/vt/concurrency"
-	"github.com/youtube/vitess/go/vt/key"
+	"vitess.io/vitess/go/event"
+	"vitess.io/vitess/go/vt/concurrency"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/topo/events"
+
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 // This file contains keyspace utility functions
-
-// KeyspaceServedFrom is a per-cell record to redirect traffic to another
-// keyspace. Used for vertical splits.
-type KeyspaceServedFrom struct {
-	// who is targeted
-	Cells []string // nil means all cells
-
-	// where to redirect
-	Keyspace string
-}
-
-// Keyspace is the data structure that has data about the Keyspaces in
-// the topology. Most fields are optional.
-type Keyspace struct {
-	// name of the column used for sharding
-	// empty if the keyspace is not sharded
-	ShardingColumnName string
-
-	// type of the column used for sharding
-	// KIT_UNSET if the keyspace is not sharded
-	ShardingColumnType key.KeyspaceIdType
-
-	// ServedFromMap will redirect the appropriate traffic to
-	// another keyspace
-	ServedFromMap map[TabletType]*KeyspaceServedFrom
-
-	// Number of shards to use for batch job / mapreduce jobs
-	// that need to split a given keyspace into multiple shards.
-	// The value N used should be big enough that all possible shards
-	// cover 1/Nth of the entire space or more.
-	// It is usually the number of shards in the system. If a keyspace
-	// is being resharded from M to P shards, it should be max(M, P).
-	// That way we can guarantee a query that is targeted to 1/N of the
-	// keyspace will land on just one shard.
-	SplitShardCount int32
-}
 
 // KeyspaceInfo is a meta struct that contains metadata to give the
 // data more context and convenience. This is the main way we interact
 // with a keyspace.
 type KeyspaceInfo struct {
 	keyspace string
-	version  int64
-	*Keyspace
+	version  Version
+	*topodatapb.Keyspace
 }
 
 // KeyspaceName returns the keyspace name
@@ -66,46 +48,40 @@ func (ki *KeyspaceInfo) KeyspaceName() string {
 	return ki.keyspace
 }
 
-// Version returns the keyspace version from last time it was read or updated.
-func (ki *KeyspaceInfo) Version() int64 {
-	return ki.version
-}
-
-// NewKeyspaceInfo returns a KeyspaceInfo basing on keyspace with the
-// keyspace. This function should be only used by Server
-// implementations.
-func NewKeyspaceInfo(keyspace string, value *Keyspace, version int64) *KeyspaceInfo {
-	return &KeyspaceInfo{
-		keyspace: keyspace,
-		version:  version,
-		Keyspace: value,
+// GetServedFrom returns a Keyspace_ServedFrom record if it exists.
+func (ki *KeyspaceInfo) GetServedFrom(tabletType topodatapb.TabletType) *topodatapb.Keyspace_ServedFrom {
+	for _, ksf := range ki.ServedFroms {
+		if ksf.TabletType == tabletType {
+			return ksf
+		}
 	}
+	return nil
 }
 
 // CheckServedFromMigration makes sure a requested migration is safe
-func (ki *KeyspaceInfo) CheckServedFromMigration(tabletType TabletType, cells []string, keyspace string, remove bool) error {
+func (ki *KeyspaceInfo) CheckServedFromMigration(tabletType topodatapb.TabletType, cells []string, keyspace string, remove bool) error {
 	// master is a special case with a few extra checks
-	if tabletType == TYPE_MASTER {
+	if tabletType == topodatapb.TabletType_MASTER {
 		if !remove {
 			return fmt.Errorf("Cannot add master back to %v", ki.keyspace)
 		}
 		if len(cells) > 0 {
 			return fmt.Errorf("Cannot migrate only some cells for master removal in keyspace %v", ki.keyspace)
 		}
-		if len(ki.ServedFromMap) > 1 {
+		if len(ki.ServedFroms) > 1 {
 			return fmt.Errorf("Cannot migrate master into %v until everything else is migrated", ki.keyspace)
 		}
 	}
 
 	// we can't remove a type we don't have
-	if _, ok := ki.ServedFromMap[tabletType]; !ok && remove {
+	if ki.GetServedFrom(tabletType) == nil && remove {
 		return fmt.Errorf("Supplied type cannot be migrated")
 	}
 
 	// check the keyspace is consistent in any case
-	for tt, ksf := range ki.ServedFromMap {
+	for _, ksf := range ki.ServedFroms {
 		if ksf.Keyspace != keyspace {
-			return fmt.Errorf("Inconsistent keypace specified in migration: %v != %v for type %v", keyspace, ksf.Keyspace, tt)
+			return fmt.Errorf("Inconsistent keypace specified in migration: %v != %v for type %v", keyspace, ksf.Keyspace, ksf.TabletType)
 		}
 	}
 
@@ -114,28 +90,26 @@ func (ki *KeyspaceInfo) CheckServedFromMigration(tabletType TabletType, cells []
 
 // UpdateServedFromMap handles ServedFromMap. It can add or remove
 // records, cells, ...
-func (ki *KeyspaceInfo) UpdateServedFromMap(tabletType TabletType, cells []string, keyspace string, remove bool, allCells []string) error {
+func (ki *KeyspaceInfo) UpdateServedFromMap(tabletType topodatapb.TabletType, cells []string, keyspace string, remove bool, allCells []string) error {
 	// check parameters to be sure
 	if err := ki.CheckServedFromMigration(tabletType, cells, keyspace, remove); err != nil {
 		return err
 	}
 
-	if ki.ServedFromMap == nil {
-		ki.ServedFromMap = make(map[TabletType]*KeyspaceServedFrom)
-	}
-	ksf, ok := ki.ServedFromMap[tabletType]
-	if !ok {
+	ksf := ki.GetServedFrom(tabletType)
+	if ksf == nil {
 		// the record doesn't exist
 		if remove {
-			if len(ki.ServedFromMap) == 0 {
-				ki.ServedFromMap = nil
+			if len(ki.ServedFroms) == 0 {
+				ki.ServedFroms = nil
 			}
 			log.Warningf("Trying to remove KeyspaceServedFrom for missing type %v in keyspace %v", tabletType, ki.keyspace)
 		} else {
-			ki.ServedFromMap[tabletType] = &KeyspaceServedFrom{
-				Cells:    cells,
-				Keyspace: keyspace,
-			}
+			ki.ServedFroms = append(ki.ServedFroms, &topodatapb.Keyspace_ServedFrom{
+				TabletType: tabletType,
+				Cells:      cells,
+				Keyspace:   keyspace,
+			})
 		}
 		return nil
 	}
@@ -144,10 +118,13 @@ func (ki *KeyspaceInfo) UpdateServedFromMap(tabletType TabletType, cells []strin
 		result, emptyList := removeCells(ksf.Cells, cells, allCells)
 		if emptyList {
 			// we don't have any cell left, we need to clear this record
-			delete(ki.ServedFromMap, tabletType)
-			if len(ki.ServedFromMap) == 0 {
-				ki.ServedFromMap = nil
+			var newServedFroms []*topodatapb.Keyspace_ServedFrom
+			for _, k := range ki.ServedFroms {
+				if k != ksf {
+					newServedFroms = append(newServedFroms, k)
+				}
 			}
+			ki.ServedFroms = newServedFroms
 		} else {
 			ksf.Cells = result
 		}
@@ -160,40 +137,92 @@ func (ki *KeyspaceInfo) UpdateServedFromMap(tabletType TabletType, cells []strin
 	return nil
 }
 
-// ComputeCellServedFrom returns the ServedFrom map for a cell
-func (ki *KeyspaceInfo) ComputeCellServedFrom(cell string) map[TabletType]string {
-	result := make(map[TabletType]string)
-	for tabletType, ksf := range ki.ServedFromMap {
+// ComputeCellServedFrom returns the ServedFrom list for a cell
+func (ki *KeyspaceInfo) ComputeCellServedFrom(cell string) []*topodatapb.SrvKeyspace_ServedFrom {
+	var result []*topodatapb.SrvKeyspace_ServedFrom
+	for _, ksf := range ki.ServedFroms {
 		if InCellList(cell, ksf.Cells) {
-			result[tabletType] = ksf.Keyspace
+			result = append(result, &topodatapb.SrvKeyspace_ServedFrom{
+				TabletType: ksf.TabletType,
+				Keyspace:   ksf.Keyspace,
+			})
 		}
-	}
-	if len(result) == 0 {
-		return nil
 	}
 	return result
 }
 
-// UpdateKeyspace updates the keyspace data, with the right version
-func UpdateKeyspace(ts Server, ki *KeyspaceInfo) error {
-	var version int64 = -1
-	if ki.version != 0 {
-		version = ki.version
+// CreateKeyspace wraps the underlying Conn.Create
+// and dispatches the event.
+func (ts *Server) CreateKeyspace(ctx context.Context, keyspace string, value *topodatapb.Keyspace) error {
+	data, err := proto.Marshal(value)
+	if err != nil {
+		return err
 	}
 
-	newVersion, err := ts.UpdateKeyspace(ki, version)
-	if err == nil {
-		ki.version = newVersion
+	keyspacePath := path.Join(KeyspacesPath, keyspace, KeyspaceFile)
+	if _, err := ts.globalCell.Create(ctx, keyspacePath, data); err != nil {
+		return err
 	}
-	return err
+	event.Dispatch(&events.KeyspaceChange{
+		KeyspaceName: keyspace,
+		Keyspace:     value,
+		Status:       "created",
+	})
+	return nil
+}
+
+// GetKeyspace reads the given keyspace and returns it
+func (ts *Server) GetKeyspace(ctx context.Context, keyspace string) (*KeyspaceInfo, error) {
+	keyspacePath := path.Join(KeyspacesPath, keyspace, KeyspaceFile)
+	data, version, err := ts.globalCell.Get(ctx, keyspacePath)
+	if err != nil {
+		return nil, err
+	}
+
+	k := &topodatapb.Keyspace{}
+	if err = proto.Unmarshal(data, k); err != nil {
+		return nil, fmt.Errorf("bad keyspace data %v", err)
+	}
+
+	return &KeyspaceInfo{
+		keyspace: keyspace,
+		version:  version,
+		Keyspace: k,
+	}, nil
+}
+
+// UpdateKeyspace updates the keyspace data. It checks the keyspace is locked.
+func (ts *Server) UpdateKeyspace(ctx context.Context, ki *KeyspaceInfo) error {
+	// make sure it is locked first
+	if err := CheckKeyspaceLocked(ctx, ki.keyspace); err != nil {
+		return err
+	}
+
+	data, err := proto.Marshal(ki.Keyspace)
+	if err != nil {
+		return err
+	}
+	keyspacePath := path.Join(KeyspacesPath, ki.keyspace, KeyspaceFile)
+	version, err := ts.globalCell.Update(ctx, keyspacePath, data, ki.version)
+	if err != nil {
+		return err
+	}
+	ki.version = version
+
+	event.Dispatch(&events.KeyspaceChange{
+		KeyspaceName: ki.keyspace,
+		Keyspace:     ki.Keyspace,
+		Status:       "updated",
+	})
+	return nil
 }
 
 // FindAllShardsInKeyspace reads and returns all the existing shards in
 // a keyspace. It doesn't take any lock.
-func FindAllShardsInKeyspace(ts Server, keyspace string) (map[string]*ShardInfo, error) {
-	shards, err := ts.GetShardNames(keyspace)
+func (ts *Server) FindAllShardsInKeyspace(ctx context.Context, keyspace string) (map[string]*ShardInfo, error) {
+	shards, err := ts.GetShardNames(ctx, keyspace)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get list of shards for keyspace '%v': %v", keyspace, err)
 	}
 
 	result := make(map[string]*ShardInfo, len(shards))
@@ -204,9 +233,13 @@ func FindAllShardsInKeyspace(ts Server, keyspace string) (map[string]*ShardInfo,
 		wg.Add(1)
 		go func(shard string) {
 			defer wg.Done()
-			si, err := ts.GetShard(keyspace, shard)
+			si, err := ts.GetShard(ctx, keyspace, shard)
 			if err != nil {
-				rec.RecordError(fmt.Errorf("GetShard(%v,%v) failed: %v", keyspace, shard, err))
+				if IsErrType(err, NoNode) {
+					log.Warningf("GetShard(%v, %v) returned ErrNoNode, consider checking the topology.", keyspace, shard)
+				} else {
+					rec.RecordError(fmt.Errorf("GetShard(%v, %v) failed: %v", keyspace, shard, err))
+				}
 				return
 			}
 			mu.Lock()
@@ -219,4 +252,49 @@ func FindAllShardsInKeyspace(ts Server, keyspace string) (map[string]*ShardInfo,
 		return nil, rec.Error()
 	}
 	return result, nil
+}
+
+// DeleteKeyspace wraps the underlying Conn.Delete
+// and dispatches the event.
+func (ts *Server) DeleteKeyspace(ctx context.Context, keyspace string) error {
+	keyspacePath := path.Join(KeyspacesPath, keyspace, KeyspaceFile)
+	if err := ts.globalCell.Delete(ctx, keyspacePath, nil); err != nil {
+		return err
+	}
+	event.Dispatch(&events.KeyspaceChange{
+		KeyspaceName: keyspace,
+		Keyspace:     nil,
+		Status:       "deleted",
+	})
+	return nil
+}
+
+// GetKeyspaces returns the list of keyspaces in the topology.
+func (ts *Server) GetKeyspaces(ctx context.Context) ([]string, error) {
+	children, err := ts.globalCell.ListDir(ctx, KeyspacesPath, false /*full*/)
+	switch {
+	case err == nil:
+		return DirEntriesToStringArray(children), nil
+	case IsErrType(err, NoNode):
+		return nil, nil
+	default:
+		return nil, err
+	}
+}
+
+// GetShardNames returns the list of shards in a keyspace.
+func (ts *Server) GetShardNames(ctx context.Context, keyspace string) ([]string, error) {
+	shardsPath := path.Join(KeyspacesPath, keyspace, ShardsPath)
+	children, err := ts.globalCell.ListDir(ctx, shardsPath, false /*full*/)
+	if IsErrType(err, NoNode) {
+		// The directory doesn't exist, let's see if the keyspace
+		// is here or not.
+		_, kerr := ts.GetKeyspace(ctx, keyspace)
+		if kerr == nil {
+			// Keyspace is here, means no shards.
+			return nil, nil
+		}
+		return nil, err
+	}
+	return DirEntriesToStringArray(children), err
 }

@@ -1,6 +1,18 @@
-// Copyright 2014, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package main
 
@@ -13,8 +25,9 @@ import (
 	"os"
 	"sort"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/exit"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/sqlparser"
 )
 
 var (
@@ -31,26 +44,30 @@ var (
 	queries   = make(map[string]int)
 )
 
-type Stat struct {
+type stat struct {
 	Query string
 	Count int
 }
 
-type Stats []Stat
+type stats []stat
 
-func (a Stats) Len() int           { return len(a) }
-func (a Stats) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a Stats) Less(i, j int) bool { return a[i].Count > a[j].Count }
+func (a stats) Len() int           { return len(a) }
+func (a stats) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a stats) Less(i, j int) bool { return a[i].Count > a[j].Count }
 
 func main() {
+	defer exit.Recover()
 	flag.Parse()
 	for _, filename := range flag.Args() {
 		fmt.Printf("processing: %s\n", filename)
-		processFile(filename)
+		if err := processFile(filename); err != nil {
+			log.Errorf("processFile error: %v", err)
+			exit.Return(1)
+		}
 	}
-	var stats = make(Stats, 0, 128)
+	var stats = make(stats, 0, 128)
 	for k, v := range queries {
-		stats = append(stats, Stat{Query: k, Count: v})
+		stats = append(stats, stat{Query: k, Count: v})
 	}
 	sort.Sort(stats)
 	for _, s := range stats {
@@ -58,10 +75,10 @@ func main() {
 	}
 }
 
-func processFile(filename string) {
+func processFile(filename string) error {
 	f, err := os.Open(filename)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	r := bufio.NewReader(f)
 	for {
@@ -70,10 +87,11 @@ func processFile(filename string) {
 			if err == io.EOF {
 				break
 			}
-			log.Fatal(err)
+			return err
 		}
 		analyze(line)
 	}
+	return nil
 }
 
 func analyze(line []byte) {
@@ -89,14 +107,19 @@ func analyze(line []byte) {
 		return
 	}
 	bindIndex = 0
-	buf := sqlparser.NewTrackedBuffer(FormatWithBind)
+	buf := sqlparser.NewTrackedBuffer(formatWithBind)
 	buf.Myprintf("%v", ast)
 	addQuery(buf.ParsedQuery().Query)
 }
 
-func FormatWithBind(buf *sqlparser.TrackedBuffer, node sqlparser.SQLNode) {
-	switch node := node.(type) {
-	case sqlparser.StrVal, sqlparser.NumVal:
+func formatWithBind(buf *sqlparser.TrackedBuffer, node sqlparser.SQLNode) {
+	v, ok := node.(*sqlparser.SQLVal)
+	if !ok {
+		node.Format(buf)
+		return
+	}
+	switch v.Type {
+	case sqlparser.StrVal, sqlparser.HexVal, sqlparser.IntVal:
 		buf.WriteArg(fmt.Sprintf(":v%d", bindIndex))
 		bindIndex++
 	default:

@@ -1,4 +1,21 @@
-// Package callinfo extracts RPC call information from context objects.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreedto in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// Package callinfo stores custom values into the Context
+// (related to the RPC source)
 package callinfo
 
 import (
@@ -7,41 +24,44 @@ import (
 	"golang.org/x/net/context"
 )
 
+// CallInfo is the extra data stored in the Context
 type CallInfo interface {
-	// The remote address information for this rpc call.
+	// RemoteAddr is the remote address information for this rpc call.
 	RemoteAddr() string
 
-	// The username associated with this rpc call, if any.
+	// Username is associated with this rpc call, if any.
 	Username() string
 
-	// A string identifying this rpc call connection as specifically as possible.
-	String() string
+	// Text is a text version of this connection, as specifically as possible.
+	Text() string
 
-	// An HTML representation of this rpc call connection.
+	// HTML represents this rpc call connection in a web-friendly way.
 	HTML() template.HTML
 }
 
-type Renderer func(context.Context) (info CallInfo, ok bool)
+// internal type and value
+type key int
 
-var renderers []Renderer
+var callInfoKey key = 0
 
-func RegisterRenderer(r Renderer) {
-	renderers = append(renderers, r)
+// NewContext adds the provided CallInfo to the context
+func NewContext(ctx context.Context, ci CallInfo) context.Context {
+	return context.WithValue(ctx, callInfoKey, ci)
 }
 
-func FromContext(ctx context.Context) CallInfo {
-	for _, r := range renderers {
-		info, ok := r(ctx)
-		if ok {
-			return info
-		}
+// FromContext returns the CallInfo value stored in ctx, if any.
+func FromContext(ctx context.Context) (CallInfo, bool) {
+	ci, ok := ctx.Value(callInfoKey).(CallInfo)
+	return ci, ok
+}
+
+// HTMLFromContext returns that value of HTML() from the context, or "" if we're
+// not able to recover one
+func HTMLFromContext(ctx context.Context) template.HTML {
+	var h template.HTML
+	ci, ok := FromContext(ctx)
+	if ok {
+		return ci.HTML()
 	}
-	return dummyRenderer{}
+	return h
 }
-
-type dummyRenderer struct{}
-
-func (dummyRenderer) RemoteAddr() string  { return "" }
-func (dummyRenderer) Username() string    { return "" }
-func (dummyRenderer) String() string      { return "" }
-func (dummyRenderer) HTML() template.HTML { return template.HTML("") }

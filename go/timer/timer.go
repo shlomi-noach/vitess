@@ -1,9 +1,40 @@
-// Copyright 2012, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// Package timer provides various enhanced timer functions.
+package timer
+
+import (
+	"sync"
+	"time"
+
+	"vitess.io/vitess/go/sync2"
+)
+
+// Out-of-band messages
+type typeAction int
+
+const (
+	timerStop typeAction = iota
+	timerReset
+	timerTrigger
+)
 
 /*
-Package timer provides timer functionality that can be controlled
+Timer provides timer functionality that can be controlled
 by the user. You start the timer by providing it a callback function,
 which it will call at the specified interval.
 
@@ -24,25 +55,6 @@ The timer interval can be changed on the fly by calling t.SetInterval.
 A zero value interval will cause the timer to wait indefinitely, and it
 will react only to an explicit Trigger or Stop.
 */
-package timer
-
-import (
-	"sync"
-	"time"
-
-	"github.com/youtube/vitess/go/sync2"
-)
-
-// Out-of-band messages
-type typeAction int
-
-const (
-	STOP typeAction = iota
-	RESET
-	TRIGGER
-)
-
-// Timer implements the timer functionality described above.
 type Timer struct {
 	interval sync2.AtomicDuration
 
@@ -54,7 +66,7 @@ type Timer struct {
 	msg chan typeAction
 }
 
-// Create a new Timer object
+// NewTimer creates a new Timer object
 func NewTimer(interval time.Duration) *Timer {
 	tm := &Timer{
 		msg: make(chan typeAction),
@@ -86,9 +98,9 @@ func (tm *Timer) run(keephouse func()) {
 		select {
 		case action := <-tm.msg:
 			switch action {
-			case STOP:
+			case timerStop:
 				return
-			case RESET:
+			case timerReset:
 				continue
 			}
 		case <-ch:
@@ -104,7 +116,7 @@ func (tm *Timer) SetInterval(ns time.Duration) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	if tm.running {
-		tm.msg <- RESET
+		tm.msg <- timerReset
 	}
 }
 
@@ -114,7 +126,7 @@ func (tm *Timer) Trigger() {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	if tm.running {
-		tm.msg <- TRIGGER
+		tm.msg <- timerTrigger
 	}
 }
 
@@ -132,7 +144,7 @@ func (tm *Timer) Stop() {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	if tm.running {
-		tm.msg <- STOP
+		tm.msg <- timerStop
 		tm.running = false
 	}
 }

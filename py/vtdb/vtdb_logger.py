@@ -1,50 +1,33 @@
-# Copyright 2014, Google Inc. All rights reserved.
-# Use of this source code is governed by a BSD-style license that can
-# be found in the LICENSE file.
+# Copyright 2017 Google Inc.
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#     http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""This module defines the VtdbLogger interface, to report suspicious events.
+"""
 
 import logging
 
 
-# VtdbLogger's methods are called whenever something worth noting happens.
-# The default behavior of the class is to log using the logging module.
-# Registering a new implementation allows the client code to report the
-# conditions to any custom reporting mechanism.
-#
-# We use this in the following cases:
-# - error reporting (an exception happened)
-# - performance logging (calls to other services took that long)
 class VtdbLogger(object):
+  """VtdbLogger's methods are called whenever something worth noting happens.
 
-  #
-  # topology callbacks
-  #
+  The default behavior of the class is to log using the logging module.
+  Registering a new implementation allows the client code to report the
+  conditions to any custom reporting mechanism.
 
-  # topo_keyspace_fetch is called when we successfully get a SrvKeyspace object.
-  def topo_keyspace_fetch(self, keyspace_name, topo_rtt):
-    logging.info("Fetched keyspace %s from topo_client in %f secs", keyspace_name, topo_rtt)
-
-  # topo_empty_keyspace_list is called when we get an empty list of
-  # keyspaces from topo server.
-  def topo_empty_keyspace_list(self):
-    logging.warning('topo_empty_keyspace_list')
-
-  # topo_bad_keyspace_data is called if we generated an exception
-  # when reading a keyspace. This is within an exception handler.
-  def topo_bad_keyspace_data(self, keyspace_name):
-    logging.exception('error getting or parsing keyspace data for %s',
-                        keyspace_name)
-
-  # topo_zkocc_error is called whenever we get a zkocc.ZkOccError
-  # when trying to resolve an endpoint.
-  def topo_zkocc_error(self, message, db_key, e):
-    logging.warning('topo_zkocc_error: %s for %s: %s', message, db_key, e)
-
-  # topo_exception is called whenever we get an exception when trying
-  # to resolve an endpoint (that is not a zkocc.ZkOccError, these get
-  # handled by topo_zkocc_error).
-  def topo_exception(self, message, db_key, e):
-    logging.warning('topo_exception: %s for %s: %s', message, db_key, e)
-
+  We use this in the following cases:
+  - error reporting (an exception happened)
+  - performance logging (calls to other services took that long)
+  """
   #
   # vtclient callbacks
   #
@@ -67,22 +50,21 @@ class VtdbLogger(object):
   # vtgatev2 callbacks
   #
 
-  # vtgatev2_exception is called when we get an exception talking to vtgate.
-  def vtgatev2_exception(self, e):
-    logging.warning('vtgatev2_exception: %s', e)
-
   def log_private_data(self, private_data):
-    logging.info("Additional exception data %s", private_data)
+    logging.info('Additional exception data %s', private_data)
+
+  def warning(self, msg, *args, **kwargs):
+    logging.warning(msg, *args, **kwargs)
 
 
 # registration mechanism for VtdbLogger
-__vtdb_logger = VtdbLogger()
+_vtdb_logger = VtdbLogger()
 
 
 def register_vtdb_logger(logger):
-  global __vtdb_logger
-  __vtdb_logger = logger
+  global _vtdb_logger
+  _vtdb_logger = logger
 
 
 def get_logger():
-  return __vtdb_logger
+  return _vtdb_logger

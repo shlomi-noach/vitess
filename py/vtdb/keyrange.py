@@ -1,21 +1,29 @@
-# Copyright 2013, Google Inc. All rights reserved.
-# Use of this source code is governed by a BSD-style license that can
-# be found in the LICENSE file.
+# Copyright 2017 Google Inc.
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#     http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Contains the definition of the KeyRange object.
 """
 
-from bson import codec
 from vtdb import dbexceptions
 from vtdb import keyrange_constants
 
 
-class KeyRange(codec.BSONCoding):
+class KeyRange(object):
   """Definition of KeyRange object.
 
   Vitess uses range based sharding. KeyRange denotes the range
-  for the sharding key. This class also provides bson encoding
-  for this object.
+  for the sharding key.
 
   Attributes:
     Start: start of the keyrange.
@@ -34,35 +42,19 @@ class KeyRange(codec.BSONCoding):
       else:
         kr = kr.split('-')
     if not isinstance(kr, tuple) and not isinstance(kr, list) or len(kr) != 2:
-      raise dbexceptions.ProgrammingError("keyrange must be a list or tuple or a '-' separated str %s" % kr)
+      raise dbexceptions.ProgrammingError(
+          'keyrange must be a list or tuple or a '-' separated str %s' % kr)
     self.Start = kr[0].strip().decode('hex')
     self.End = kr[1].strip().decode('hex')
 
   def __str__(self):
-    if self.Start == keyrange_constants.MIN_KEY and self.End == keyrange_constants.MAX_KEY:
+    if (self.Start == keyrange_constants.MIN_KEY and
+        self.End == keyrange_constants.MAX_KEY):
       return keyrange_constants.NON_PARTIAL_KEYRANGE
     return '%s-%s' % (self.Start.encode('hex'), self.End.encode('hex'))
 
   def __repr__(self):
-    if self.Start == keyrange_constants.MIN_KEY and self.End == keyrange_constants.MAX_KEY:
+    if (self.Start == keyrange_constants.MIN_KEY and
+        self.End == keyrange_constants.MAX_KEY):
       return 'KeyRange(%r)' % keyrange_constants.NON_PARTIAL_KEYRANGE
     return 'KeyRange(%r-%r)' % (self.Start, self.End)
-
-  def bson_encode(self):
-    """Bson encode KeyRange.
-
-    Returns:
-      Dict of start and end values for the KeyRange.
-      {"Start": start, "End": end}
-    """
-
-    return {"Start": self.Start, "End": self.End}
-
-  def bson_init(self, raw_values):
-    """Bson initialize the object with start and end dict.
-
-    Args:
-      raw_values: Dictionary of start and end values for keyrange.
-    """
-    self.Start = raw_values["Start"]
-    self.End = raw_values["End"]

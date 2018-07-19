@@ -1,136 +1,190 @@
-# Schema Management
+Uisng Vitess requires you to work with two different types of schemas:
 
-The schema is the list of tables and how to create them. It is managed by vtctl.
+1. The MySQL database schema. This is the schema of the individual MySQL instances.
+2. The [VSchema]({% link user-guide/vschema.md %}), which describes all the keyspaces and how they're sharded.
 
-## Looking at the Schema
+The workflow for the <code>VSchema</code> is as follows:
 
-The following vtctl commands exist to look at the schema, and validate it's the same on all databases.
+1. Apply the VSchema for each keyspace using the <code>ApplyVschema</code> command. This saves the VSchemas in the global topo server.
+2. Execute <code>RebuildVSchemaGraph</code> for each cell (or all cells). This command propagates a denormalized version of the combined VSchema to all the specified cells. The main purpose for this propagation is to minimize the dependency of each cell from the global topology. The ability to push a change to only specific cells allows you to canary the change to make sure that it's good before deploying it everywhere.
 
-```
-GetSchema <tablet alias>
-```
-where \<tablet alias\> is in the format of "\<cell name\>-\<uid\>"
+This document describes the <code>[vtctl]({% link reference/vtctl.md %})</code>
+commands that you can use to [review](#reviewing-your-schema) or
+[update](#changing-your-schema) your schema in Vitess.
 
-Example:
-```
-$ vtctl -wait-time=30s GetSchema cell01-01234567
-```
-displays the full schema for a tablet
+Note that this functionality is not recommended for long-running schema changes. In such cases, we recommend to do a [schema swap]({% link user-guide/schema-swap.md %}) instead.
 
-```
-ValidateSchemaShard <keyspace/shard>
-```
-where \<keyspace/shard\> is the format of "\<keyspace\>/\<shard\>"
+## Reviewing your schema
 
-Example:
-```
-$ vtctl -wait-time=30s ValidateSchemaShard keyspace01/10-20
-```
-validate the master schema matches all the slaves.
+This section describes the following <code>vtctl</code> commands, which let you look at the schema and validate its consistency across tablets or shards:
 
-```
-ValidateSchemaKeyspace <keyspace>
-```
-validate the master schema from shard 0 matches all the other tablets in the keyspace.
+* [GetSchema](#getschema)
+* [ValidateSchemaShard](#validateschemashard)
+* [ValidateSchemaKeyspace](#validateschemakeyspace)
+* [GetVSchema](#getvschema)
+* [GetSrvVSchema](#getsrvvschema)
 
-Example:
+### GetSchema
 
-```
-$ vtctl -wait-time=30s ValidateSchemaKeyspace user
-```
+The <code>[GetSchema]({% link reference/vtctl.md %}#getschema)</code> command
+displays the full schema for a tablet or a subset of the tablet's tables.
+When you call <code>GetSchema</code>, you specify the tablet alias that
+uniquely identifies the tablet. The <code>\<tablet alias\></code>
+argument value has the format <code>\<cell name\>-\<uid\></code>.
 
-## Changing the Schema
+**Note:** You can use the
+<code>[vtctl ListAllTablets]({% link reference/vtctl.md %}#listalltablets)</code> 
+command to retrieve a list of tablets in a cell and their unique IDs.
 
-Goals:
-- simplify schema updates on the fleet
-- minimize human actions / errors
-- guarantee no or very little downtime for most schema updates
-- do not store any permanent schema data in Topology Server, just use it for actions.
-- only look at tables for now (not stored procedures or grants for instance, although they both could be added fairly easily in the same manner)
-
-We’re trying to get reasonable confidence that a schema update is going to work before applying it. Since we cannot really apply a change to live tables without potentially causing trouble, we have implemented a Preflight operation: it copies the current schema into a temporary database, applies the change there to validate it, and gathers the resulting schema. After this Preflight, we have a good idea of what to expect, and we can apply the change to any database and make sure it worked.
-
-The Preflight operation takes a sql string, and returns a SchemaChangeResult:
-```go
-type SchemaChangeResult struct {
- Error        string
- BeforeSchema *SchemaDefinition
- AfterSchema  *SchemaDefinition
-}
-```
-
-The ApplySchema action applies a schema change. It is described by the following structure (also returns a SchemaChangeResult):
-```go
-type SchemaChange struct {
- Sql              string
- Force            bool
- AllowReplication bool
- BeforeSchema     *SchemaDefinition
- AfterSchema      *SchemaDefinition
-}
-```
-
-And the associated ApplySchema remote action for a tablet. Then the performed steps are:
-- The database to use is either derived from the tablet dbName if UseVt is false, or is the _vt database. A ‘use dbname’ is prepended to the Sql.
-- (if BeforeSchema is not nil) read the schema, make sure it is equal to BeforeSchema. If not equal: if Force is not set, we will abort, if Force is set, we’ll issue a warning and keep going.
-- if AllowReplication is false, we’ll disable replication (adding SET sql_log_bin=0 before the Sql).
-- We will then apply the Sql command.
-- (if AfterSchema is not nil) read the schema again, make sure it is equal to AfterSchema. If not equal: if Force is not set, we will issue an error, if Force is set, we’ll issue a warning.
-We will return the following information:
-- whether it worked or not (doh!)
-- BeforeSchema
-- AfterSchema
-
-### Use case 1: Single tablet update:
-- we first do a Preflight (to know what BeforeSchema and AfterSchema will be). This can be disabled, but is not recommended.
-- we then do the schema upgrade. We will check BeforeSchema before the upgrade, and AfterSchema after the upgrade.
-
-### Use case 2: Single Shard update:
-- need to figure out (or be told) if it’s a simple or complex schema update (does it require the shell game?). For now we'll use a command line flag.
-- in any case, do a Preflight on the master, to get the BeforeSchema and AfterSchema values.
-- in any case, gather the schema on all databases, to see which ones have been upgraded already or not. This guarantees we can interrupt and restart a schema change. Also, this makes sure no action is currently running on the databases we're about to change.
-- if simple:
- - nobody has it: apply to master, very similar to a single tablet update.
- - some tablets have it but not others: error out
-- if complex: do the shell game while disabling replication. Skip the tablets that already have it. Have an option to re-parent a the end.
- - Note the Backup, and Lag servers won't apply a complex schema change. Only the servers actively in the replication graph will.
- - the process can be interrupted at any time, restarting it as a complex schema upgrade should just work.
-
-### Use case 3: Keyspace update:
-- Similar to Single Shard, but the BeforeSchema and AfterSchema values are taken from the first shard, and used in all shards after that.
-- We don't know the new masters to use on each shard, so just skip re-parenting all together.
-
-This translates into the following vtctl commands:
+The following example retrieves the schema for the tablet with the
+unique ID <code>test-000000100</code>:
 
 ```
-PreflightSchema {-sql=<sql> || -sql_file=<filename>} <tablet alias>
-```
-apply the schema change to a temporary database to gather before and after schema and validate the change. The sql can be inlined or read from a file.
-This will create a temporary database, copy the existing keyspace schema into it, apply the schema change, and re-read the resulting schema.
-
-```
-$ echo "create table test_table(id int);" > change.sql
-$ vtctl PreflightSchema -sql_file=change.sql nyc-0002009001
+GetSchema test-000000100
 ```
 
-```
-ApplySchema {-sql=<sql> || -sql_file=<filename>} [-skip_preflight] [-stop_replication] <tablet alias>
-```
-apply the schema change to the specific tablet (allowing replication by default). The sql can be inlined or read from a file.
-a PreflightSchema operation will first be used to make sure the schema is OK (unless skip_preflight is specified).
+### ValidateSchemaShard
+
+The
+<code>[ValidateSchemaShard]({% link reference/vtctl.md %}#validateschemashard)</code>
+command confirms that for a given keyspace, all of the slave tablets
+in a specified shard have the same schema as the master tablet in that
+shard. When you call <code>ValidateSchemaShard</code>, you specify both 
+the keyspace and the shard that you are validating.
+
+The following command confirms that the master and slave tablets in
+shard <code>0</code> all have the same schema for the <code>user</code>
+keyspace:
 
 ```
-ApplySchemaShard {-sql=<sql> || -sql_file=<filename>} [-simple] [-new_parent=<tablet alias>] <keyspace/shard>
-```
-apply the schema change to the specific shard. If simple is specified, we just apply on the live master. Otherwise we do the shell game and will optionally re-parent.
-if new_parent is set, we will also reparent (otherwise the master won't be touched at all). Using the force flag will cause a bunch of checks to be ignored, use with care.
-
-```
-$ vtctl ApplySchemaShard --sql-file=change.sql -simple vtx/0
-$ vtctl ApplySchemaShard --sql-file=change.sql -new_parent=nyc-0002009002 vtx/0
+ValidateSchemaShard user/0
 ```
 
+### ValidateSchemaKeyspace
+
+The <code>[ValidateSchemaKeyspace]({% link reference/vtctl.md %}#validateschemakeyspace)</code>
+command confirms that all of the tablets in a given keyspace have
+the the same schema as the master tablet on shard <code>0</code>
+in that keyspace. Thus, whereas the <code>ValidateSchemaShard</code>
+command confirms the consistency of the schema on tablets within a shard
+for a given keyspace, <code>ValidateSchemaKeyspace</code> confirms the
+consistency across all tablets in all shards for that keyspace.
+
+The following command confirms that all tablets in all shards have the
+same schema as the master tablet in shard <code>0</code> for the
+<code>user</code> keyspace:
+
 ```
-ApplySchemaKeyspace {-sql=<sql> || -sql_file=<filename>} [-simple] <keyspace>
+ValidateSchemaKeyspace user
 ```
-apply the schema change to the specified shard. If simple is specified, we just apply on the live master. Otherwise we will need to do the shell game. So we will apply the schema change to every single slave.
+
+### GetVSchema
+
+The <code>[GetVSchema]({% link reference/vtctl.md %}#getvschema)</code>
+command displays the global VSchema for the specified keyspace.
+
+### GetSrvVSchema
+
+The <code>[GetSrvVSchema]({% link reference/vtctl.md %}#getsrvvschema)</code>
+command displays the combined VSchema for a given cell.
+
+## Changing your schema
+
+This section describes the following commands:
+
+* [ApplySchema](#applyschema)
+* [ApplyVSchema](#applyvschema)
+* [RebuildVSchemaGraph](#rebuildvschemagraph)
+
+### ApplySchema
+
+Vitess' schema modification functionality is designed the following goals in mind:
+
+* Enable simple updates that propagate to your entire fleet of servers.
+* Require minimal human interaction.
+* Minimize errors by testing changes against a temporary database.
+* Guarantee very little downtime (or no downtime) for most schema updates.
+* Do not store permanent schema data in the topology server.
+
+Note that, at this time, Vitess only supports
+[data definition statements](https://dev.mysql.com/doc/refman/5.6/en/sql-syntax-data-definition.html)
+that create, modify, or delete database tables.
+For instance, <code>ApplySchema</code> does not affect stored procedures
+or grants.
+
+The <code>[ApplySchema]({% link reference/vtctl.md %}#applyschema)</code>
+command applies a schema change to the specified keyspace on every
+master tablet, running in parallel on all shards. Changes are then
+propagated to slaves via replication. The command format is:
+```
+ApplySchema {-sql=<sql> || -sql_file=<filename>} <keyspace>
+```
+
+When the <code>ApplySchema</code> action actually applies a schema
+change to the specified keyspace, it performs the following steps:
+
+1. It finds shards that belong to the keyspace, including newly added
+   shards if a [resharding event]({% link user-guide/sharding.md %}#resharding)
+   has taken place.
+1. It validates the SQL syntax and determines the impact of the schema
+   change. If the scope of the change is too large, Vitess rejects it.
+   See the [permitted schema changes](#permitted-schema-changes) section
+   for more detail.
+1. It employs a pre-flight check to ensure that a schema update will
+   succeed before the change is actually applied to the live database.
+   In this stage, Vitess copies the current schema into a temporary
+   database, applies the change there to validate it, and retrieves
+   the resulting schema. By doing so, Vitess verifies that the change
+   succeeds without actually touching live database tables.
+1. It applies the SQL command on the master tablet in each shard.
+
+The following sample command applies the SQL in the **user_table.sql**
+file to the **user** keyspace:
+
+```
+ApplySchema -sql_file=user_table.sql user
+```
+
+#### Permitted schema changes
+
+The <code>ApplySchema</code> command supports a limited set of DDL
+statements. In addition, Vitess rejects some schema changes because
+large changes can slow replication and may reduce the availability
+of your overall system.
+
+The following list identifies types of DDL statements that Vitess
+supports:
+
+* <code>CREATE TABLE</code>
+* <code>CREATE INDEX</code>
+* <code>CREATE VIEW</code>
+* <code>ALTER TABLE</code>
+* <code>ALTER VIEW</code>
+* <code>RENAME TABLE</code>
+* <code>DROP TABLE</code>
+* <code>DROP INDEX</code>
+* <code>DROP VIEW</code>
+
+In addition, Vitess applies the following rules when assessing the
+impact of a potential change:
+
+* <code>DROP</code> statements are always allowed, regardless of the
+  table's size.
+* <code>ALTER</code> statements are only allowed if the table on the
+  shard's master tablet has 100,000 rows or less.
+* For all other statements, the table on the shard's master tablet
+  must have 2 million rows or less.
+
+If a schema change gets rejected because it affects too many rows, you can specify the flag `-allow_long_unavailability` to tell `ApplySchema` to skip this check.
+However, we do not recommend this. Instead, you should apply large schema changes by following the [schema swap process]({% link user-guide/schema-swap.md %}).
+
+### ApplyVSchema
+
+The <code>[ApplyVSchema]({% link reference/vtctl.md %}#applyvschema)</code>
+command applies the specified VSchema to the keyspace. The VSchema can be specified
+as a string or in a file.
+
+### RebuildVSchemaGraph
+
+The <code>[RebuildVSchemaGraph]({% link reference/vtctl.md %}#rebuildvschemagraph)</code>
+command propagates the global VSchema to a specific cell or the list of specified cells.

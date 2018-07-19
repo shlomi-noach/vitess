@@ -1,3 +1,19 @@
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreedto in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 // Package history implements a circular buffer with adjacent-item deduplication.
 package history
 
@@ -17,14 +33,15 @@ type Deduplicable interface {
 // History is a data structure that allows you to keep some number of
 // records.
 type History struct {
-	mu      sync.Mutex
-	records []interface{}
-	last    interface{}
-	next    int
-	length  int
+	mu        sync.Mutex
+	records   []interface{}
+	lastAdded interface{}
+	latest    interface{}
+	next      int
+	length    int
 }
 
-// Return a history with the specified maximum length.
+// New returns a History with the specified maximum length.
 func New(length int) *History {
 	return &History{records: make([]interface{}, length)}
 }
@@ -36,14 +53,16 @@ func (history *History) Add(record interface{}) {
 	history.mu.Lock()
 	defer history.mu.Unlock()
 
+	history.latest = record
+
 	if equiv, ok := record.(Deduplicable); ok && history.length > 0 {
-		if equiv.IsDuplicate(history.last) {
+		if equiv.IsDuplicate(history.lastAdded) {
 			return
 		}
 	}
 
 	history.records[history.next] = record
-	history.last = record
+	history.lastAdded = record
 
 	if history.length < len(history.records) {
 		history.length++
@@ -52,7 +71,7 @@ func (history *History) Add(record interface{}) {
 	history.next = (history.next + 1) % len(history.records)
 }
 
-// Return the kept records in reverse chronological order in a
+// Records returns the kept records in reverse chronological order in a
 // threadsafe manner.
 func (history *History) Records() []interface{} {
 	history.mu.Lock()
@@ -68,4 +87,12 @@ func (history *History) Records() []interface{} {
 	}
 
 	return records
+}
+
+// Latest returns the record most recently passed to Add(),
+// regardless of whether it was actually added or dropped as a duplicate.
+func (history *History) Latest() interface{} {
+	history.mu.Lock()
+	defer history.mu.Unlock()
+	return history.latest
 }

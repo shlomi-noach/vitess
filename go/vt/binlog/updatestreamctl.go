@@ -1,6 +1,18 @@
-// Copyright 2012, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package binlog
 
@@ -8,222 +20,228 @@ import (
 	"fmt"
 	"sync"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/stats"
-	"github.com/youtube/vitess/go/sync2"
-	"github.com/youtube/vitess/go/vt/binlog/proto"
-	"github.com/youtube/vitess/go/vt/mysqlctl"
-	myproto "github.com/youtube/vitess/go/vt/mysqlctl/proto"
+	"golang.org/x/net/context"
+
+	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/stats"
+	"vitess.io/vitess/go/sync2"
+	"vitess.io/vitess/go/tb"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
+
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 /* API and config for UpdateStream Service */
 
 const (
-	DISABLED int64 = iota
-	ENABLED
+	usDisabled int64 = iota
+	usEnabled
 )
 
 var usStateNames = map[int64]string{
-	ENABLED:  "Enabled",
-	DISABLED: "Disabled",
+	usEnabled:  "Enabled",
+	usDisabled: "Disabled",
 }
 
 var (
-	streamCount          = stats.NewCounters("UpdateStreamStreamCount")
-	updateStreamErrors   = stats.NewCounters("UpdateStreamErrors")
-	updateStreamEvents   = stats.NewCounters("UpdateStreamEvents")
-	keyrangeStatements   = stats.NewInt("UpdateStreamKeyRangeStatements")
-	keyrangeTransactions = stats.NewInt("UpdateStreamKeyRangeTransactions")
-	tablesStatements     = stats.NewInt("UpdateStreamTablesStatements")
-	tablesTransactions   = stats.NewInt("UpdateStreamTablesTransactions")
+	streamCount          = stats.NewCountersWithSingleLabel("UpdateStreamStreamCount", "update stream count", "type")
+	updateStreamErrors   = stats.NewCountersWithSingleLabel("UpdateStreamErrors", "update stream error count", "type")
+	keyrangeStatements   = stats.NewCounter("UpdateStreamKeyRangeStatements", "update stream key range statement count")
+	keyrangeTransactions = stats.NewCounter("UpdateStreamKeyRangeTransactions", "update stream key range transaction count")
+	tablesStatements     = stats.NewCounter("UpdateStreamTablesStatements", "update stream table statement count")
+	tablesTransactions   = stats.NewCounter("UpdateStreamTablesTransactions", "update stream table transaction count")
 )
 
-type UpdateStream struct {
-	mycnf *mysqlctl.Mycnf
+// UpdateStreamControl is the interface an UpdateStream service implements
+// to bring it up or down.
+type UpdateStreamControl interface {
+	// Enable will allow any new RPC calls
+	Enable()
 
+	// Disable will interrupt all current calls, and disallow any new call
+	Disable()
+
+	// IsEnabled returns true iff the service is enabled
+	IsEnabled() bool
+}
+
+// UpdateStreamControlMock is an implementation of UpdateStreamControl
+// to be used in tests
+type UpdateStreamControlMock struct {
+	enabled bool
+	sync.Mutex
+}
+
+// NewUpdateStreamControlMock creates a new UpdateStreamControlMock
+func NewUpdateStreamControlMock() *UpdateStreamControlMock {
+	return &UpdateStreamControlMock{}
+}
+
+// Enable is part of UpdateStreamControl
+func (m *UpdateStreamControlMock) Enable() {
+	m.Lock()
+	m.enabled = true
+	m.Unlock()
+}
+
+// Disable is part of UpdateStreamControl
+func (m *UpdateStreamControlMock) Disable() {
+	m.Lock()
+	m.enabled = false
+	m.Unlock()
+}
+
+// IsEnabled is part of UpdateStreamControl
+func (m *UpdateStreamControlMock) IsEnabled() bool {
+	m.Lock()
+	defer m.Unlock()
+	return m.enabled
+}
+
+// UpdateStreamImpl is the real implementation of UpdateStream
+// and UpdateStreamControl
+type UpdateStreamImpl struct {
+	// the following variables are set at construction time
+	ts       *topo.Server
+	keyspace string
+	cell     string
+	cp       *mysql.ConnParams
+	se       *schema.Engine
+
+	// actionLock protects the following variables
 	actionLock     sync.Mutex
 	state          sync2.AtomicInt64
-	mysqld         *mysqlctl.Mysqld
 	stateWaitGroup sync.WaitGroup
-	dbname         string
-	streams        streamList
+	streams        StreamList
 }
 
-type streamList struct {
+// StreamList is a map of context.CancelFunc to mass-interrupt ongoing
+// calls.
+type StreamList struct {
 	sync.Mutex
-	streams map[*sync2.ServiceManager]bool
+	currentIndex int
+	streams      map[int]context.CancelFunc
 }
 
-func (sl *streamList) Init() {
+// Init must be called before using the list.
+func (sl *StreamList) Init() {
 	sl.Lock()
-	sl.streams = make(map[*sync2.ServiceManager]bool)
+	sl.streams = make(map[int]context.CancelFunc)
+	sl.currentIndex = 0
 	sl.Unlock()
 }
 
-func (sl *streamList) Add(e *sync2.ServiceManager) {
+// Add adds a CancelFunc to the map.
+func (sl *StreamList) Add(c context.CancelFunc) int {
 	sl.Lock()
-	sl.streams[e] = true
+	defer sl.Unlock()
+
+	sl.currentIndex++
+	sl.streams[sl.currentIndex] = c
+	return sl.currentIndex
+}
+
+// Delete removes a CancelFunc from the list.
+func (sl *StreamList) Delete(i int) {
+	sl.Lock()
+	delete(sl.streams, i)
 	sl.Unlock()
 }
 
-func (sl *streamList) Delete(e *sync2.ServiceManager) {
+// Stop stops all the current streams.
+func (sl *StreamList) Stop() {
 	sl.Lock()
-	delete(sl.streams, e)
-	sl.Unlock()
-}
-
-func (sl *streamList) Stop() {
-	sl.Lock()
-	for stream := range sl.streams {
-		stream.Stop()
+	for _, c := range sl.streams {
+		c()
 	}
 	sl.Unlock()
 }
 
-// UpdateStreamRpcService is the singleton that gets initialized during
-// startup and that gets called by all RPC server implementations
-var UpdateStreamRpcService *UpdateStream
+// RegisterUpdateStreamServiceFunc is the type to use for delayed
+// registration of RPC servers until we have all the objects
+type RegisterUpdateStreamServiceFunc func(UpdateStream)
 
-// Glue to delay registration of RPC servers until we have all the objects
-type RegisterUpdateStreamServiceFunc func(*UpdateStream)
-
+// RegisterUpdateStreamServices is the list of all registration
+// callbacks to invoke
 var RegisterUpdateStreamServices []RegisterUpdateStreamServiceFunc
 
-// RegisterUpdateStreamService needs to be called to start listening
-// to clients
-func RegisterUpdateStreamService(mycnf *mysqlctl.Mycnf) {
-	// check we haven't been called already
-	if UpdateStreamRpcService != nil {
-		panic("Update Stream service already initialized")
+// NewUpdateStream returns a new UpdateStreamImpl object
+func NewUpdateStream(ts *topo.Server, keyspace string, cell string, cp *mysql.ConnParams, se *schema.Engine) *UpdateStreamImpl {
+	return &UpdateStreamImpl{
+		ts:       ts,
+		keyspace: keyspace,
+		cell:     cell,
+		cp:       cp,
+		se:       se,
 	}
+}
 
-	// create the singleton
-	UpdateStreamRpcService = &UpdateStream{mycnf: mycnf}
+// RegisterService needs to be called to publish stats, and to start listening
+// to clients. Only once instance can call this in a process.
+func (updateStream *UpdateStreamImpl) RegisterService() {
+	// publish the stats
 	stats.Publish("UpdateStreamState", stats.StringFunc(func() string {
-		return usStateNames[UpdateStreamRpcService.state.Get()]
+		return usStateNames[updateStream.state.Get()]
 	}))
 
-	// and register all the instances
+	// and register all the RPC protocols
 	for _, f := range RegisterUpdateStreamServices {
-		f(UpdateStreamRpcService)
+		f(updateStream)
 	}
 }
 
 func logError() {
 	if x := recover(); x != nil {
-		log.Errorf("%s", x.(error).Error())
+		log.Errorf("%s at\n%s", x.(error).Error(), tb.Stack(4))
 	}
 }
 
-func EnableUpdateStreamService(dbname string, mysqld *mysqlctl.Mysqld) {
+// Enable will allow connections to the service
+func (updateStream *UpdateStreamImpl) Enable() {
 	defer logError()
-	UpdateStreamRpcService.enable(dbname, mysqld)
-}
-
-func DisableUpdateStreamService() {
-	defer logError()
-	UpdateStreamRpcService.disable()
-}
-
-func ServeUpdateStream(req *proto.UpdateStreamRequest, sendReply func(reply *proto.StreamEvent) error) error {
-	return UpdateStreamRpcService.ServeUpdateStream(req, sendReply)
-}
-
-func IsUpdateStreamEnabled() bool {
-	return UpdateStreamRpcService.isEnabled()
-}
-
-func GetReplicationPosition() (myproto.ReplicationPosition, error) {
-	return UpdateStreamRpcService.getReplicationPosition()
-}
-
-func (updateStream *UpdateStream) enable(dbname string, mysqld *mysqlctl.Mysqld) {
 	updateStream.actionLock.Lock()
 	defer updateStream.actionLock.Unlock()
-	if updateStream.isEnabled() {
+	if updateStream.IsEnabled() {
 		return
 	}
 
-	if dbname == "" {
-		log.Errorf("Missing db name, cannot enable update stream service")
-		return
-	}
-
-	if updateStream.mycnf.BinLogPath == "" {
-		log.Errorf("Update stream service requires binlogs enabled")
-		return
-	}
-
-	updateStream.state.Set(ENABLED)
-	updateStream.mysqld = mysqld
-	updateStream.dbname = dbname
+	updateStream.state.Set(usEnabled)
 	updateStream.streams.Init()
-	log.Infof("Enabling update stream, dbname: %s, binlogpath: %s", updateStream.dbname, updateStream.mycnf.BinLogPath)
+	log.Infof("Enabling update stream, dbname: %s", updateStream.cp.DbName)
 }
 
-func (updateStream *UpdateStream) disable() {
+// Disable will disallow any connection to the service
+func (updateStream *UpdateStreamImpl) Disable() {
+	defer logError()
 	updateStream.actionLock.Lock()
 	defer updateStream.actionLock.Unlock()
-	if !updateStream.isEnabled() {
+	if !updateStream.IsEnabled() {
 		return
 	}
 
-	updateStream.state.Set(DISABLED)
+	updateStream.state.Set(usDisabled)
 	updateStream.streams.Stop()
 	updateStream.stateWaitGroup.Wait()
 	log.Infof("Update Stream Disabled")
 }
 
-func (updateStream *UpdateStream) isEnabled() bool {
-	return updateStream.state.Get() == ENABLED
+// IsEnabled returns true if UpdateStreamImpl is enabled
+func (updateStream *UpdateStreamImpl) IsEnabled() bool {
+	return updateStream.state.Get() == usEnabled
 }
 
-func (updateStream *UpdateStream) ServeUpdateStream(req *proto.UpdateStreamRequest, sendReply func(reply *proto.StreamEvent) error) (err error) {
-	defer func() {
-		if x := recover(); x != nil {
-			err = x.(error)
-		}
-	}()
-
-	updateStream.actionLock.Lock()
-	if !updateStream.isEnabled() {
-		updateStream.actionLock.Unlock()
-		log.Errorf("Unable to serve client request: update stream service is not enabled")
-		return fmt.Errorf("update stream service is not enabled")
+// StreamKeyRange is part of the UpdateStream interface
+func (updateStream *UpdateStreamImpl) StreamKeyRange(ctx context.Context, position string, keyRange *topodatapb.KeyRange, charset *binlogdatapb.Charset, callback func(trans *binlogdatapb.BinlogTransaction) error) (err error) {
+	pos, err := mysql.DecodePosition(position)
+	if err != nil {
+		return err
 	}
-	updateStream.stateWaitGroup.Add(1)
-	updateStream.actionLock.Unlock()
-	defer updateStream.stateWaitGroup.Done()
-
-	streamCount.Add("Updates", 1)
-	defer streamCount.Add("Updates", -1)
-	log.Infof("ServeUpdateStream starting @ %#v", req.Position)
-
-	evs := NewEventStreamer(updateStream.dbname, updateStream.mysqld, req.Position, func(reply *proto.StreamEvent) error {
-		if reply.Category == "ERR" {
-			updateStreamErrors.Add("UpdateStream", 1)
-		} else {
-			updateStreamEvents.Add(reply.Category, 1)
-		}
-		return sendReply(reply)
-	})
-
-	svm := &sync2.ServiceManager{}
-	svm.Go(evs.Stream)
-	updateStream.streams.Add(svm)
-	defer updateStream.streams.Delete(svm)
-	return svm.Join()
-}
-
-func (updateStream *UpdateStream) StreamKeyRange(req *proto.KeyRangeRequest, sendReply func(reply *proto.BinlogTransaction) error) (err error) {
-	defer func() {
-		if x := recover(); x != nil {
-			err = x.(error)
-		}
-	}()
 
 	updateStream.actionLock.Lock()
-	if !updateStream.isEnabled() {
+	if !updateStream.IsEnabled() {
 		updateStream.actionLock.Unlock()
 		log.Errorf("Unable to serve client request: Update stream service is not enabled")
 		return fmt.Errorf("update stream service is not enabled")
@@ -234,32 +252,36 @@ func (updateStream *UpdateStream) StreamKeyRange(req *proto.KeyRangeRequest, sen
 
 	streamCount.Add("KeyRange", 1)
 	defer streamCount.Add("KeyRange", -1)
-	log.Infof("ServeUpdateStream starting @ %#v", req.Position)
+	log.Infof("ServeUpdateStream starting @ %#v", pos)
 
-	// Calls cascade like this: BinlogStreamer->KeyRangeFilterFunc->func(*proto.BinlogTransaction)->sendReply
-	f := KeyRangeFilterFunc(req.KeyspaceIdType, req.KeyRange, func(reply *proto.BinlogTransaction) error {
-		keyrangeStatements.Add(int64(len(reply.Statements)))
+	// Calls cascade like this: binlog.Streamer->KeyRangeFilterFunc->func(*binlogdatapb.BinlogTransaction)->callback
+	f := KeyRangeFilterFunc(keyRange, func(trans *binlogdatapb.BinlogTransaction) error {
+		keyrangeStatements.Add(int64(len(trans.Statements)))
 		keyrangeTransactions.Add(1)
-		return sendReply(reply)
+		return callback(trans)
 	})
-	bls := NewBinlogStreamer(updateStream.dbname, updateStream.mysqld, req.Charset, req.Position, f)
+	bls := NewStreamer(updateStream.cp, updateStream.se, charset, pos, 0, f)
+	bls.resolverFactory, err = newKeyspaceIDResolverFactory(ctx, updateStream.ts, updateStream.keyspace, updateStream.cell)
+	if err != nil {
+		return fmt.Errorf("newKeyspaceIDResolverFactory failed: %v", err)
+	}
 
-	svm := &sync2.ServiceManager{}
-	svm.Go(bls.Stream)
-	updateStream.streams.Add(svm)
-	defer updateStream.streams.Delete(svm)
-	return svm.Join()
+	streamCtx, cancel := context.WithCancel(ctx)
+	i := updateStream.streams.Add(cancel)
+	defer updateStream.streams.Delete(i)
+
+	return bls.Stream(streamCtx)
 }
 
-func (updateStream *UpdateStream) StreamTables(req *proto.TablesRequest, sendReply func(reply *proto.BinlogTransaction) error) (err error) {
-	defer func() {
-		if x := recover(); x != nil {
-			err = x.(error)
-		}
-	}()
+// StreamTables is part of the UpdateStream interface
+func (updateStream *UpdateStreamImpl) StreamTables(ctx context.Context, position string, tables []string, charset *binlogdatapb.Charset, callback func(trans *binlogdatapb.BinlogTransaction) error) (err error) {
+	pos, err := mysql.DecodePosition(position)
+	if err != nil {
+		return err
+	}
 
 	updateStream.actionLock.Lock()
-	if !updateStream.isEnabled() {
+	if !updateStream.IsEnabled() {
 		updateStream.actionLock.Unlock()
 		log.Errorf("Unable to serve client request: Update stream service is not enabled")
 		return fmt.Errorf("update stream service is not enabled")
@@ -270,29 +292,27 @@ func (updateStream *UpdateStream) StreamTables(req *proto.TablesRequest, sendRep
 
 	streamCount.Add("Tables", 1)
 	defer streamCount.Add("Tables", -1)
-	log.Infof("ServeUpdateStream starting @ %#v", req.Position)
+	log.Infof("ServeUpdateStream starting @ %#v", pos)
 
-	// Calls cascade like this: BinlogStreamer->TablesFilterFunc->func(*proto.BinlogTransaction)->sendReply
-	f := TablesFilterFunc(req.Tables, func(reply *proto.BinlogTransaction) error {
-		keyrangeStatements.Add(int64(len(reply.Statements)))
-		keyrangeTransactions.Add(1)
-		return sendReply(reply)
+	// Calls cascade like this: binlog.Streamer->TablesFilterFunc->func(*binlogdatapb.BinlogTransaction)->callback
+	f := TablesFilterFunc(tables, func(trans *binlogdatapb.BinlogTransaction) error {
+		tablesStatements.Add(int64(len(trans.Statements)))
+		tablesTransactions.Add(1)
+		return callback(trans)
 	})
-	bls := NewBinlogStreamer(updateStream.dbname, updateStream.mysqld, req.Charset, req.Position, f)
+	bls := NewStreamer(updateStream.cp, updateStream.se, charset, pos, 0, f)
 
-	svm := &sync2.ServiceManager{}
-	svm.Go(bls.Stream)
-	updateStream.streams.Add(svm)
-	defer updateStream.streams.Delete(svm)
-	return svm.Join()
+	streamCtx, cancel := context.WithCancel(ctx)
+	i := updateStream.streams.Add(cancel)
+	defer updateStream.streams.Delete(i)
+
+	return bls.Stream(streamCtx)
 }
 
-func (updateStream *UpdateStream) getReplicationPosition() (myproto.ReplicationPosition, error) {
-	updateStream.actionLock.Lock()
-	defer updateStream.actionLock.Unlock()
-	if !updateStream.isEnabled() {
-		return myproto.ReplicationPosition{}, fmt.Errorf("update stream service is not enabled")
+// HandlePanic is part of the UpdateStream interface
+func (updateStream *UpdateStreamImpl) HandlePanic(err *error) {
+	if x := recover(); x != nil {
+		log.Errorf("Uncaught panic:\n%v\n%s", x, tb.Stack(4))
+		*err = fmt.Errorf("uncaught panic: %v", x)
 	}
-
-	return updateStream.mysqld.MasterPosition()
 }

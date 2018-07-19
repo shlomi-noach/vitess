@@ -1,6 +1,18 @@
-// Copyright 2013, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+Copyright 2017 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 /*
 vtworker is the main program to run a worker job.
@@ -14,102 +26,84 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"os"
-	"os/signal"
-	"sync"
-	"syscall"
 	"time"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/vt/servenv"
-	"github.com/youtube/vitess/go/vt/topo"
-	"github.com/youtube/vitess/go/vt/worker"
-	"github.com/youtube/vitess/go/vt/wrangler"
+	"golang.org/x/net/context"
+	"vitess.io/vitess/go/exit"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/worker"
 )
 
 var (
-	cell = flag.String("cell", "", "cell to pick servers from")
+	cell                   = flag.String("cell", "", "cell to pick servers from")
+	commandDisplayInterval = flag.Duration("command_display_interval", time.Second, "Interval between each status update when vtworker is executing a single command from the command line")
 )
 
 func init() {
 	servenv.RegisterDefaultFlags()
+
+	logger := logutil.NewConsoleLogger()
+	flag.CommandLine.SetOutput(logutil.NewLoggerWriter(logger))
+	flag.Usage = func() {
+		logger.Printf("Usage: %s [global parameters] command [command parameters]\n", os.Args[0])
+		logger.Printf("\nThe global optional parameters are:\n")
+		flag.PrintDefaults()
+		logger.Printf("\nThe commands are listed below, sorted by group. Use '%s <command> -h' for more help.\n\n", os.Args[0])
+		worker.PrintAllCommands(logger)
+	}
 }
 
 var (
-	// global wrangler object we'll use
-	wr *wrangler.Wrangler
-
-	// mutex is protecting all the following variables
-	currentWorkerMutex  sync.Mutex
-	currentWorker       worker.Worker
-	currentMemoryLogger *logutil.MemoryLogger
-	currentDone         chan struct{}
+	wi *worker.Instance
 )
 
-// signal handling, centralized here
-func installSignalHandlers(wr *wrangler.Wrangler) {
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
-	go func() {
-		<-sigChan
-		// we got a signal, notify our modules
-		wr.Cancel()
-
-		// TODO(aaijazi) take the currentWorkerMutex, and cancel
-		// currentWorker's context. Or maybe it's even using the
-		// wrangler one, and doesn't need to do anything here.
-		worker.SignalInterrupt()
-	}()
-}
-
-// setAndStartWorker will set the current worker.
-// We always log to both memory logger (for display on the web) and
-// console logger (for records / display of command line worker).
-func setAndStartWorker(wrk worker.Worker) (chan struct{}, error) {
-	currentWorkerMutex.Lock()
-	defer currentWorkerMutex.Unlock()
-	if currentWorker != nil {
-		return nil, fmt.Errorf("A worker is already in progress: %v", currentWorker)
-	}
-
-	currentWorker = wrk
-	currentMemoryLogger = logutil.NewMemoryLogger()
-	currentDone = make(chan struct{})
-	wr.SetLogger(logutil.NewTeeLogger(currentMemoryLogger, logutil.NewConsoleLogger()))
-
-	// one go function runs the worker, closes 'done' when done
-	go func() {
-		log.Infof("Starting worker...")
-		wrk.Run()
-		close(currentDone)
-	}()
-
-	return currentDone, nil
-}
-
 func main() {
+	defer exit.Recover()
+
 	flag.Parse()
 	args := flag.Args()
 
 	servenv.Init()
 	defer servenv.Close()
 
-	ts := topo.GetServer()
-	defer topo.CloseServers()
-
-	// the logger will be replaced when we start a job
-	wr = wrangler.New(logutil.NewConsoleLogger(), ts, 30*time.Second, 30*time.Second)
-	if len(args) == 0 {
-		// interactive mode, initialize the web UI to chose a command
-		initInteractiveMode()
-	} else {
-		// single command mode, just runs it
-		runCommand(args)
+	if *servenv.Version {
+		servenv.AppVersion.Print()
+		os.Exit(0)
 	}
-	installSignalHandlers(wr)
-	initStatusHandling()
+
+	ts := topo.Open()
+	defer ts.Close()
+
+	wi = worker.NewInstance(ts, *cell, *commandDisplayInterval)
+	wi.InstallSignalHandlers()
+	wi.InitStatusHandling()
+
+	if len(args) == 0 {
+		// In interactive mode, initialize the web UI to choose a command.
+		wi.InitInteractiveMode()
+	} else {
+		// In single command mode, just run it.
+		worker, done, err := wi.RunCommand(context.Background(), args, nil /*custom wrangler*/, true /*runFromCli*/)
+		if err != nil {
+			log.Error(err)
+			exit.Return(1)
+		}
+		// Run the subsequent, blocking wait asynchronously.
+		go func() {
+			if err := wi.WaitForCommand(worker, done); err != nil {
+				log.Error(err)
+				logutil.Flush()
+				// We cannot use exit.Return() here because we are in a different go routine now.
+				os.Exit(1)
+			}
+			logutil.Flush()
+			os.Exit(0)
+		}()
+	}
 
 	servenv.RunDefault()
 }
