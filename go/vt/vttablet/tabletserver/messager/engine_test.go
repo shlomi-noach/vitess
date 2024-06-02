@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,72 +17,83 @@ limitations under the License.
 package messager
 
 import (
-	"fmt"
-	"math/rand"
+	"context"
 	"reflect"
-	"runtime"
 	"testing"
-	"time"
 
-	"golang.org/x/net/context"
-
-	"vitess.io/vitess/go/mysql/fakesqldb"
 	"vitess.io/vitess/go/sqltypes"
-	"vitess.io/vitess/go/sync2"
-	"vitess.io/vitess/go/vt/dbconfigs"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 )
 
-var meTable = &schema.Table{
-	Type:        schema.Message,
-	MessageInfo: mmTable.MessageInfo,
-}
+var (
+	meTableT1 = &schema.Table{
+		Name:        sqlparser.NewIdentifierCS("t1"),
+		Type:        schema.Message,
+		MessageInfo: newMMTable().MessageInfo,
+	}
+	meTableT2 = &schema.Table{
+		Name:        sqlparser.NewIdentifierCS("t2"),
+		Type:        schema.Message,
+		MessageInfo: newMMTable().MessageInfo,
+	}
+	meTableT3 = &schema.Table{
+		Name:        sqlparser.NewIdentifierCS("t3"),
+		Type:        schema.Message,
+		MessageInfo: newMMTable().MessageInfo,
+	}
+	meTableT4 = &schema.Table{
+		Name:        sqlparser.NewIdentifierCS("t4"),
+		Type:        schema.Message,
+		MessageInfo: newMMTable().MessageInfo,
+	}
+
+	tableT2 = &schema.Table{
+		Name: sqlparser.NewIdentifierCS("t2"),
+		Type: schema.NoType,
+	}
+	tableT4 = &schema.Table{
+		Name: sqlparser.NewIdentifierCS("t4"),
+		Type: schema.NoType,
+	}
+	tableT5 = &schema.Table{
+		Name: sqlparser.NewIdentifierCS("t5"),
+		Type: schema.NoType,
+	}
+)
 
 func TestEngineSchemaChanged(t *testing.T) {
-	db := fakesqldb.New(t)
-	defer db.Close()
-	engine := newTestEngine(db)
+	engine := newTestEngine()
 	defer engine.Close()
-	tables := map[string]*schema.Table{
-		"t1": meTable,
-		"t2": {
-			Type: schema.NoType,
-		},
-	}
-	engine.schemaChanged(tables, []string{"t1", "t2"}, nil, nil)
+
+	engine.schemaChanged(nil, []*schema.Table{meTableT1, tableT2}, nil, nil, true)
 	got := extractManagerNames(engine.managers)
 	want := map[string]bool{"t1": true}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got: %+v, want %+v", got, want)
 	}
-	tables = map[string]*schema.Table{
-		"t1": meTable,
-		"t2": {
-			Type: schema.NoType,
-		},
-		"t3": meTable,
-	}
-	engine.schemaChanged(tables, []string{"t3"}, nil, nil)
+
+	engine.schemaChanged(nil, []*schema.Table{meTableT3}, nil, nil, true)
 	got = extractManagerNames(engine.managers)
 	want = map[string]bool{"t1": true, "t3": true}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got: %+v, want %+v", got, want)
 	}
-	tables = map[string]*schema.Table{
-		"t1": meTable,
-		"t2": {
-			Type: schema.NoType,
-		},
-		"t4": meTable,
-	}
-	engine.schemaChanged(tables, []string{"t4"}, nil, []string{"t3", "t5"})
+
+	engine.schemaChanged(nil, []*schema.Table{meTableT4}, nil, []*schema.Table{meTableT3, tableT5}, true)
 	got = extractManagerNames(engine.managers)
-	// schemaChanged is only additive.
 	want = map[string]bool{"t1": true, "t4": true}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got: %+v, want %+v", got, want)
+	}
+	// Test update
+	engine.schemaChanged(nil, nil, []*schema.Table{meTableT2, tableT4}, nil, true)
+	got = extractManagerNames(engine.managers)
+	want = map[string]bool{"t1": true, "t2": true}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got: %+v, want %+v", got, want)
 	}
@@ -97,14 +108,8 @@ func extractManagerNames(in map[string]*messageManager) map[string]bool {
 }
 
 func TestSubscribe(t *testing.T) {
-	db := fakesqldb.New(t)
-	defer db.Close()
-	engine := newTestEngine(db)
-	tables := map[string]*schema.Table{
-		"t1": meTable,
-		"t2": meTable,
-	}
-	engine.schemaChanged(tables, []string{"t1", "t2"}, nil, nil)
+	engine := newTestEngine()
+	engine.schemaChanged(nil, []*schema.Table{meTableT1, meTableT2}, nil, nil, true)
 	f1, ch1 := newEngineReceiver()
 	f2, ch2 := newEngineReceiver()
 	// Each receiver is subscribed to different managers.
@@ -132,142 +137,33 @@ func TestSubscribe(t *testing.T) {
 	}
 }
 
-func TestLockDB(t *testing.T) {
-	db := fakesqldb.New(t)
-	defer db.Close()
-	engine := newTestEngine(db)
-	defer engine.Close()
-	tables := map[string]*schema.Table{
-		"t1": meTable,
-		"t2": meTable,
-	}
-	engine.schemaChanged(tables, []string{"t1", "t2"}, nil, nil)
-	f1, ch1 := newEngineReceiver()
-	engine.Subscribe(context.Background(), "t1", f1)
-	<-ch1
-
-	row1 := &MessageRow{
-		Row: []sqltypes.Value{sqltypes.NewVarBinary("1")},
-	}
-	row2 := &MessageRow{
-		TimeNext: time.Now().UnixNano() + int64(10*time.Minute),
-		Row:      []sqltypes.Value{sqltypes.NewVarBinary("2")},
-	}
-	newMessages := map[string][]*MessageRow{"t1": {row1, row2}, "t3": {row1}}
-	unlock := engine.LockDB(newMessages, nil)
-	engine.UpdateCaches(newMessages, nil)
-	unlock()
-	<-ch1
-	runtime.Gosched()
-	// row2 should not be sent.
-	select {
-	case mr := <-ch1:
-		t.Errorf("Unexpected message: %v", mr)
-	default:
-	}
-
-	ch2 := make(chan *sqltypes.Result)
-	var count sync2.AtomicInt64
-	engine.Subscribe(context.Background(), "t2", func(qr *sqltypes.Result) error {
-		count.Add(1)
-		ch2 <- qr
-		return nil
-	})
-	<-ch2
-	mm := engine.managers["t2"]
-	mm.Add(&MessageRow{Row: []sqltypes.Value{sqltypes.NewVarBinary("1")}})
-	// Make sure the message is enqueued.
-	for {
-		runtime.Gosched()
-		time.Sleep(10 * time.Millisecond)
-		if count.Get() == int64(2) {
-			break
-		}
-	}
-	// "2" will be in the cache.
-	mm.Add(&MessageRow{Row: []sqltypes.Value{sqltypes.NewVarBinary("2")}})
-	changedMessages := map[string][]string{"t2": {"2"}, "t3": {"2"}}
-	unlock = engine.LockDB(nil, changedMessages)
-	// This should delete "2".
-	engine.UpdateCaches(nil, changedMessages)
-	unlock()
-	<-ch2
-	runtime.Gosched()
-	// There should be no more messages.
-	select {
-	case mr := <-ch2:
-		t.Errorf("Unexpected message: %v", mr)
-	default:
-	}
-}
-
-func TestGenerateLoadMessagesQuery(t *testing.T) {
-	db := fakesqldb.New(t)
-	defer db.Close()
-	engine := newTestEngine(db)
-	defer engine.Close()
-
-	table := *meTable
-	table.Name = sqlparser.NewTableIdent("t1")
-	engine.schemaChanged(map[string]*schema.Table{
-		"t1": &table,
-	}, []string{"t1"}, nil, nil)
-
-	q, err := engine.GenerateLoadMessagesQuery("t1")
-	if err != nil {
-		t.Error(err)
-	}
-	want := "select time_next, epoch, time_created, id, time_scheduled, message from t1 where :#pk"
-	if q.Query != want {
-		t.Errorf("GenerateLoadMessagesQuery: %s, want %s", q.Query, want)
-	}
-}
-
 func TestEngineGenerate(t *testing.T) {
-	db := fakesqldb.New(t)
-	defer db.Close()
-	engine := newTestEngine(db)
+	engine := newTestEngine()
 	defer engine.Close()
-	engine.schemaChanged(map[string]*schema.Table{
-		"t1": meTable,
-	}, []string{"t1"}, nil, nil)
-	if _, _, err := engine.GenerateAckQuery("t1", []string{"1"}); err != nil {
+	engine.schemaChanged(nil, []*schema.Table{meTableT1}, nil, nil, true)
+
+	if _, err := engine.GetGenerator("t1"); err != nil {
 		t.Error(err)
 	}
 	want := "message table t2 not found in schema"
-	if _, _, err := engine.GenerateAckQuery("t2", []string{"1"}); err == nil || err.Error() != want {
+	if _, err := engine.GetGenerator("t2"); err == nil || err.Error() != want {
 		t.Errorf("engine.GenerateAckQuery(invalid): %v, want %s", err, want)
-	}
-
-	if _, _, err := engine.GeneratePostponeQuery("t1", []string{"1"}); err != nil {
-		t.Error(err)
-	}
-	if _, _, err := engine.GeneratePostponeQuery("t2", []string{"1"}); err == nil || err.Error() != want {
-		t.Errorf("engine.GeneratePostponeQuery(invalid): %v, want %s", err, want)
-	}
-
-	if _, _, err := engine.GeneratePurgeQuery("t1", 0); err != nil {
-		t.Error(err)
-	}
-	if _, _, err := engine.GeneratePurgeQuery("t2", 0); err == nil || err.Error() != want {
-		t.Errorf("engine.GeneratePurgeQuery(invalid): %v, want %s", err, want)
 	}
 }
 
-func newTestEngine(db *fakesqldb.DB) *Engine {
-	randID := rand.Int63()
-	config := tabletenv.DefaultQsConfig
-	config.PoolNamePrefix = fmt.Sprintf("Pool-%d-", randID)
-	tsv := newFakeTabletServer()
-	se := schema.NewEngine(tsv, config)
-	te := NewEngine(tsv, se, config)
-	te.InitDBConfig(dbconfigs.NewTestDBConfigs(*db.ConnParams(), *db.ConnParams(), ""))
+func newTestEngine() *Engine {
+	cfg := tabletenv.NewDefaultConfig()
+	tsv := &fakeTabletServer{
+		Env: tabletenv.NewEnv(vtenv.NewTestEnv(), cfg, "MessagerTest"),
+	}
+	se := schema.NewEngine(tsv)
+	te := NewEngine(tsv, se, newFakeVStreamer())
 	te.Open()
 	return te
 }
 
 func newEngineReceiver() (f func(qr *sqltypes.Result) error, ch chan *sqltypes.Result) {
-	ch = make(chan *sqltypes.Result)
+	ch = make(chan *sqltypes.Result, 1)
 	return func(qr *sqltypes.Result) error {
 		ch <- qr
 		return nil

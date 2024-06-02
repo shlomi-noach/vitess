@@ -1,5 +1,5 @@
 /*
-Copyright 2018 The Vitess Authors
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,13 +18,18 @@ package stats
 
 import (
 	"expvar"
+	"fmt"
+	"sync"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestCounter(t *testing.T) {
 	var gotname string
 	var gotv *Counter
-	clear()
+	clearStats()
 	Register(func(name string, v expvar.Var) {
 		gotname = name
 		gotv = v.(*Counter)
@@ -52,7 +57,7 @@ func TestCounter(t *testing.T) {
 func TestGaugeFunc(t *testing.T) {
 	var gotname string
 	var gotv *GaugeFunc
-	clear()
+	clearStats()
 	Register(func(name string, v expvar.Var) {
 		gotname = name
 		gotv = v.(*GaugeFunc)
@@ -69,5 +74,115 @@ func TestGaugeFunc(t *testing.T) {
 	}
 	if v.String() != "1" {
 		t.Errorf("want 1, got %v", v.String())
+	}
+}
+
+func TestGaugeFloat64(t *testing.T) {
+	var gotname string
+	var gotv *GaugeFloat64
+	clearStats()
+	Register(func(name string, v expvar.Var) {
+		gotname = name
+		gotv = v.(*GaugeFloat64)
+	})
+	v := NewGaugeFloat64("f", "help")
+	assert.Equal(t, "f", gotname)
+	assert.Equal(t, v, gotv)
+	v.Set(3.14)
+	assert.Equal(t, 3.14, v.Get())
+	assert.Equal(t, "3.14", v.String())
+	v.Reset()
+	assert.Equal(t, float64(0), v.Get())
+}
+
+func TestNewCounterWithDeprecatedName(t *testing.T) {
+	clearStats()
+	Register(func(name string, v expvar.Var) {})
+
+	testcases := []struct {
+		name           string
+		deprecatedName string
+		shouldPanic    bool
+	}{
+		{
+			name:           "new_name",
+			deprecatedName: "deprecatedName",
+			shouldPanic:    true,
+		},
+		{
+			name:           "metricName_test",
+			deprecatedName: "metric.name-test",
+			shouldPanic:    false,
+		},
+		{
+			name:           "MetricNameTesting",
+			deprecatedName: "metric.name.testing",
+			shouldPanic:    false,
+		},
+	}
+
+	for _, testcase := range testcases {
+		t.Run(fmt.Sprintf("%v-%v", testcase.name, testcase.deprecatedName), func(t *testing.T) {
+			wg := sync.WaitGroup{}
+			wg.Add(1)
+			panicReceived := false
+			go func() {
+				defer func() {
+					if x := recover(); x != nil {
+						panicReceived = true
+					}
+					wg.Done()
+				}()
+				NewCounterWithDeprecatedName(testcase.name, testcase.deprecatedName, "help")
+			}()
+			wg.Wait()
+			require.EqualValues(t, testcase.shouldPanic, panicReceived)
+		})
+	}
+}
+
+func TestNewGaugeWithDeprecatedName(t *testing.T) {
+	clearStats()
+	Register(func(name string, v expvar.Var) {})
+
+	testcases := []struct {
+		name           string
+		deprecatedName string
+		shouldPanic    bool
+	}{
+		{
+			name:           "gauge_new_name",
+			deprecatedName: "gauge_deprecatedName",
+			shouldPanic:    true,
+		},
+		{
+			name:           "gauge-metricName_test",
+			deprecatedName: "gauge_metric.name-test",
+			shouldPanic:    false,
+		},
+		{
+			name:           "GaugeMetricNameTesting",
+			deprecatedName: "gauge.metric.name.testing",
+			shouldPanic:    false,
+		},
+	}
+
+	for _, testcase := range testcases {
+		t.Run(fmt.Sprintf("%v-%v", testcase.name, testcase.deprecatedName), func(t *testing.T) {
+			wg := sync.WaitGroup{}
+			wg.Add(1)
+			panicReceived := false
+			go func() {
+				defer func() {
+					if x := recover(); x != nil {
+						panicReceived = true
+					}
+					wg.Done()
+				}()
+				NewGaugeWithDeprecatedName(testcase.name, testcase.deprecatedName, "help")
+			}()
+			wg.Wait()
+			require.EqualValues(t, testcase.shouldPanic, panicReceived)
+		})
 	}
 }

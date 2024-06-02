@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -19,8 +19,9 @@ limitations under the License.
 package cephbackupstorage
 
 import (
+	"context"
 	"encoding/json"
-	"flag"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -28,21 +29,31 @@ import (
 	"strings"
 	"sync"
 
-	"errors"
-
 	minio "github.com/minio/minio-go"
-	"golang.org/x/net/context"
+	"github.com/spf13/pflag"
 
 	"vitess.io/vitess/go/vt/concurrency"
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/mysqlctl/backupstorage"
+	"vitess.io/vitess/go/vt/servenv"
 )
 
 var (
 	// configFilePath is where the configs/credentials for backups will be stored.
-	configFilePath = flag.String("ceph_backup_storage_config", "ceph_backup_config.json",
-		"Path to JSON config file for ceph backup storage")
+	configFilePath string
 )
+
+func registerFlags(fs *pflag.FlagSet) {
+	fs.StringVar(&configFilePath, "ceph_backup_storage_config", "ceph_backup_config.json",
+		"Path to JSON config file for ceph backup storage.")
+}
+
+func init() {
+	servenv.OnParseFor("vtbackup", registerFlags)
+	servenv.OnParseFor("vtctl", registerFlags)
+	servenv.OnParseFor("vtctld", registerFlags)
+	servenv.OnParseFor("vttablet", registerFlags)
+}
 
 var storageConfig struct {
 	AccessKey string `json:"accessKey"`
@@ -60,6 +71,21 @@ type CephBackupHandle struct {
 	readOnly  bool
 	errors    concurrency.AllErrorRecorder
 	waitGroup sync.WaitGroup
+}
+
+// RecordError is part of the concurrency.ErrorRecorder interface.
+func (bh *CephBackupHandle) RecordError(err error) {
+	bh.errors.RecordError(err)
+}
+
+// HasErrors is part of the concurrency.ErrorRecorder interface.
+func (bh *CephBackupHandle) HasErrors() bool {
+	return bh.errors.HasErrors()
+}
+
+// Error is part of the concurrency.ErrorRecorder interface.
+func (bh *CephBackupHandle) Error() error {
+	return bh.errors.Error()
 }
 
 // Directory implements BackupHandle.
@@ -88,12 +114,13 @@ func (bh *CephBackupHandle) AddFile(ctx context.Context, filename string, filesi
 
 		// Give PutObject() the read end of the pipe.
 		object := objName(bh.dir, bh.name, filename)
-		_, err := bh.client.PutObject(bucket, object, reader, "application/octet-stream")
+		// If filesize is unknown, the caller should pass in -1 and we will pass it through.
+		_, err := bh.client.PutObjectWithContext(ctx, bucket, object, reader, filesize, minio.PutObjectOptions{ContentType: "application/octet-stream"})
 		if err != nil {
 			// Signal the writer that an error occurred, in case it's not done writing yet.
 			reader.CloseWithError(err)
 			// In case the error happened after the writer finished, we need to remember it.
-			bh.errors.RecordError(err)
+			bh.RecordError(err)
 		}
 	}()
 	// Give our caller the write end of the pipe.
@@ -107,7 +134,7 @@ func (bh *CephBackupHandle) EndBackup(ctx context.Context) error {
 	}
 	bh.waitGroup.Wait()
 	// Return the saved PutObject() errors, if any.
-	return bh.errors.Error()
+	return bh.Error()
 }
 
 // AbortBackup implements BackupHandle.
@@ -126,7 +153,7 @@ func (bh *CephBackupHandle) ReadFile(ctx context.Context, filename string) (io.R
 	// ceph bucket name
 	bucket := alterBucketName(bh.dir)
 	object := objName(bh.dir, bh.name, filename)
-	return bh.client.GetObject(bucket, object)
+	return bh.client.GetObjectWithContext(ctx, bucket, object, minio.GetObjectOptions{})
 }
 
 // CephBackupStorage implements BackupStorage for Ceph Cloud Storage.
@@ -154,7 +181,7 @@ func (bs *CephBackupStorage) ListBackups(ctx context.Context, dir string) ([]bac
 	doneCh := make(chan struct{})
 	for object := range c.ListObjects(bucket, searchPrefix, false, doneCh) {
 		if object.Err != nil {
-			err := c.BucketExists(bucket)
+			_, err := c.BucketExists(bucket)
 			if err != nil {
 				return nil, nil
 			}
@@ -190,8 +217,13 @@ func (bs *CephBackupStorage) StartBackup(ctx context.Context, dir, name string) 
 	// ceph bucket name
 	bucket := alterBucketName(dir)
 
-	err = c.BucketExists(bucket)
+	found, err := c.BucketExists(bucket)
+
 	if err != nil {
+		log.Info("Error from BucketExists: %v, quitting", bucket)
+		return nil, errors.New("Error checking whether bucket exists: " + bucket)
+	}
+	if !found {
 		log.Info("Bucket: %v doesn't exist, creating new bucket with the required name", bucket)
 		err = c.MakeBucket(bucket, "")
 		if err != nil {
@@ -249,6 +281,11 @@ func (bs *CephBackupStorage) Close() error {
 	return nil
 }
 
+func (bs *CephBackupStorage) WithParams(params backupstorage.Params) backupstorage.BackupStorage {
+	// TODO(maxeng): return a new CephBackupStorage that uses params.
+	return bs
+}
+
 // client returns the Ceph Storage client instance.
 // If there isn't one yet, it tries to create one.
 func (bs *CephBackupStorage) client() (*minio.Client, error) {
@@ -256,14 +293,14 @@ func (bs *CephBackupStorage) client() (*minio.Client, error) {
 	defer bs.mu.Unlock()
 
 	if bs._client == nil {
-		configFile, err := os.Open(*configFilePath)
+		configFile, err := os.Open(configFilePath)
 		if err != nil {
 			return nil, fmt.Errorf("file not present : %v", err)
 		}
 		defer configFile.Close()
 		jsonParser := json.NewDecoder(configFile)
 		if err = jsonParser.Decode(&storageConfig); err != nil {
-			return nil, fmt.Errorf("Error parsing the json file : %v", err)
+			return nil, fmt.Errorf("error parsing the json file : %v", err)
 		}
 
 		accessKey := storageConfig.AccessKey
@@ -286,7 +323,6 @@ func init() {
 
 // objName joins path parts into an object name.
 // Unlike path.Join, it doesn't collapse ".." or strip trailing slashes.
-// It also adds the value of the -gcs_backup_storage_root flag if set.
 func objName(parts ...string) string {
 	return strings.Join(parts, "/")
 }

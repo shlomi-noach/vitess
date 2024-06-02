@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -19,9 +19,10 @@ package consultopo
 import (
 	"path"
 
-	"golang.org/x/net/context"
+	"context"
 
 	"github.com/hashicorp/consul/api"
+
 	"vitess.io/vitess/go/vt/topo"
 )
 
@@ -95,6 +96,32 @@ func (s *Server) Get(ctx context.Context, filePath string) ([]byte, topo.Version
 	}
 
 	return pair.Value, ConsulVersion(pair.ModifyIndex), nil
+}
+
+// GetVersion is part of topo.Conn interface.
+func (s *Server) GetVersion(ctx context.Context, filePath string, version int64) ([]byte, error) {
+	return nil, topo.NewError(topo.NoImplementation, "GetVersion not supported in consul topo")
+}
+
+// List is part of the topo.Conn interface.
+func (s *Server) List(ctx context.Context, filePathPrefix string) ([]topo.KVInfo, error) {
+	nodePathPrefix := path.Join(s.root, filePathPrefix)
+
+	pairs, _, err := s.kv.List(nodePathPrefix, nil)
+	if err != nil {
+		return []topo.KVInfo{}, err
+	}
+	if len(pairs) == 0 {
+		return []topo.KVInfo{}, topo.NewError(topo.NoNode, nodePathPrefix)
+	}
+	results := make([]topo.KVInfo, len(pairs))
+	for n := range pairs {
+		results[n].Key = []byte(pairs[n].Key)
+		results[n].Value = pairs[n].Value
+		results[n].Version = ConsulVersion(pairs[n].ModifyIndex)
+	}
+
+	return results, nil
 }
 
 // Delete is part of the topo.Conn interface.

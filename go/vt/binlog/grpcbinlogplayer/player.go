@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,27 +17,34 @@ limitations under the License.
 package grpcbinlogplayer
 
 import (
-	"golang.org/x/net/context"
+	"context"
 
+	"github.com/spf13/pflag"
 	"google.golang.org/grpc"
 
 	"vitess.io/vitess/go/netutil"
 	"vitess.io/vitess/go/vt/binlog/binlogplayer"
 	"vitess.io/vitess/go/vt/grpcclient"
-
-	"flag"
-
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 	binlogservicepb "vitess.io/vitess/go/vt/proto/binlogservice"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/servenv"
 )
 
-var (
-	cert = flag.String("binlog_player_grpc_cert", "", "the cert to use to connect")
-	key  = flag.String("binlog_player_grpc_key", "", "the key to use to connect")
-	ca   = flag.String("binlog_player_grpc_ca", "", "the server ca to use to validate servers when connecting")
-	name = flag.String("binlog_player_grpc_server_name", "", "the server name to use to validate server certificate")
-)
+var cert, key, ca, crl, name string
+
+func init() {
+	servenv.OnParseFor("vtcombo", registerFlags)
+	servenv.OnParseFor("vttablet", registerFlags)
+}
+
+func registerFlags(fs *pflag.FlagSet) {
+	fs.StringVar(&cert, "binlog_player_grpc_cert", cert, "the cert to use to connect")
+	fs.StringVar(&key, "binlog_player_grpc_key", key, "the key to use to connect")
+	fs.StringVar(&ca, "binlog_player_grpc_ca", ca, "the server ca to use to validate servers when connecting")
+	fs.StringVar(&crl, "binlog_player_grpc_crl", crl, "the server crl to use to validate server certificates when connecting")
+	fs.StringVar(&name, "binlog_player_grpc_server_name", name, "the server name to use to validate server certificate")
+}
 
 // client implements a Client over go rpc
 type client struct {
@@ -45,14 +52,14 @@ type client struct {
 	c  binlogservicepb.UpdateStreamClient
 }
 
-func (client *client) Dial(tablet *topodatapb.Tablet) error {
+func (client *client) Dial(ctx context.Context, tablet *topodatapb.Tablet) error {
 	addr := netutil.JoinHostPort(tablet.Hostname, tablet.PortMap["grpc"])
 	var err error
-	opt, err := grpcclient.SecureDialOption(*cert, *key, *ca, *name)
+	opt, err := grpcclient.SecureDialOption(cert, key, ca, crl, name)
 	if err != nil {
 		return err
 	}
-	client.cc, err = grpcclient.Dial(addr, grpcclient.FailFast(false), opt)
+	client.cc, err = grpcclient.DialContext(ctx, addr, grpcclient.FailFast(true), opt)
 	if err != nil {
 		return err
 	}

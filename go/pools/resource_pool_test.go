@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,82 +17,90 @@ limitations under the License.
 package pools
 
 import (
+	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
-	"vitess.io/vitess/go/sync2"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-var lastID, count sync2.AtomicInt64
+var (
+	lastID, count, closeCount, resetCount atomic.Int64
+	waitStarts                            []time.Time
+)
 
 type TestResource struct {
-	num    int64
-	closed bool
+	num         int64
+	timeCreated time.Time
+	closed      bool
 }
 
 func (tr *TestResource) Close() {
 	if !tr.closed {
 		count.Add(-1)
+		closeCount.Add(1)
 		tr.closed = true
 	}
 }
 
-func PoolFactory() (Resource, error) {
-	count.Add(1)
-	return &TestResource{lastID.Add(1), false}, nil
+var _ Resource = (*TestResource)(nil)
+
+func (tr *TestResource) Expired(lifetimeTimeout time.Duration) bool {
+	return lifetimeTimeout > 0 && time.Until(tr.timeCreated.Add(lifetimeTimeout)) < 0
 }
 
-func FailFactory() (Resource, error) {
+func logWait(start time.Time) {
+	waitStarts = append(waitStarts, start)
+}
+
+func PoolFactory(context.Context) (Resource, error) {
+	count.Add(1)
+	return &TestResource{num: lastID.Add(1), timeCreated: time.Now()}, nil
+}
+
+func FailFactory(context.Context) (Resource, error) {
 	return nil, errors.New("Failed")
 }
 
-func SlowFailFactory() (Resource, error) {
+func SlowFailFactory(context.Context) (Resource, error) {
 	time.Sleep(10 * time.Millisecond)
 	return nil, errors.New("Failed")
 }
 
 func TestOpen(t *testing.T) {
 	ctx := context.Background()
-	lastID.Set(0)
-	count.Set(0)
-	p := NewResourcePool(PoolFactory, 6, 6, time.Second)
+	lastID.Store(0)
+	count.Store(0)
+	waitStarts = waitStarts[:0]
+
+	p := NewResourcePool(PoolFactory, 6, 6, time.Second, 0, logWait, nil, 0)
 	p.SetCapacity(5)
 	var resources [10]Resource
+	var r Resource
+	var err error
 
 	// Test Get
 	for i := 0; i < 5; i++ {
-		r, err := p.Get(ctx)
+		r, err = p.Get(ctx)
+		require.NoError(t, err)
 		resources[i] = r
-		if err != nil {
-			t.Errorf("Unexpected error %v", err)
-		}
-		if p.Available() != int64(5-i-1) {
-			t.Errorf("expecting %d, received %d", 5-i-1, p.Available())
-		}
-		if p.WaitCount() != 0 {
-			t.Errorf("expecting 0, received %d", p.WaitCount())
-		}
-		if p.WaitTime() != 0 {
-			t.Errorf("expecting 0, received %d", p.WaitTime())
-		}
-		if lastID.Get() != int64(i+1) {
-			t.Errorf("Expecting %d, received %d", i+1, lastID.Get())
-		}
-		if count.Get() != int64(i+1) {
-			t.Errorf("Expecting %d, received %d", i+1, count.Get())
-		}
+		assert.EqualValues(t, 5-i-1, p.Available())
+		assert.Zero(t, p.WaitCount())
+		assert.Zero(t, len(waitStarts))
+		assert.Zero(t, p.WaitTime())
+		assert.EqualValues(t, i+1, lastID.Load())
+		assert.EqualValues(t, i+1, count.Load())
 	}
 
 	// Test that Get waits
 	ch := make(chan bool)
 	go func() {
 		for i := 0; i < 5; i++ {
-			r, err := p.Get(ctx)
-			if err != nil {
-				t.Errorf("Get failed: %v", err)
-			}
+			r, err = p.Get(ctx)
+			require.NoError(t, err)
 			resources[i] = r
 		}
 		for i := 0; i < 5; i++ {
@@ -106,106 +114,79 @@ func TestOpen(t *testing.T) {
 		p.Put(resources[i])
 	}
 	<-ch
-	if p.WaitCount() != 5 {
-		t.Errorf("Expecting 5, received %d", p.WaitCount())
-	}
-	if p.WaitTime() == 0 {
-		t.Errorf("Expecting non-zero")
-	}
-	if lastID.Get() != 5 {
-		t.Errorf("Expecting 5, received %d", lastID.Get())
-	}
-
-	// Test Close resource
-	r, err := p.Get(ctx)
-	if err != nil {
-		t.Errorf("Unexpected error %v", err)
-	}
-	r.Close()
-	p.Put(nil)
-	if count.Get() != 4 {
-		t.Errorf("Expecting 4, received %d", count.Get())
-	}
-	for i := 0; i < 5; i++ {
-		r, err := p.Get(ctx)
-		if err != nil {
-			t.Errorf("Get failed: %v", err)
+	assert.EqualValues(t, 5, p.WaitCount())
+	assert.Equal(t, 5, len(waitStarts))
+	// verify start times are monotonic increasing
+	for i := 1; i < len(waitStarts); i++ {
+		if waitStarts[i].Before(waitStarts[i-1]) {
+			t.Errorf("Expecting monotonic increasing start times")
 		}
+	}
+	assert.NotZero(t, p.WaitTime())
+	assert.EqualValues(t, 5, lastID.Load())
+	// Test Close resource
+	r, err = p.Get(ctx)
+	require.NoError(t, err)
+	r.Close()
+	// A nil Put should cause the resource to be reopened.
+	p.Put(nil)
+	assert.EqualValues(t, 5, count.Load())
+	assert.EqualValues(t, 6, lastID.Load())
+
+	for i := 0; i < 5; i++ {
+		r, err = p.Get(ctx)
+		require.NoError(t, err)
 		resources[i] = r
 	}
 	for i := 0; i < 5; i++ {
 		p.Put(resources[i])
 	}
-	if count.Get() != 5 {
-		t.Errorf("Expecting 5, received %d", count.Get())
-	}
-	if lastID.Get() != 6 {
-		t.Errorf("Expecting 6, received %d", lastID.Get())
-	}
+	assert.EqualValues(t, 5, count.Load())
+	assert.EqualValues(t, 6, lastID.Load())
 
 	// SetCapacity
 	p.SetCapacity(3)
-	if count.Get() != 3 {
-		t.Errorf("Expecting 3, received %d", count.Get())
-	}
-	if lastID.Get() != 6 {
-		t.Errorf("Expecting 6, received %d", lastID.Get())
-	}
-	if p.Capacity() != 3 {
-		t.Errorf("Expecting 3, received %d", p.Capacity())
-	}
-	if p.Available() != 3 {
-		t.Errorf("Expecting 3, received %d", p.Available())
-	}
+	assert.EqualValues(t, 3, count.Load())
+	assert.EqualValues(t, 6, lastID.Load())
+	assert.EqualValues(t, 3, p.Capacity())
+	assert.EqualValues(t, 3, p.Available())
+
 	p.SetCapacity(6)
-	if p.Capacity() != 6 {
-		t.Errorf("Expecting 6, received %d", p.Capacity())
-	}
-	if p.Available() != 6 {
-		t.Errorf("Expecting 6, received %d", p.Available())
-	}
+	assert.EqualValues(t, 6, p.Capacity())
+	assert.EqualValues(t, 6, p.Available())
+
 	for i := 0; i < 6; i++ {
-		r, err := p.Get(ctx)
-		if err != nil {
-			t.Errorf("Get failed: %v", err)
-		}
+		r, err = p.Get(ctx)
+		require.NoError(t, err)
 		resources[i] = r
 	}
 	for i := 0; i < 6; i++ {
 		p.Put(resources[i])
 	}
-	if count.Get() != 6 {
-		t.Errorf("Expecting 5, received %d", count.Get())
-	}
-	if lastID.Get() != 9 {
-		t.Errorf("Expecting 9, received %d", lastID.Get())
-	}
+	assert.EqualValues(t, 6, count.Load())
+	assert.EqualValues(t, 9, lastID.Load())
 
 	// Close
 	p.Close()
-	if p.Capacity() != 0 {
-		t.Errorf("Expecting 0, received %d", p.Capacity())
-	}
-	if p.Available() != 0 {
-		t.Errorf("Expecting 0, received %d", p.Available())
-	}
-	if count.Get() != 0 {
-		t.Errorf("Expecting 0, received %d", count.Get())
-	}
+	assert.EqualValues(t, 0, p.Capacity())
+	assert.EqualValues(t, 0, p.Available())
+	assert.EqualValues(t, 0, count.Load())
 }
 
 func TestShrinking(t *testing.T) {
 	ctx := context.Background()
-	lastID.Set(0)
-	count.Set(0)
-	p := NewResourcePool(PoolFactory, 5, 5, time.Second)
+	lastID.Store(0)
+	count.Store(0)
+	waitStarts = waitStarts[:0]
+
+	p := NewResourcePool(PoolFactory, 5, 5, time.Second, 0, logWait, nil, 0)
 	var resources [10]Resource
 	// Leave one empty slot in the pool
 	for i := 0; i < 4; i++ {
-		r, err := p.Get(ctx)
-		if err != nil {
-			t.Errorf("Get failed: %v", err)
-		}
+		var r Resource
+		var err error
+		r, err = p.Get(ctx)
+		require.NoError(t, err)
 		resources[i] = r
 	}
 	done := make(chan bool)
@@ -213,7 +194,7 @@ func TestShrinking(t *testing.T) {
 		p.SetCapacity(3)
 		done <- true
 	}()
-	expected := `{"Capacity": 3, "Available": 0, "Active": 4, "InUse": 4, "MaxCapacity": 5, "WaitCount": 0, "WaitTime": 0, "IdleTimeout": 1000000000, "IdleClosed": 0}`
+	expected := `{"Capacity": 3, "Available": 0, "Active": 4, "InUse": 4, "MaxCapacity": 5, "WaitCount": 0, "WaitTime": 0, "IdleTimeout": 1000000000, "IdleClosed": 0, "MaxLifetimeClosed": 0, "Exhausted": 0}`
 	for i := 0; i < 10; i++ {
 		time.Sleep(10 * time.Millisecond)
 		stats := p.StatsJSON()
@@ -232,29 +213,23 @@ func TestShrinking(t *testing.T) {
 		p.Put(resources[i])
 	}
 	stats := p.StatsJSON()
-	expected = `{"Capacity": 3, "Available": 3, "Active": 3, "InUse": 0, "MaxCapacity": 5, "WaitCount": 0, "WaitTime": 0, "IdleTimeout": 1000000000, "IdleClosed": 0}`
-	if stats != expected {
-		t.Errorf(`expecting '%s', received '%s'`, expected, stats)
-	}
-	if count.Get() != 3 {
-		t.Errorf("Expecting 3, received %d", count.Get())
-	}
+	expected = `{"Capacity": 3, "Available": 3, "Active": 3, "InUse": 0, "MaxCapacity": 5, "WaitCount": 0, "WaitTime": 0, "IdleTimeout": 1000000000, "IdleClosed": 0, "MaxLifetimeClosed": 0, "Exhausted": 0}`
+	assert.Equal(t, expected, stats)
+	assert.EqualValues(t, 3, count.Load())
 
 	// Ensure no deadlock if SetCapacity is called after we start
 	// waiting for a resource
 	var err error
 	for i := 0; i < 3; i++ {
-		resources[i], err = p.Get(ctx)
-		if err != nil {
-			t.Errorf("Unexpected error %v", err)
-		}
+		var r Resource
+		r, err = p.Get(ctx)
+		require.NoError(t, err)
+		resources[i] = r
 	}
 	// This will wait because pool is empty
 	go func() {
 		r, err := p.Get(ctx)
-		if err != nil {
-			t.Errorf("Unexpected error %v", err)
-		}
+		require.NoError(t, err)
 		p.Put(r)
 		done <- true
 	}()
@@ -272,33 +247,24 @@ func TestShrinking(t *testing.T) {
 	}
 	<-done
 	<-done
-	if p.Capacity() != 2 {
-		t.Errorf("Expecting 2, received %d", p.Capacity())
-	}
-	if p.Available() != 2 {
-		t.Errorf("Expecting 2, received %d", p.Available())
-	}
-	if p.WaitCount() != 1 {
-		t.Errorf("Expecting 1, received %d", p.WaitCount())
-	}
-	if count.Get() != 2 {
-		t.Errorf("Expecting 2, received %d", count.Get())
-	}
+	assert.EqualValues(t, 2, p.Capacity())
+	assert.EqualValues(t, 2, p.Available())
+	assert.EqualValues(t, 1, p.WaitCount())
+	assert.EqualValues(t, p.WaitCount(), len(waitStarts))
+	assert.EqualValues(t, 2, count.Load())
 
 	// Test race condition of SetCapacity with itself
 	p.SetCapacity(3)
 	for i := 0; i < 3; i++ {
-		resources[i], err = p.Get(ctx)
-		if err != nil {
-			t.Errorf("Unexpected error %v", err)
-		}
+		var r Resource
+		r, err = p.Get(ctx)
+		require.NoError(t, err)
+		resources[i] = r
 	}
 	// This will wait because pool is empty
 	go func() {
 		r, err := p.Get(ctx)
-		if err != nil {
-			t.Errorf("Unexpected error %v", err)
-		}
+		require.NoError(t, err)
 		p.Put(r)
 		done <- true
 	}()
@@ -325,25 +291,21 @@ func TestShrinking(t *testing.T) {
 		t.Errorf("Expecting error")
 	}
 
-	if p.Capacity() != 4 {
-		t.Errorf("Expecting 4, received %d", p.Capacity())
-	}
-	if p.Available() != 4 {
-		t.Errorf("Expecting 4, received %d", p.Available())
-	}
+	assert.EqualValues(t, 4, p.Capacity())
+	assert.EqualValues(t, 4, p.Available())
 }
 
 func TestClosing(t *testing.T) {
 	ctx := context.Background()
-	lastID.Set(0)
-	count.Set(0)
-	p := NewResourcePool(PoolFactory, 5, 5, time.Second)
+	lastID.Store(0)
+	count.Store(0)
+	p := NewResourcePool(PoolFactory, 5, 5, time.Second, 0, logWait, nil, 0)
 	var resources [10]Resource
 	for i := 0; i < 5; i++ {
-		r, err := p.Get(ctx)
-		if err != nil {
-			t.Errorf("Get failed: %v", err)
-		}
+		var r Resource
+		var err error
+		r, err = p.Get(ctx)
+		require.NoError(t, err)
 		resources[i] = r
 	}
 	ch := make(chan bool)
@@ -355,10 +317,8 @@ func TestClosing(t *testing.T) {
 	// Wait for goroutine to call Close
 	time.Sleep(10 * time.Millisecond)
 	stats := p.StatsJSON()
-	expected := `{"Capacity": 0, "Available": 0, "Active": 5, "InUse": 5, "MaxCapacity": 5, "WaitCount": 0, "WaitTime": 0, "IdleTimeout": 1000000000, "IdleClosed": 0}`
-	if stats != expected {
-		t.Errorf(`expecting '%s', received '%s'`, expected, stats)
-	}
+	expected := `{"Capacity": 0, "Available": 0, "Active": 5, "InUse": 5, "MaxCapacity": 5, "WaitCount": 0, "WaitTime": 0, "IdleTimeout": 1000000000, "IdleClosed": 0, "MaxLifetimeClosed": 0, "Exhausted": 1}`
+	assert.Equal(t, expected, stats)
 
 	// Put is allowed when closing
 	for i := 0; i < 5; i++ {
@@ -368,153 +328,244 @@ func TestClosing(t *testing.T) {
 	// Wait for Close to return
 	<-ch
 
-	// SetCapacity must be ignored after Close
-	err := p.SetCapacity(1)
-	if err == nil {
-		t.Errorf("expecting error")
+	stats = p.StatsJSON()
+	expected = `{"Capacity": 0, "Available": 0, "Active": 0, "InUse": 0, "MaxCapacity": 5, "WaitCount": 0, "WaitTime": 0, "IdleTimeout": 1000000000, "IdleClosed": 0, "MaxLifetimeClosed": 0, "Exhausted": 1}`
+	assert.Equal(t, expected, stats)
+	assert.EqualValues(t, 5, lastID.Load())
+	assert.EqualValues(t, 0, count.Load())
+}
+
+func TestReopen(t *testing.T) {
+	ctx := context.Background()
+	lastID.Store(0)
+	count.Store(0)
+	refreshCheck := func() (bool, error) {
+		return true, nil
+	}
+	p := NewResourcePool(PoolFactory, 5, 5, time.Second, 0, logWait, refreshCheck, 500*time.Millisecond)
+	var resources [10]Resource
+	for i := 0; i < 5; i++ {
+		var r Resource
+		var err error
+		r, err = p.Get(ctx)
+		require.NoError(t, err)
+		resources[i] = r
 	}
 
+	time.Sleep(10 * time.Millisecond)
+	stats := p.StatsJSON()
+	expected := `{"Capacity": 5, "Available": 0, "Active": 5, "InUse": 5, "MaxCapacity": 5, "WaitCount": 0, "WaitTime": 0, "IdleTimeout": 1000000000, "IdleClosed": 0, "MaxLifetimeClosed": 0, "Exhausted": 1}`
+	assert.Equal(t, expected, stats)
+
+	time.Sleep(650 * time.Millisecond)
+	for i := 0; i < 5; i++ {
+		p.Put(resources[i])
+	}
+	time.Sleep(50 * time.Millisecond)
 	stats = p.StatsJSON()
-	expected = `{"Capacity": 0, "Available": 0, "Active": 0, "InUse": 0, "MaxCapacity": 5, "WaitCount": 0, "WaitTime": 0, "IdleTimeout": 1000000000, "IdleClosed": 0}`
-	if stats != expected {
-		t.Errorf(`expecting '%s', received '%s'`, expected, stats)
-	}
-	if lastID.Get() != 5 {
-		t.Errorf("Expecting 5, received %d", count.Get())
-	}
-	if count.Get() != 0 {
-		t.Errorf("Expecting 0, received %d", count.Get())
-	}
+	expected = `{"Capacity": 5, "Available": 5, "Active": 0, "InUse": 0, "MaxCapacity": 5, "WaitCount": 0, "WaitTime": 0, "IdleTimeout": 1000000000, "IdleClosed": 0, "MaxLifetimeClosed": 0, "Exhausted": 1}`
+	assert.Equal(t, expected, stats)
+	assert.EqualValues(t, 5, lastID.Load())
+	assert.EqualValues(t, 0, count.Load())
 }
 
 func TestIdleTimeout(t *testing.T) {
 	ctx := context.Background()
-	lastID.Set(0)
-	count.Set(0)
-	p := NewResourcePool(PoolFactory, 1, 1, 10*time.Millisecond)
+	lastID.Store(0)
+	count.Store(0)
+	p := NewResourcePool(PoolFactory, 1, 1, 10*time.Millisecond, 0, logWait, nil, 0)
 	defer p.Close()
 
 	r, err := p.Get(ctx)
-	if err != nil {
-		t.Errorf("Unexpected error %v", err)
-	}
-	if count.Get() != 1 {
-		t.Errorf("Expecting 1, received %d", count.Get())
-	}
-	if p.IdleClosed() != 0 {
-		t.Errorf("Expecting 0, received %d", p.IdleClosed())
-	}
-	p.Put(r)
-	if lastID.Get() != 1 {
-		t.Errorf("Expecting 1, received %d", count.Get())
-	}
-	if count.Get() != 1 {
-		t.Errorf("Expecting 1, received %d", count.Get())
-	}
-	if p.IdleClosed() != 0 {
-		t.Errorf("Expecting 0, received %d", p.IdleClosed())
-	}
-	time.Sleep(20 * time.Millisecond)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, count.Load())
+	assert.EqualValues(t, 0, p.IdleClosed())
 
-	if count.Get() != 0 {
-		t.Errorf("Expecting 0, received %d", count.Get())
-	}
-	if p.IdleClosed() != 1 {
-		t.Errorf("Expecting 1, received %d", p.IdleClosed())
-	}
+	p.Put(r)
+	assert.EqualValues(t, 1, lastID.Load())
+	assert.EqualValues(t, 1, count.Load())
+	assert.EqualValues(t, 0, p.IdleClosed())
+
+	time.Sleep(15 * time.Millisecond)
+	assert.EqualValues(t, 1, count.Load())
+	assert.EqualValues(t, 1, p.IdleClosed())
+
 	r, err = p.Get(ctx)
-	if err != nil {
-		t.Errorf("Unexpected error %v", err)
-	}
-	if lastID.Get() != 2 {
-		t.Errorf("Expecting 2, received %d", count.Get())
-	}
-	if count.Get() != 1 {
-		t.Errorf("Expecting 1, received %d", count.Get())
-	}
-	if p.IdleClosed() != 1 {
-		t.Errorf("Expecting 1, received %d", p.IdleClosed())
-	}
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, lastID.Load())
+	assert.EqualValues(t, 1, count.Load())
+	assert.EqualValues(t, 1, p.IdleClosed())
 
 	// sleep to let the idle closer run while all resources are in use
 	// then make sure things are still as we expect
-	time.Sleep(20 * time.Millisecond)
-	if lastID.Get() != 2 {
-		t.Errorf("Expecting 2, received %d", count.Get())
-	}
-	if count.Get() != 1 {
-		t.Errorf("Expecting 1, received %d", count.Get())
-	}
-	if p.IdleClosed() != 1 {
-		t.Errorf("Expecting 1, received %d", p.IdleClosed())
-	}
+	time.Sleep(15 * time.Millisecond)
+	assert.EqualValues(t, 2, lastID.Load())
+	assert.EqualValues(t, 1, count.Load())
+	assert.EqualValues(t, 1, p.IdleClosed())
+
 	p.Put(r)
 	r, err = p.Get(ctx)
-	if err != nil {
-		t.Errorf("Unexpected error %v", err)
-	}
-	if lastID.Get() != 2 {
-		t.Errorf("Expecting 2, received %d", count.Get())
-	}
-	if count.Get() != 1 {
-		t.Errorf("Expecting 1, received %d", count.Get())
-	}
-	if p.IdleClosed() != 1 {
-		t.Errorf("Expecting 1, received %d", p.IdleClosed())
-	}
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, lastID.Load())
+	assert.EqualValues(t, 1, count.Load())
+	assert.EqualValues(t, 1, p.IdleClosed())
 
 	// the idle close thread wakes up every 1/100 of the idle time, so ensure
 	// the timeout change applies to newly added resources
 	p.SetIdleTimeout(1000 * time.Millisecond)
 	p.Put(r)
 
-	time.Sleep(20 * time.Millisecond)
-	if lastID.Get() != 2 {
-		t.Errorf("Expecting 2, received %d", count.Get())
-	}
-	if count.Get() != 1 {
-		t.Errorf("Expecting 1, received %d", count.Get())
-	}
-	if p.IdleClosed() != 1 {
-		t.Errorf("Expecting 1, received %d", p.IdleClosed())
-	}
+	time.Sleep(15 * time.Millisecond)
+	assert.EqualValues(t, 2, lastID.Load())
+	assert.EqualValues(t, 1, count.Load())
+	assert.EqualValues(t, 1, p.IdleClosed())
 
+	// Get and Put to refresh timeUsed
+	r, err = p.Get(ctx)
+	require.NoError(t, err)
+	p.Put(r)
 	p.SetIdleTimeout(10 * time.Millisecond)
-	time.Sleep(20 * time.Millisecond)
-	if lastID.Get() != 2 {
-		t.Errorf("Expecting 2, received %d", count.Get())
+	time.Sleep(15 * time.Millisecond)
+	assert.EqualValues(t, 3, lastID.Load())
+	assert.EqualValues(t, 1, count.Load())
+	assert.EqualValues(t, 2, p.IdleClosed())
+}
+
+func TestIdleTimeoutCreateFail(t *testing.T) {
+	ctx := context.Background()
+	lastID.Store(0)
+	count.Store(0)
+	p := NewResourcePool(PoolFactory, 1, 1, 10*time.Millisecond, 0, logWait, nil, 0)
+	defer p.Close()
+
+	r, err := p.Get(ctx)
+	require.NoError(t, err)
+	// Change the factory before putting back
+	// to prevent race with the idle closer, who will
+	// try to use it.
+	p.factory = FailFactory
+	p.Put(r)
+	timeout := time.After(1 * time.Second)
+	for p.Active() != 0 {
+		select {
+		case <-timeout:
+			t.Errorf("Timed out waiting for resource to be closed by idle timeout")
+		default:
+		}
 	}
-	if count.Get() != 0 {
-		t.Errorf("Expecting 1, received %d", count.Get())
-	}
-	if p.IdleClosed() != 2 {
-		t.Errorf("Expecting 2, received %d", p.IdleClosed())
+	// reset factory for next run.
+	p.factory = PoolFactory
+}
+
+func TestMaxLifetime(t *testing.T) {
+	// maxLifetime 0
+	ctx := context.Background()
+	lastID.Store(0)
+	count.Store(0)
+
+	p := NewResourcePool(PoolFactory, 1, 1, 10*time.Second, 0, logWait, nil, 0)
+	defer p.Close()
+
+	r, err := p.Get(ctx)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, count.Load())
+	assert.EqualValues(t, 0, p.MaxLifetimeClosed())
+
+	time.Sleep(10 * time.Millisecond)
+
+	p.Put(r)
+	assert.EqualValues(t, 1, lastID.Load())
+	assert.EqualValues(t, 1, count.Load())
+	assert.EqualValues(t, 0, p.MaxLifetimeClosed())
+
+	// maxLifetime > 0
+	ctx = context.Background()
+	lastID.Store(0)
+	count.Store(0)
+
+	p = NewResourcePool(PoolFactory, 1, 1, 10*time.Second, 10*time.Millisecond, logWait, nil, 0)
+	defer p.Close()
+
+	r, err = p.Get(ctx)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, count.Load())
+	assert.EqualValues(t, 0, p.MaxLifetimeClosed())
+
+	time.Sleep(5 * time.Millisecond)
+
+	p.Put(r)
+	assert.EqualValues(t, 1, lastID.Load())
+	assert.EqualValues(t, 1, count.Load())
+	assert.EqualValues(t, 0, p.MaxLifetimeClosed())
+
+	r, err = p.Get(ctx)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, count.Load())
+	assert.EqualValues(t, 0, p.MaxLifetimeClosed())
+
+	time.Sleep(10 * time.Millisecond * 2)
+
+	p.Put(r)
+	assert.EqualValues(t, 2, lastID.Load())
+	assert.EqualValues(t, 1, count.Load())
+	assert.EqualValues(t, 1, p.MaxLifetimeClosed())
+}
+
+func TestExtendedLifetimeTimeout(t *testing.T) {
+	// maxLifetime 0
+	p := NewResourcePool(PoolFactory, 5, 5, time.Second, 0, logWait, nil, 0)
+	defer p.Close()
+	assert.Zero(t, p.extendedMaxLifetime())
+
+	// maxLifetime > 0
+	maxLifetime := 10 * time.Millisecond
+	for i := 0; i < 10; i++ {
+		p = NewResourcePool(PoolFactory, 5, 5, time.Second, maxLifetime, logWait, nil, 0)
+		defer p.Close()
+		assert.LessOrEqual(t, maxLifetime, p.extendedMaxLifetime())
+		assert.Greater(t, 2*maxLifetime, p.extendedMaxLifetime())
 	}
 }
 
 func TestCreateFail(t *testing.T) {
 	ctx := context.Background()
-	lastID.Set(0)
-	count.Set(0)
-	p := NewResourcePool(FailFactory, 5, 5, time.Second)
+	lastID.Store(0)
+	count.Store(0)
+	p := NewResourcePool(FailFactory, 5, 5, time.Second, 0, logWait, nil, 0)
 	defer p.Close()
+
 	if _, err := p.Get(ctx); err.Error() != "Failed" {
 		t.Errorf("Expecting Failed, received %v", err)
 	}
 	stats := p.StatsJSON()
-	expected := `{"Capacity": 5, "Available": 5, "Active": 0, "InUse": 0, "MaxCapacity": 5, "WaitCount": 0, "WaitTime": 0, "IdleTimeout": 1000000000, "IdleClosed": 0}`
-	if stats != expected {
-		t.Errorf(`expecting '%s', received '%s'`, expected, stats)
-	}
+	expected := `{"Capacity": 5, "Available": 5, "Active": 0, "InUse": 0, "MaxCapacity": 5, "WaitCount": 0, "WaitTime": 0, "IdleTimeout": 1000000000, "IdleClosed": 0, "MaxLifetimeClosed": 0, "Exhausted": 0}`
+	assert.Equal(t, expected, stats)
+}
+
+func TestCreateFailOnPut(t *testing.T) {
+	ctx := context.Background()
+	lastID.Store(0)
+	count.Store(0)
+	p := NewResourcePool(PoolFactory, 5, 5, time.Second, 0, logWait, nil, 0)
+	defer p.Close()
+
+	_, err := p.Get(ctx)
+	require.NoError(t, err)
+
+	// change factory to fail the put.
+	p.factory = FailFactory
+	p.Put(nil)
+	assert.Zero(t, p.Active())
 }
 
 func TestSlowCreateFail(t *testing.T) {
 	ctx := context.Background()
-	lastID.Set(0)
-	count.Set(0)
-	p := NewResourcePool(SlowFailFactory, 2, 2, time.Second)
+	lastID.Store(0)
+	count.Store(0)
+	p := NewResourcePool(SlowFailFactory, 2, 2, time.Second, 0, logWait, nil, 0)
 	defer p.Close()
 	ch := make(chan bool)
+
 	// The third Get should not wait indefinitely
 	for i := 0; i < 3; i++ {
 		go func() {
@@ -525,44 +576,39 @@ func TestSlowCreateFail(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		<-ch
 	}
-	if p.Available() != 2 {
-		t.Errorf("Expecting 2, received %d", p.Available())
-	}
+	assert.EqualValues(t, 2, p.Available())
 }
 
 func TestTimeout(t *testing.T) {
 	ctx := context.Background()
-	lastID.Set(0)
-	count.Set(0)
-	p := NewResourcePool(PoolFactory, 1, 1, time.Second)
+	lastID.Store(0)
+	count.Store(0)
+	p := NewResourcePool(PoolFactory, 1, 1, time.Second, 0, logWait, nil, 0)
 	defer p.Close()
+
+	// take the only connection available
 	r, err := p.Get(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	newctx, cancel := context.WithTimeout(ctx, 1*time.Millisecond)
+	require.NoError(t, err)
+
+	// trying to get the connection without a timeout.
+	newctx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
 	_, err = p.Get(newctx)
 	cancel()
-	want := "resource pool timed out"
-	if err == nil || err.Error() != want {
-		t.Errorf("got %v, want %s", err, want)
-	}
+	assert.EqualError(t, err, "resource pool timed out")
+
+	// put the connection take was taken initially.
 	p.Put(r)
 }
 
 func TestExpired(t *testing.T) {
-	lastID.Set(0)
-	count.Set(0)
-	p := NewResourcePool(PoolFactory, 1, 1, time.Second)
+	lastID.Store(0)
+	count.Store(0)
+	p := NewResourcePool(PoolFactory, 1, 1, time.Second, 0, logWait, nil, 0)
 	defer p.Close()
+
+	// expired context
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-1*time.Second))
-	r, err := p.Get(ctx)
-	if err == nil {
-		p.Put(r)
-	}
+	_, err := p.Get(ctx)
 	cancel()
-	want := "resource pool timed out"
-	if err == nil || err.Error() != want {
-		t.Errorf("got %v, want %s", err, want)
-	}
+	require.EqualError(t, err, "resource pool context already expired")
 }

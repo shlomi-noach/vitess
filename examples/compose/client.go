@@ -1,18 +1,18 @@
 /*
-Copyright 2017 Google Inc.
+ * Copyright 2019 The Vitess Authors.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 // client.go is a sample for using the Vitess Go SQL driver.
 //
@@ -22,29 +22,29 @@ limitations under the License.
 // Then run:
 // vitess$ . dev.env
 // vitess$ cd examples/local
-// vitess/examples/local$ go run client.go -server=localhost:15991
+// vitess/examples/local$ go run client.go --server=localhost:15991
 package main
 
 import (
-	"flag"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"time"
+
+	"github.com/spf13/pflag"
 
 	"vitess.io/vitess/go/vt/vitessdriver"
 )
 
 var (
-	server = flag.String("server", "", "vtgate server to connect to")
+	server = pflag.String("server", "", "vtgate server to connect to")
 )
 
 func main() {
-	flag.Parse()
-	rand.Seed(time.Now().UnixNano())
+	pflag.Parse()
 
 	// Connect to vtgate.
-	db, err := vitessdriver.Open(*server, "@master")
+	db, err := vitessdriver.Open(*server, "@primary")
 	if err != nil {
 		fmt.Printf("client error: %v\n", err)
 		os.Exit(1)
@@ -52,14 +52,14 @@ func main() {
 	defer db.Close()
 
 	// Insert some messages on random pages.
-	fmt.Println("Inserting into master...")
-	for i := 0; i < 3; i++ {
+	fmt.Println("Inserting into primary...")
+	for range 3 {
 		tx, err := db.Begin()
 		if err != nil {
 			fmt.Printf("begin failed: %v\n", err)
 			os.Exit(1)
 		}
-		page := rand.Intn(100) + 1
+		page := rand.IntN(100) + 1
 		timeCreated := time.Now().UnixNano()
 		if _, err := tx.Exec("INSERT INTO messages (page,time_created_ns,message) VALUES (?,?,?)",
 			page, timeCreated, "V is for speed"); err != nil {
@@ -72,8 +72,8 @@ func main() {
 		}
 	}
 
-	// Read it back from the master.
-	fmt.Println("Reading from master...")
+	// Read it back from the primary.
+	fmt.Println("Reading from primary...")
 	rows, err := db.Query("SELECT page, time_created_ns, message FROM messages")
 	if err != nil {
 		fmt.Printf("query failed: %v\n", err)
@@ -94,7 +94,7 @@ func main() {
 	}
 
 	// Read from a replica.
-	// Note that this may be behind master due to replication lag.
+	// Note that this may be behind primary due to replication lag.
 	fmt.Println("Reading from replica...")
 
 	dbr, err := vitessdriver.Open(*server, "@replica")

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 GitHub Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,17 +25,22 @@ import (
 	"strings"
 	"time"
 
+	"vitess.io/vitess/go/vt/log"
+
 	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/vt/mysqlctl"
 )
 
 // MySQLManager is an interface to a mysqld process manager, capable
 // of starting/shutting down mysqld services and initializing them.
 type MySQLManager interface {
 	Setup() error
+	Start() error
 	TearDown() error
 	Auth() (string, string)
 	Address() (string, int)
 	UnixSocket() string
+	TabletDir() string
 	Params(dbname string) mysql.ConnParams
 }
 
@@ -47,6 +52,7 @@ type Mysqlctl struct {
 	Port      int
 	MyCnf     []string
 	Env       []string
+	UID       uint32
 }
 
 // Setup spawns a new mysqld service and initializes it with the defaults.
@@ -57,11 +63,11 @@ func (ctl *Mysqlctl) Setup() error {
 
 	cmd := exec.CommandContext(ctx,
 		ctl.Binary,
-		"-alsologtostderr",
-		"-tablet_uid", "1",
-		"-mysql_port", fmt.Sprintf("%d", ctl.Port),
+		"--alsologtostderr",
+		"--tablet_uid", fmt.Sprintf("%d", ctl.UID),
+		"--mysql_port", fmt.Sprintf("%d", ctl.Port),
 		"init",
-		"-init_db_sql_file", ctl.InitFile,
+		"--init_db_sql_file", ctl.InitFile,
 	)
 
 	myCnf := strings.Join(ctl.MyCnf, ":")
@@ -74,6 +80,30 @@ func (ctl *Mysqlctl) Setup() error {
 	return err
 }
 
+// Start spawns a mysqld service for an existing data directory
+// The service is kept running in the background until TearDown() is called.
+func (ctl *Mysqlctl) Start() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx,
+		ctl.Binary,
+		"--alsologtostderr",
+		"--tablet_uid", fmt.Sprintf("%d", ctl.UID),
+		"--mysql_port", fmt.Sprintf("%d", ctl.Port),
+		"start",
+	)
+
+	myCnf := strings.Join(ctl.MyCnf, ":")
+
+	cmd.Env = append(cmd.Env, os.Environ()...)
+	cmd.Env = append(cmd.Env, ctl.Env...)
+	cmd.Env = append(cmd.Env, fmt.Sprintf("EXTRA_MY_CNF=%s", myCnf))
+	log.Infof("Starting MySQL using: %+v", cmd.Env)
+	_, err := cmd.Output()
+	return err
+}
+
 // TearDown shutdowns the running mysqld service
 func (ctl *Mysqlctl) TearDown() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -81,9 +111,9 @@ func (ctl *Mysqlctl) TearDown() error {
 
 	cmd := exec.CommandContext(ctx,
 		ctl.Binary,
-		"-alsologtostderr",
-		"-tablet_uid", "1",
-		"-mysql_port", fmt.Sprintf("%d", ctl.Port),
+		"--alsologtostderr",
+		"--tablet_uid", fmt.Sprintf("%d", ctl.UID),
+		"--mysql_port", fmt.Sprintf("%d", ctl.Port),
 		"shutdown",
 	)
 
@@ -106,14 +136,18 @@ func (ctl *Mysqlctl) Address() (string, int) {
 
 // UnixSocket returns the path to the local Unix socket required to connect to mysqld
 func (ctl *Mysqlctl) UnixSocket() string {
-	return path.Join(ctl.Directory, "vt_0000000001", "mysql.sock")
+	return path.Join(ctl.TabletDir(), "mysql.sock")
+}
+
+// TabletDir returns the path where data for this Tablet would be stored
+func (ctl *Mysqlctl) TabletDir() string {
+	return mysqlctl.DefaultTabletDirAtRoot(ctl.Directory, ctl.UID)
 }
 
 // Params returns the mysql.ConnParams required to connect directly to mysqld
 // using Vitess' mysql client.
 func (ctl *Mysqlctl) Params(dbname string) mysql.ConnParams {
 	return mysql.ConnParams{
-		Charset:    DefaultCharset,
 		DbName:     dbname,
 		Uname:      "vt_dba",
 		UnixSocket: ctl.UnixSocket(),

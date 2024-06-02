@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,38 +17,79 @@ limitations under the License.
 package vindexes
 
 import (
+	"context"
 	"reflect"
-	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
 )
 
-var hash Vindex
+var hashTest SingleColumn
 
 func init() {
-	hv, err := CreateVindex("hash", "nn", map[string]string{"Table": "t", "Column": "c"})
+	hv, err := CreateVindex("hash", "nn", map[string]string{})
+	unknownParams := hv.(ParamValidating).UnknownParams()
+	if len(unknownParams) > 0 {
+		panic("hash test init: expected 0 unknown params")
+	}
 	if err != nil {
 		panic(err)
 	}
-	hash = hv
+	hashTest = hv.(SingleColumn)
 }
 
-func TestHashCost(t *testing.T) {
-	if hash.Cost() != 1 {
-		t.Errorf("Cost(): %d, want 1", hash.Cost())
+func hashCreateVindexTestCase(
+	testName string,
+	vindexParams map[string]string,
+	expectErr error,
+	expectUnknownParams []string,
+) createVindexTestCase {
+	return createVindexTestCase{
+		testName: testName,
+
+		vindexType:   "hash",
+		vindexName:   "hash",
+		vindexParams: vindexParams,
+
+		expectCost:          1,
+		expectErr:           expectErr,
+		expectIsUnique:      true,
+		expectNeedsVCursor:  false,
+		expectString:        "hash",
+		expectUnknownParams: expectUnknownParams,
 	}
 }
 
-func TestHashString(t *testing.T) {
-	if strings.Compare("nn", hash.String()) != 0 {
-		t.Errorf("String(): %s, want hash", hash.String())
+func TestHashCreateVindex(t *testing.T) {
+	cases := []createVindexTestCase{
+		hashCreateVindexTestCase(
+			"no params",
+			nil,
+			nil,
+			nil,
+		),
+		hashCreateVindexTestCase(
+			"empty params",
+			map[string]string{},
+			nil,
+			nil,
+		),
+		hashCreateVindexTestCase(
+			"unknown params",
+			map[string]string{"hello": "world"},
+			nil,
+			[]string{"hello"},
+		),
 	}
+
+	testCreateVindexes(t, cases)
 }
 
 func TestHashMap(t *testing.T) {
-	got, err := hash.Map(nil, []sqltypes.Value{
+	got, err := hashTest.Map(context.Background(), nil, []sqltypes.Value{
 		sqltypes.NewInt64(1),
 		sqltypes.NewInt64(2),
 		sqltypes.NewInt64(3),
@@ -56,10 +97,14 @@ func TestHashMap(t *testing.T) {
 		sqltypes.NewInt64(4),
 		sqltypes.NewInt64(5),
 		sqltypes.NewInt64(6),
+		sqltypes.NewInt64(0),
+		sqltypes.NewInt64(-1),
+		sqltypes.NewUint64(18446744073709551615), // 2^64 - 1
+		sqltypes.NewInt64(9223372036854775807),   // 2^63 - 1
+		sqltypes.NewUint64(9223372036854775807),  // 2^63 - 1
+		sqltypes.NewInt64(-9223372036854775808),  // - 2^63
 	})
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	want := []key.Destination{
 		key.DestinationKeyspaceID([]byte("\x16k@\xb4J\xbaK\xd6")),
 		key.DestinationKeyspaceID([]byte("\x06\xe7\xea\"Βp\x8f")),
@@ -68,16 +113,26 @@ func TestHashMap(t *testing.T) {
 		key.DestinationKeyspaceID([]byte("\xd2\xfd\x88g\xd5\r-\xfe")),
 		key.DestinationKeyspaceID([]byte("p\xbb\x02<\x81\f\xa8z")),
 		key.DestinationKeyspaceID([]byte("\xf0\x98H\n\xc4ľq")),
+		key.DestinationKeyspaceID([]byte("\x8c\xa6M\xe9\xc1\xb1#\xa7")),
+		key.DestinationKeyspaceID([]byte("5UP\xb2\x15\x0e$Q")),
+		key.DestinationKeyspaceID([]byte("5UP\xb2\x15\x0e$Q")),
+		key.DestinationKeyspaceID([]byte("\xf7}H\xaaݡ\xf1\xbb")),
+		key.DestinationKeyspaceID([]byte("\xf7}H\xaaݡ\xf1\xbb")),
+		key.DestinationKeyspaceID([]byte("\x95\xf8\xa5\xe5\xdd1\xd9\x00")),
 	}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("Map(): %#v, want %+v", got, want)
+		for i, v := range got {
+			if v.String() != want[i].String() {
+				t.Errorf("Map() %d: %#v, want %#v", i, v, want[i])
+			}
+		}
 	}
 }
 
 func TestHashVerify(t *testing.T) {
 	ids := []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)}
 	ksids := [][]byte{[]byte("\x16k@\xb4J\xbaK\xd6"), []byte("\x16k@\xb4J\xbaK\xd6")}
-	got, err := hash.Verify(nil, ids, ksids)
+	got, err := hashTest.Verify(context.Background(), nil, ids, ksids)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,26 +142,49 @@ func TestHashVerify(t *testing.T) {
 	}
 
 	// Failure test
-	_, err = hash.Verify(nil, []sqltypes.Value{sqltypes.NewVarBinary("aa")}, [][]byte{nil})
-	wantErr := "hash.Verify: could not parse value: 'aa'"
-	if err == nil || err.Error() != wantErr {
-		t.Errorf("hash.Verify err: %v, want %s", err, wantErr)
-	}
+	_, err = hashTest.Verify(context.Background(), nil, []sqltypes.Value{sqltypes.NewVarBinary("aa")}, [][]byte{nil})
+	require.EqualError(t, err, "cannot parse uint64 from \"aa\"")
 }
 
 func TestHashReverseMap(t *testing.T) {
-	got, err := hash.(Reversible).ReverseMap(nil, [][]byte{[]byte("\x16k@\xb4J\xbaK\xd6")})
-	if err != nil {
-		t.Error(err)
+	got, err := hashTest.(Reversible).ReverseMap(nil, [][]byte{
+		[]byte("\x16k@\xb4J\xbaK\xd6"),
+		[]byte("\x06\xe7\xea\"Βp\x8f"),
+		[]byte("N\xb1\x90ɢ\xfa\x16\x9c"),
+		[]byte("\xd2\xfd\x88g\xd5\r-\xfe"),
+		[]byte("p\xbb\x02<\x81\f\xa8z"),
+		[]byte("\xf0\x98H\n\xc4ľq"),
+		[]byte("\x8c\xa6M\xe9\xc1\xb1#\xa7"),
+		[]byte("5UP\xb2\x15\x0e$Q"),
+		[]byte("5UP\xb2\x15\x0e$Q"),
+		[]byte("\xf7}H\xaaݡ\xf1\xbb"),
+		[]byte("\xf7}H\xaaݡ\xf1\xbb"),
+		[]byte("\x95\xf8\xa5\xe5\xdd1\xd9\x00"),
+	})
+	require.NoError(t, err)
+	neg1 := int64(-1)
+	negmax := int64(-9223372036854775808)
+	want := []sqltypes.Value{
+		sqltypes.NewUint64(uint64(1)),
+		sqltypes.NewUint64(2),
+		sqltypes.NewUint64(3),
+		sqltypes.NewUint64(4),
+		sqltypes.NewUint64(5),
+		sqltypes.NewUint64(6),
+		sqltypes.NewUint64(0),
+		sqltypes.NewUint64(uint64(neg1)),
+		sqltypes.NewUint64(18446744073709551615), // 2^64 - 1
+		sqltypes.NewUint64(9223372036854775807),  // 2^63 - 1
+		sqltypes.NewUint64(9223372036854775807),  // 2^63 - 1
+		sqltypes.NewUint64(uint64(negmax)),       // - 2^63
 	}
-	want := []sqltypes.Value{sqltypes.NewUint64(uint64(1))}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("ReverseMap(): %v, want %v", got, want)
 	}
 }
 
 func TestHashReverseMapNeg(t *testing.T) {
-	_, err := hash.(Reversible).ReverseMap(nil, [][]byte{[]byte("\x16k@\xb4J\xbaK\xd6\x16k@\xb4J\xbaK\xd6")})
+	_, err := hashTest.(Reversible).ReverseMap(nil, [][]byte{[]byte("\x16k@\xb4J\xbaK\xd6\x16k@\xb4J\xbaK\xd6")})
 	want := "invalid keyspace id: 166b40b44aba4bd6166b40b44aba4bd6"
 	if err.Error() != want {
 		t.Error(err)

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -17,9 +17,8 @@ limitations under the License.
 package memorytopo
 
 import (
+	"context"
 	"fmt"
-
-	"golang.org/x/net/context"
 
 	"vitess.io/vitess/go/vt/topo"
 )
@@ -41,9 +40,41 @@ type memoryTopoLockDescriptor struct {
 	dirPath string
 }
 
+// TryLock is part of the topo.Conn interface. Its implementation is same as Lock
+func (c *Conn) TryLock(ctx context.Context, dirPath, contents string) (topo.LockDescriptor, error) {
+	c.factory.callstats.Add([]string{"TryLock"}, 1)
+
+	c.factory.mu.Lock()
+	err := c.factory.getOperationError(TryLock, dirPath)
+	c.factory.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+
+	return c.Lock(ctx, dirPath, contents)
+}
+
 // Lock is part of the topo.Conn interface.
 func (c *Conn) Lock(ctx context.Context, dirPath, contents string) (topo.LockDescriptor, error) {
+	c.factory.callstats.Add([]string{"Lock"}, 1)
+
+	c.factory.mu.Lock()
+	err := c.factory.getOperationError(Lock, dirPath)
+	c.factory.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+
+	return c.lock(ctx, dirPath, contents)
+}
+
+// Lock is part of the topo.Conn interface.
+func (c *Conn) lock(ctx context.Context, dirPath, contents string) (topo.LockDescriptor, error) {
 	for {
+		if err := c.dial(ctx); err != nil {
+			return nil, err
+		}
+
 		c.factory.mu.Lock()
 
 		if c.factory.err != nil {
@@ -70,9 +101,15 @@ func (c *Conn) Lock(ctx context.Context, dirPath, contents string) (topo.LockDes
 			}
 		}
 
-		// Noone has the lock, grab it.
+		// No one has the lock, grab it.
 		n.lock = make(chan struct{})
 		n.lockContents = contents
+		for _, w := range n.watches {
+			if w.lock == nil {
+				continue
+			}
+			w.lock <- contents
+		}
 		c.factory.mu.Unlock()
 		return &memoryTopoLockDescriptor{
 			c:       c,
@@ -93,6 +130,10 @@ func (ld *memoryTopoLockDescriptor) Unlock(ctx context.Context) error {
 }
 
 func (c *Conn) unlock(ctx context.Context, dirPath string) error {
+	if c.closed.Load() {
+		return ErrConnectionClosed
+	}
+
 	c.factory.mu.Lock()
 	defer c.factory.mu.Unlock()
 

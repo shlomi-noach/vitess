@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,8 +17,6 @@ limitations under the License.
 package tabletserver
 
 import (
-	"fmt"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -52,15 +50,15 @@ var (
 				<th>RowsAffected</th>
 				<th>Response Size</th>
 				<th>Transaction ID</th>
+				<th>Reserved ID</th>
 				<th>Error</th>
 			</tr>
 		</thead>
 	`)
 	querylogzFuncMap = template.FuncMap{
-		"stampMicro":    func(t time.Time) string { return t.Format(time.StampMicro) },
-		"cssWrappable":  logz.Wrappable,
-		"truncateQuery": sqlparser.TruncateForUI,
-		"unquote":       func(s string) string { return strings.Trim(s, "\"") },
+		"stampMicro":   func(t time.Time) string { return t.Format(time.StampMicro) },
+		"cssWrappable": logz.Wrappable,
+		"unquote":      func(s string) string { return strings.Trim(s, "\"") },
 	}
 	querylogzTmpl = template.Must(template.New("example").Funcs(querylogzFuncMap).Parse(`
 		<tr class="{{.ColorLevel}}">
@@ -74,28 +72,21 @@ var (
 			<td>{{.MysqlResponseTime.Seconds}}</td>
 			<td>{{.WaitingForConnection.Seconds}}</td>
 			<td>{{.PlanType}}</td>
-			<td>{{.OriginalSQL | truncateQuery | unquote | cssWrappable}}</td>
+			<td>{{.OriginalSQL | .Parser.TruncateForUI | unquote | cssWrappable}}</td>
 			<td>{{.NumberOfQueries}}</td>
 			<td>{{.FmtQuerySources}}</td>
 			<td>{{.RowsAffected}}</td>
 			<td>{{.SizeOfResponse}}</td>
 			<td>{{.TransactionID}}</td>
+			<td>{{.ReservedID}}</td>
 			<td>{{.ErrorStr}}</td>
 		</tr>
 	`))
 )
 
-func init() {
-	http.HandleFunc("/querylogz", func(w http.ResponseWriter, r *http.Request) {
-		ch := tabletenv.StatsLogger.Subscribe("querylogz")
-		defer tabletenv.StatsLogger.Unsubscribe(ch)
-		querylogzHandler(ch, w, r)
-	})
-}
-
 // querylogzHandler serves a human readable snapshot of the
 // current query log.
-func querylogzHandler(ch chan interface{}, w http.ResponseWriter, r *http.Request) {
+func querylogzHandler(ch chan *tabletenv.LogStats, w http.ResponseWriter, r *http.Request, parser *sqlparser.Parser) {
 	if err := acl.CheckAccessHTTP(r, acl.DEBUGGING); err != nil {
 		acl.SendError(w, err)
 		return
@@ -109,20 +100,11 @@ func querylogzHandler(ch chan interface{}, w http.ResponseWriter, r *http.Reques
 	defer tmr.Stop()
 	for i := 0; i < limit; i++ {
 		select {
-		case out := <-ch:
+		case stats := <-ch:
 			select {
 			case <-tmr.C:
 				return
 			default:
-			}
-			stats, ok := out.(*tabletenv.LogStats)
-			if !ok {
-				err := fmt.Errorf("unexpected value in %s: %#v (expecting value of type %T)", tabletenv.TxLogger.Name(), out, &tabletenv.LogStats{})
-				io.WriteString(w, `<tr class="error">`)
-				io.WriteString(w, err.Error())
-				io.WriteString(w, "</tr>")
-				log.Error(err)
-				continue
 			}
 			var level string
 			if stats.TotalTime().Seconds() < 0.01 {
@@ -135,7 +117,8 @@ func querylogzHandler(ch chan interface{}, w http.ResponseWriter, r *http.Reques
 			tmplData := struct {
 				*tabletenv.LogStats
 				ColorLevel string
-			}{stats, level}
+				Parser     *sqlparser.Parser
+			}{stats, level, parser}
 			if err := querylogzTmpl.Execute(w, tmplData); err != nil {
 				log.Errorf("querylogz: couldn't execute template: %v", err)
 			}

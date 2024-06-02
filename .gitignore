@@ -4,12 +4,18 @@
 # For mac users
 .DS_Store
 
+# For direnv users
+.envrc
+
 # Produced by yacc
 *.output
 
 # vim files
 *.swp
 tags
+
+# emacs
+*~
 
 # Eclipse files
 .classpath
@@ -21,11 +27,12 @@ tags
 *.iml
 .idea
 
+# vscode
+.vscode/
+__debug_bin
+
 # C build dirs
 **/build
-
-# site-local example files
-/examples/kubernetes/config.sh
 
 # generated protobuf files
 /go/vt/.proto.tmp
@@ -63,10 +70,23 @@ _test/
 /vendor/*/
 
 # release folder
-releases
+/releases/
 
-# Angular2 Bower Libs
-/web/vtctld2/.bowerrc~
-/web/vtctld2/bower.json~
-/web/vtctld2/public/bower_components/
+# Local examples
+/examples/local/vtdataroot
 
+/dist/
+/vthook/
+/bin/
+/vtdataroot/
+venv
+
+.scannerwork
+report
+
+# plan test output
+/go/vt/vtgate/planbuilder/testdata/plan_test*
+/go/vt/vtgate/planbuilder/testdata/expected
+
+# mise files
+.mise.toml

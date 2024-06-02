@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -24,44 +24,95 @@ limitations under the License.
 package s3backupstorage
 
 import (
-	"flag"
+	"context"
+	"crypto/md5"
+	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"math"
+	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/client"
+	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
-	"golang.org/x/net/context"
+	"github.com/spf13/pflag"
 
 	"vitess.io/vitess/go/vt/concurrency"
+	"vitess.io/vitess/go/vt/log"
+	stats "vitess.io/vitess/go/vt/mysqlctl/backupstats"
 	"vitess.io/vitess/go/vt/mysqlctl/backupstorage"
+	"vitess.io/vitess/go/vt/servenv"
 )
 
 var (
 	// AWS API region
-	region = flag.String("s3_backup_aws_region", "us-east-1", "AWS region to use")
+	region string
+
+	// AWS request retries
+	retryCount int
+
+	// AWS endpoint, defaults to amazonaws.com but appliances may use a different location
+	endpoint string
 
 	// bucket is where the backups will go.
-	bucket = flag.String("s3_backup_storage_bucket", "", "S3 bucket to use for backups")
+	bucket string
 
 	// root is a prefix added to all object names.
-	root = flag.String("s3_backup_storage_root", "", "root prefix for all backup-related object names")
+	root string
+
+	// forcePath is used to ensure that the certificate and path used match the endpoint + region
+	forcePath bool
+
+	tlsSkipVerifyCert bool
+
+	// verboseLogging provides more verbose logging of AWS actions
+	requiredLogLevel string
 
 	// sse is the server-side encryption algorithm used when storing this object in S3
-	sse = flag.String("s3_backup_server_side_encryption", "", "server-side encryption algorithm (e.g., AES256, aws:kms)")
+	sse string
 
 	// path component delimiter
 	delimiter = "/"
 )
 
+func registerFlags(fs *pflag.FlagSet) {
+	fs.StringVar(&region, "s3_backup_aws_region", "us-east-1", "AWS region to use.")
+	fs.IntVar(&retryCount, "s3_backup_aws_retries", -1, "AWS request retries.")
+	fs.StringVar(&endpoint, "s3_backup_aws_endpoint", "", "endpoint of the S3 backend (region must be provided).")
+	fs.StringVar(&bucket, "s3_backup_storage_bucket", "", "S3 bucket to use for backups.")
+	fs.StringVar(&root, "s3_backup_storage_root", "", "root prefix for all backup-related object names.")
+	fs.BoolVar(&forcePath, "s3_backup_force_path_style", false, "force the s3 path style.")
+	fs.BoolVar(&tlsSkipVerifyCert, "s3_backup_tls_skip_verify_cert", false, "skip the 'certificate is valid' check for SSL connections.")
+	fs.StringVar(&requiredLogLevel, "s3_backup_log_level", "LogOff", "determine the S3 loglevel to use from LogOff, LogDebug, LogDebugWithSigning, LogDebugWithHTTPBody, LogDebugWithRequestRetries, LogDebugWithRequestErrors.")
+	fs.StringVar(&sse, "s3_backup_server_side_encryption", "", "server-side encryption algorithm (e.g., AES256, aws:kms, sse_c:/path/to/key/file).")
+}
+
+func init() {
+	servenv.OnParseFor("vtbackup", registerFlags)
+	servenv.OnParseFor("vtctl", registerFlags)
+	servenv.OnParseFor("vtctld", registerFlags)
+	servenv.OnParseFor("vttablet", registerFlags)
+}
+
+type logNameToLogLevel map[string]aws.LogLevelType
+
+var logNameMap logNameToLogLevel
+
+const sseCustomerPrefix = "sse_c:"
+
 // S3BackupHandle implements the backupstorage.BackupHandle interface.
 type S3BackupHandle struct {
-	client    *s3.S3
+	client    s3iface.S3API
 	bs        *S3BackupStorage
 	dir       string
 	name      string
@@ -80,6 +131,21 @@ func (bh *S3BackupHandle) Name() string {
 	return bh.name
 }
 
+// RecordError is part of the concurrency.ErrorRecorder interface.
+func (bh *S3BackupHandle) RecordError(err error) {
+	bh.errors.RecordError(err)
+}
+
+// HasErrors is part of the concurrency.ErrorRecorder interface.
+func (bh *S3BackupHandle) HasErrors() bool {
+	return bh.errors.HasErrors()
+}
+
+// Error is part of the concurrency.ErrorRecorder interface.
+func (bh *S3BackupHandle) Error() error {
+	return bh.errors.Error()
+}
+
 // AddFile is part of the backupstorage.BackupHandle interface.
 func (bh *S3BackupHandle) AddFile(ctx context.Context, filename string, filesize int64) (io.WriteCloser, error) {
 	if bh.readOnly {
@@ -87,13 +153,13 @@ func (bh *S3BackupHandle) AddFile(ctx context.Context, filename string, filesize
 	}
 
 	// Calculate s3 upload part size using the source filesize
-	partSizeMB := s3manager.DefaultUploadPartSize
+	partSizeBytes := s3manager.DefaultUploadPartSize
 	if filesize > 0 {
 		minimumPartSize := float64(filesize) / float64(s3manager.MaxUploadParts)
-		// Convert partsize to mb and round up to ensure large enough partsize
-		calculatedPartSizeMB := int64(math.Ceil(minimumPartSize / 1024 * 1024))
-		if calculatedPartSizeMB > partSizeMB {
-			partSizeMB = calculatedPartSizeMB
+		// Round up to ensure large enough partsize
+		calculatedPartSizeBytes := int64(math.Ceil(minimumPartSize))
+		if calculatedPartSizeBytes > partSizeBytes {
+			partSizeBytes = calculatedPartSizeBytes
 		}
 	}
 
@@ -103,23 +169,27 @@ func (bh *S3BackupHandle) AddFile(ctx context.Context, filename string, filesize
 	go func() {
 		defer bh.waitGroup.Done()
 		uploader := s3manager.NewUploaderWithClient(bh.client, func(u *s3manager.Uploader) {
-			u.PartSize = partSizeMB
+			u.PartSize = partSizeBytes
 		})
 		object := objName(bh.dir, bh.name, filename)
-
-		var sseOption *string
-		if *sse != "" {
-			sseOption = sse
-		}
+		sendStats := bh.bs.params.Stats.Scope(stats.Operation("AWS:Request:Send"))
+		// Using UploadWithContext breaks uploading to Minio and Ceph https://github.com/vitessio/vitess/issues/14188
 		_, err := uploader.Upload(&s3manager.UploadInput{
-			Bucket:               bucket,
+			Bucket:               &bucket,
 			Key:                  object,
 			Body:                 reader,
-			ServerSideEncryption: sseOption,
-		})
+			ServerSideEncryption: bh.bs.s3SSE.awsAlg,
+			SSECustomerAlgorithm: bh.bs.s3SSE.customerAlg,
+			SSECustomerKey:       bh.bs.s3SSE.customerKey,
+			SSECustomerKeyMD5:    bh.bs.s3SSE.customerMd5,
+		}, s3manager.WithUploaderRequestOptions(func(r *request.Request) {
+			r.Handlers.CompleteAttempt.PushBack(func(r *request.Request) {
+				sendStats.TimedIncrement(time.Since(r.AttemptTime))
+			})
+		}))
 		if err != nil {
 			reader.CloseWithError(err)
-			bh.errors.RecordError(err)
+			bh.RecordError(err)
 		}
 	}()
 
@@ -132,7 +202,7 @@ func (bh *S3BackupHandle) EndBackup(ctx context.Context) error {
 		return fmt.Errorf("EndBackup cannot be called on read-only backup")
 	}
 	bh.waitGroup.Wait()
-	return bh.errors.Error()
+	return bh.Error()
 }
 
 // AbortBackup is part of the backupstorage.BackupHandle interface.
@@ -149,9 +219,17 @@ func (bh *S3BackupHandle) ReadFile(ctx context.Context, filename string) (io.Rea
 		return nil, fmt.Errorf("ReadFile cannot be called on read-write backup")
 	}
 	object := objName(bh.dir, bh.name, filename)
-	out, err := bh.client.GetObject(&s3.GetObjectInput{
-		Bucket: bucket,
-		Key:    object,
+	sendStats := bh.bs.params.Stats.Scope(stats.Operation("AWS:Request:Send"))
+	out, err := bh.client.GetObjectWithContext(ctx, &s3.GetObjectInput{
+		Bucket:               &bucket,
+		Key:                  object,
+		SSECustomerAlgorithm: bh.bs.s3SSE.customerAlg,
+		SSECustomerKey:       bh.bs.s3SSE.customerKey,
+		SSECustomerKeyMD5:    bh.bs.s3SSE.customerMd5,
+	}, func(r *request.Request) {
+		r.Handlers.CompleteAttempt.PushBack(func(r *request.Request) {
+			sendStats.TimedIncrement(time.Since(r.AttemptTime))
+		})
 	})
 	if err != nil {
 		return nil, err
@@ -161,22 +239,83 @@ func (bh *S3BackupHandle) ReadFile(ctx context.Context, filename string) (io.Rea
 
 var _ backupstorage.BackupHandle = (*S3BackupHandle)(nil)
 
+type S3ServerSideEncryption struct {
+	awsAlg      *string
+	customerAlg *string
+	customerKey *string
+	customerMd5 *string
+}
+
+func (s3ServerSideEncryption *S3ServerSideEncryption) init() error {
+	s3ServerSideEncryption.reset()
+
+	if strings.HasPrefix(sse, sseCustomerPrefix) {
+		sseCustomerKeyFile := strings.TrimPrefix(sse, sseCustomerPrefix)
+		base64CodedKey, err := os.ReadFile(sseCustomerKeyFile)
+		if err != nil {
+			log.Errorf(err.Error())
+			return err
+		}
+
+		decodedKey, err := base64.StdEncoding.DecodeString(string(base64CodedKey))
+		if err != nil {
+			decodedKey = base64CodedKey
+		}
+
+		md5Hash := md5.Sum(decodedKey)
+		s3ServerSideEncryption.customerAlg = aws.String("AES256")
+		s3ServerSideEncryption.customerKey = aws.String(string(decodedKey))
+		s3ServerSideEncryption.customerMd5 = aws.String(base64.StdEncoding.EncodeToString(md5Hash[:]))
+	} else if sse != "" {
+		s3ServerSideEncryption.awsAlg = &sse
+	}
+	return nil
+}
+
+func (s3ServerSideEncryption *S3ServerSideEncryption) reset() {
+	s3ServerSideEncryption.awsAlg = nil
+	s3ServerSideEncryption.customerAlg = nil
+	s3ServerSideEncryption.customerKey = nil
+	s3ServerSideEncryption.customerMd5 = nil
+}
+
 // S3BackupStorage implements the backupstorage.BackupStorage interface.
 type S3BackupStorage struct {
-	_client *s3.S3
-	mu      sync.Mutex
+	_client   *s3.S3
+	mu        sync.Mutex
+	s3SSE     S3ServerSideEncryption
+	params    backupstorage.Params
+	transport *http.Transport
+}
+
+func newS3BackupStorage() *S3BackupStorage {
+	// This initialises a new transport based off http.DefaultTransport the first time and returns the same
+	// transport on subsequent calls so connections can be reused as part of the same transport.
+	tlsClientConf := &tls.Config{InsecureSkipVerify: tlsSkipVerifyCert}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = tlsClientConf
+
+	return &S3BackupStorage{params: backupstorage.NoParams(), transport: transport}
 }
 
 // ListBackups is part of the backupstorage.BackupStorage interface.
 func (bs *S3BackupStorage) ListBackups(ctx context.Context, dir string) ([]backupstorage.BackupHandle, error) {
+	log.Infof("ListBackups: [s3] dir: %v, bucket: %v", dir, bucket)
 	c, err := bs.client()
 	if err != nil {
 		return nil, err
 	}
 
-	searchPrefix := objName(dir, "")
+	var searchPrefix *string
+	if dir == "/" {
+		searchPrefix = objName("")
+	} else {
+		searchPrefix = objName(dir, "")
+	}
+	log.Infof("objName: %v", *searchPrefix)
+
 	query := &s3.ListObjectsV2Input{
-		Bucket:    bucket,
+		Bucket:    &bucket,
 		Delimiter: &delimiter,
 		Prefix:    searchPrefix,
 	}
@@ -217,6 +356,7 @@ func (bs *S3BackupStorage) ListBackups(ctx context.Context, dir string) ([]backu
 
 // StartBackup is part of the backupstorage.BackupStorage interface.
 func (bs *S3BackupStorage) StartBackup(ctx context.Context, dir, name string) (backupstorage.BackupHandle, error) {
+	log.Infof("StartBackup: [s3] dir: %v, name: %v, bucket: %v", dir, name, bucket)
 	c, err := bs.client()
 	if err != nil {
 		return nil, err
@@ -233,13 +373,15 @@ func (bs *S3BackupStorage) StartBackup(ctx context.Context, dir, name string) (b
 
 // RemoveBackup is part of the backupstorage.BackupStorage interface.
 func (bs *S3BackupStorage) RemoveBackup(ctx context.Context, dir, name string) error {
+	log.Infof("RemoveBackup: [s3] dir: %v, name: %v, bucket: %v", dir, name, bucket)
+
 	c, err := bs.client()
 	if err != nil {
 		return err
 	}
 
 	query := &s3.ListObjectsV2Input{
-		Bucket: bucket,
+		Bucket: &bucket,
 		Prefix: objName(dir, name),
 	}
 
@@ -258,7 +400,7 @@ func (bs *S3BackupStorage) RemoveBackup(ctx context.Context, dir, name string) e
 
 		quiet := true // return less in the Delete response
 		out, err := c.DeleteObjects(&s3.DeleteObjectsInput{
-			Bucket: bucket,
+			Bucket: &bucket,
 			Delete: &s3.Delete{
 				Objects: objIds,
 				Quiet:   &quiet,
@@ -288,22 +430,66 @@ func (bs *S3BackupStorage) Close() error {
 	bs.mu.Lock()
 	defer bs.mu.Unlock()
 	bs._client = nil
+	bs.s3SSE.reset()
 	return nil
 }
 
+func (bs *S3BackupStorage) WithParams(params backupstorage.Params) backupstorage.BackupStorage {
+	return &S3BackupStorage{params: params, transport: bs.transport}
+}
+
 var _ backupstorage.BackupStorage = (*S3BackupStorage)(nil)
+
+// getLogLevel converts the string loglevel to an aws.LogLevelType
+func getLogLevel() *aws.LogLevelType {
+	l := new(aws.LogLevelType)
+	*l = aws.LogOff // default setting
+	if level, found := logNameMap[requiredLogLevel]; found {
+		*l = level // adjust as required
+	}
+	return l
+}
 
 func (bs *S3BackupStorage) client() (*s3.S3, error) {
 	bs.mu.Lock()
 	defer bs.mu.Unlock()
 	if bs._client == nil {
-		bs._client = s3.New(session.New(), &aws.Config{Region: aws.String(*region)})
+		logLevel := getLogLevel()
 
-		if len(*bucket) == 0 {
-			return nil, fmt.Errorf("-s3_backup_storage_bucket required")
+		httpClient := &http.Client{Transport: bs.transport}
+
+		session, err := session.NewSession()
+		if err != nil {
+			return nil, err
 		}
 
-		if _, err := bs._client.HeadBucket(&s3.HeadBucketInput{Bucket: bucket}); err != nil {
+		awsConfig := aws.Config{
+			HTTPClient:       httpClient,
+			LogLevel:         logLevel,
+			Endpoint:         aws.String(endpoint),
+			Region:           aws.String(region),
+			S3ForcePathStyle: aws.Bool(forcePath),
+		}
+
+		if retryCount >= 0 {
+			awsConfig = *request.WithRetryer(&awsConfig, &ClosedConnectionRetryer{
+				awsRetryer: &client.DefaultRetryer{
+					NumMaxRetries: retryCount,
+				},
+			})
+		}
+
+		bs._client = s3.New(session, &awsConfig)
+
+		if len(bucket) == 0 {
+			return nil, fmt.Errorf("--s3_backup_storage_bucket required")
+		}
+
+		if _, err := bs._client.HeadBucket(&s3.HeadBucketInput{Bucket: &bucket}); err != nil {
+			return nil, err
+		}
+
+		if err := bs.s3SSE.init(); err != nil {
 			return nil, err
 		}
 	}
@@ -312,13 +498,22 @@ func (bs *S3BackupStorage) client() (*s3.S3, error) {
 
 func objName(parts ...string) *string {
 	res := ""
-	if *root != "" {
-		res += *root + delimiter
+	if root != "" {
+		res += root + delimiter
 	}
 	res += strings.Join(parts, delimiter)
 	return &res
 }
 
 func init() {
-	backupstorage.BackupStorageMap["s3"] = &S3BackupStorage{}
+	backupstorage.BackupStorageMap["s3"] = newS3BackupStorage()
+
+	logNameMap = logNameToLogLevel{
+		"LogOff":                     aws.LogOff,
+		"LogDebug":                   aws.LogDebug,
+		"LogDebugWithSigning":        aws.LogDebugWithSigning,
+		"LogDebugWithHTTPBody":       aws.LogDebugWithHTTPBody,
+		"LogDebugWithRequestRetries": aws.LogDebugWithRequestRetries,
+		"LogDebugWithRequestErrors":  aws.LogDebugWithRequestErrors,
+	}
 }

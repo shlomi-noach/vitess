@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,22 +17,24 @@ limitations under the License.
 package topo
 
 import (
-	"fmt"
 	"path"
 	"strings"
 	"sync"
 
-	"golang.org/x/net/context"
+	"context"
+
+	"vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
 
 	"vitess.io/vitess/go/fileutil"
 	"vitess.io/vitess/go/vt/log"
 )
 
 // ResolveKeyspaceWildcard will resolve keyspace wildcards.
-// - If the param is not a wildcard, it will just be returned (if the keyspace
-//   doesn't exist, it is still returned).
-// - If the param is a wildcard, it will get all keyspaces and returns
-//   the ones which match the wildcard (which may be an empty list).
+//   - If the param is not a wildcard, it will just be returned (if the keyspace
+//     doesn't exist, it is still returned).
+//   - If the param is a wildcard, it will get all keyspaces and returns
+//     the ones which match the wildcard (which may be an empty list).
 func (ts *Server) ResolveKeyspaceWildcard(ctx context.Context, param string) ([]string, error) {
 	if !fileutil.HasWildcard(param) {
 		return []string{param}, nil
@@ -42,12 +44,12 @@ func (ts *Server) ResolveKeyspaceWildcard(ctx context.Context, param string) ([]
 
 	keyspaces, err := ts.GetKeyspaces(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read keyspaces from topo: %v", err)
+		return nil, vterrors.Wrapf(err, "failed to read keyspaces from topo")
 	}
 	for _, k := range keyspaces {
 		matched, err := path.Match(param, k)
 		if err != nil {
-			return nil, fmt.Errorf("invalid pattern %v: %v", param, err)
+			return nil, vterrors.Wrapf(err, "invalid pattern %v", param)
 		}
 		if matched {
 			result = append(result, k)
@@ -65,15 +67,15 @@ type KeyspaceShard struct {
 // ResolveShardWildcard will resolve shard wildcards. Both keyspace and shard
 // names can use wildcard. Errors talking to the topology server are returned.
 // ErrNoNode is ignored if it's the result of resolving a wildcard. Examples:
-// - */* returns all keyspace/shard pairs, or empty list if none.
-// - user/* returns all shards in user keyspace (or error if user keyspace
-//   doesn't exist)
-// - us*/* returns all shards in all keyspaces that start with 'us'. If no such
-//   keyspace exists, list is empty (it is not an error).
+//   - */* returns all keyspace/shard pairs, or empty list if none.
+//   - user/* returns all shards in user keyspace (or error if user keyspace
+//     doesn't exist)
+//   - us*/* returns all shards in all keyspaces that start with 'us'. If no such
+//     keyspace exists, list is empty (it is not an error).
 func (ts *Server) ResolveShardWildcard(ctx context.Context, param string) ([]KeyspaceShard, error) {
 	parts := strings.Split(param, "/")
 	if len(parts) != 2 {
-		return nil, fmt.Errorf("invalid shard path: %v", param)
+		return nil, vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "invalid shard path: %v", param)
 	}
 	result := make([]KeyspaceShard, 0, 1)
 
@@ -99,14 +101,14 @@ func (ts *Server) ResolveShardWildcard(ctx context.Context, param string) ([]Key
 					// that's the */* case when a keyspace has no shards
 					continue
 				}
-				return nil, fmt.Errorf("keyspace %v doesn't exist", matchedKeyspace)
+				return nil, vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "keyspace %v doesn't exist", matchedKeyspace)
 			default:
-				return nil, fmt.Errorf("cannot read keyspace shards for %v: %v", matchedKeyspace, err)
+				return nil, vterrors.Wrapf(err, "cannot read keyspace shards for %v", matchedKeyspace)
 			}
 			for _, s := range shardNames {
 				matched, err := path.Match(shard, s)
 				if err != nil {
-					return nil, fmt.Errorf("Invalid pattern %v: %v", shard, err)
+					return nil, vterrors.Wrapf(err, "invalid pattern %v", shard)
 				}
 				if matched {
 					result = append(result, KeyspaceShard{matchedKeyspace, s})
@@ -129,7 +131,7 @@ func (ts *Server) ResolveShardWildcard(ctx context.Context, param string) ([]Key
 					// no shard, ignore
 				default:
 					// other error
-					return nil, fmt.Errorf("Cannot read shard %v/%v: %v", matchedKeyspace, shard, err)
+					return nil, vterrors.Wrapf(err, "cannot read shard %v/%v", matchedKeyspace, shard)
 				}
 			} else {
 				// keyspace and shards are not wildcards, just add the value

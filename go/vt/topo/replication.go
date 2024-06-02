@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,16 +17,16 @@ limitations under the License.
 package topo
 
 import (
-	"fmt"
+	"context"
 	"path"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	"google.golang.org/protobuf/proto"
 
 	"vitess.io/vitess/go/trace"
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/vterrors"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
@@ -78,8 +78,7 @@ func (sri *ShardReplicationInfo) GetShardReplicationNode(tabletAlias *topodatapb
 // UpdateShardReplicationRecord is a low level function to add / update an
 // entry to the ShardReplication object.
 func UpdateShardReplicationRecord(ctx context.Context, ts *Server, keyspace, shard string, tabletAlias *topodatapb.TabletAlias) error {
-	span := trace.NewSpanFromContext(ctx)
-	span.StartClient("TopoServer.UpdateShardReplicationFields")
+	span, ctx := trace.NewSpan(ctx, "TopoServer.UpdateShardReplicationFields")
 	span.Annotate("keyspace", keyspace)
 	span.Annotate("shard", shard)
 	span.Annotate("tablet", topoproto.TabletAliasString(tabletAlias))
@@ -88,10 +87,10 @@ func UpdateShardReplicationRecord(ctx context.Context, ts *Server, keyspace, sha
 	return ts.UpdateShardReplicationFields(ctx, tabletAlias.Cell, keyspace, shard, func(sr *topodatapb.ShardReplication) error {
 		// Not very efficient, but easy to read, and allows us
 		// to remove duplicate entries if any.
-		nodes := make([]*topodatapb.ShardReplication_Node, 0, len(sr.Nodes)+1)
+		nodes := make([]*topodatapb.ShardReplication_Node, 0, len((*sr).Nodes)+1)
 		found := false
 		modified := false
-		for _, node := range sr.Nodes {
+		for _, node := range (*sr).Nodes {
 			if proto.Equal(node.TabletAlias, tabletAlias) {
 				if found {
 					log.Warningf("Found a second ShardReplication_Node for tablet %v, deleting it", tabletAlias)
@@ -109,7 +108,7 @@ func UpdateShardReplicationRecord(ctx context.Context, ts *Server, keyspace, sha
 		if !modified {
 			return NewError(NoUpdateNeeded, tabletAlias.String())
 		}
-		sr.Nodes = nodes
+		(*sr).Nodes = nodes
 		return nil
 	})
 }
@@ -118,47 +117,56 @@ func UpdateShardReplicationRecord(ctx context.Context, ts *Server, keyspace, sha
 // entry from the ShardReplication object.
 func RemoveShardReplicationRecord(ctx context.Context, ts *Server, cell, keyspace, shard string, tabletAlias *topodatapb.TabletAlias) error {
 	err := ts.UpdateShardReplicationFields(ctx, cell, keyspace, shard, func(sr *topodatapb.ShardReplication) error {
-		nodes := make([]*topodatapb.ShardReplication_Node, 0, len(sr.Nodes))
-		for _, node := range sr.Nodes {
+		nodes := make([]*topodatapb.ShardReplication_Node, 0, len((*sr).Nodes))
+		for _, node := range (*sr).Nodes {
 			if !proto.Equal(node.TabletAlias, tabletAlias) {
 				nodes = append(nodes, node)
 			}
 		}
-		sr.Nodes = nodes
+		(*sr).Nodes = nodes
 		return nil
 	})
 	return err
 }
 
 // FixShardReplication will fix the first problem it encounters within
-// a ShardReplication object.
-func FixShardReplication(ctx context.Context, ts *Server, logger logutil.Logger, cell, keyspace, shard string) error {
+// a ShardReplication object. It returns info about the error being fixed, if
+// an error was found.
+//
+// A return value of (nil, nil) indicates no issues in the replication graph.
+func FixShardReplication(ctx context.Context, ts *Server, logger logutil.Logger, cell, keyspace, shard string) (*topodatapb.ShardReplicationError, error) {
 	sri, err := ts.GetShardReplication(ctx, cell, keyspace, shard)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	for _, node := range sri.Nodes {
+		problem := &topodatapb.ShardReplicationError{
+			TabletAlias: node.TabletAlias,
+		}
+
 		ti, err := ts.GetTablet(ctx, node.TabletAlias)
 		if IsErrType(err, NoNode) {
+			problem.Type = topodatapb.ShardReplicationError_NOT_FOUND
 			logger.Warningf("Tablet %v is in the replication graph, but does not exist, removing it", node.TabletAlias)
-			return RemoveShardReplicationRecord(ctx, ts, cell, keyspace, shard, node.TabletAlias)
+			return problem, RemoveShardReplicationRecord(ctx, ts, cell, keyspace, shard, node.TabletAlias)
 		}
 		if err != nil {
 			// unknown error, we probably don't want to continue
-			return err
+			return nil, err
 		}
 
 		if ti.Keyspace != keyspace || ti.Shard != shard || ti.Alias.Cell != cell {
+			problem.Type = topodatapb.ShardReplicationError_TOPOLOGY_MISMATCH
 			logger.Warningf("Tablet '%v' is in the replication graph, but has wrong keyspace/shard/cell, removing it", ti.Tablet)
-			return RemoveShardReplicationRecord(ctx, ts, cell, keyspace, shard, node.TabletAlias)
+			return problem, RemoveShardReplicationRecord(ctx, ts, cell, keyspace, shard, node.TabletAlias)
 		}
 
 		logger.Infof("Keeping tablet %v in the replication graph", node.TabletAlias)
 	}
 
 	logger.Infof("All entries in replication graph are valid")
-	return nil
+	return nil, nil
 }
 
 // UpdateShardReplicationFields updates the fields inside a topo.ShardReplication object.
@@ -178,8 +186,8 @@ func (ts *Server) UpdateShardReplicationFields(ctx context.Context, cell, keyspa
 			// Empty node, version is nil
 		case err == nil:
 			// Use any data we got.
-			if err = proto.Unmarshal(data, sr); err != nil {
-				return fmt.Errorf("bad ShardReplication data %v", err)
+			if err = sr.UnmarshalVT(data); err != nil {
+				return vterrors.Wrap(err, "bad ShardReplication data")
 			}
 		default:
 			return err
@@ -196,7 +204,7 @@ func (ts *Server) UpdateShardReplicationFields(ctx context.Context, cell, keyspa
 		}
 
 		// marshall and save
-		data, err = proto.Marshal(sr)
+		data, err = sr.MarshalVT()
 		if err != nil {
 			return err
 		}
@@ -235,8 +243,8 @@ func (ts *Server) GetShardReplication(ctx context.Context, cell, keyspace, shard
 	}
 
 	sr := &topodatapb.ShardReplication{}
-	if err = proto.Unmarshal(data, sr); err != nil {
-		return nil, fmt.Errorf("bad ShardReplication data %v", err)
+	if err = sr.UnmarshalVT(data); err != nil {
+		return nil, vterrors.Wrap(err, "bad ShardReplication data")
 	}
 
 	return NewShardReplicationInfo(sr, cell, keyspace, shard), nil

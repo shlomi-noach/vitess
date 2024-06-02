@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -17,25 +17,25 @@ limitations under the License.
 package vtctld
 
 import (
+	"context"
 	"io"
 	"sync"
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/golang/protobuf/proto"
 	"vitess.io/vitess/go/vt/logutil"
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
+	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vttablet/grpcqueryservice"
 	"vitess.io/vitess/go/vt/vttablet/queryservice"
 	"vitess.io/vitess/go/vt/vttablet/queryservice/fakes"
 	"vitess.io/vitess/go/vt/vttablet/tmclient"
 	"vitess.io/vitess/go/vt/wrangler"
 	"vitess.io/vitess/go/vt/wrangler/testlib"
-
-	querypb "vitess.io/vitess/go/vt/proto/query"
-	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 // streamHealthTabletServer is a local QueryService implementation to support the tests
@@ -91,10 +91,14 @@ func (s *streamHealthTabletServer) streamHealthUnregister(id int) error {
 }
 
 // BroadcastHealth will broadcast the current health to all listeners
-func (s *streamHealthTabletServer) BroadcastHealth(terTimestamp int64, stats *querypb.RealtimeStats) {
+func (s *streamHealthTabletServer) BroadcastHealth() {
 	shr := &querypb.StreamHealthResponse{
-		TabletExternallyReparentedTimestamp: terTimestamp,
-		RealtimeStats:                       stats,
+		PrimaryTermStartTimestamp: 42,
+		RealtimeStats: &querypb.RealtimeStats{
+			HealthError:           "testHealthError",
+			ReplicationLagSeconds: 72,
+			CpuUsage:              1.1,
+		},
 	}
 
 	s.streamHealthMutex.Lock()
@@ -105,29 +109,23 @@ func (s *streamHealthTabletServer) BroadcastHealth(terTimestamp int64, stats *qu
 }
 
 func TestTabletData(t *testing.T) {
-	ts := memorytopo.NewServer("cell1", "cell2")
-	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ts := memorytopo.NewServer(ctx, "cell1", "cell2")
+	defer ts.Close()
+	wr := wrangler.New(vtenv.NewTestEnv(), logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
 
-	if err := ts.CreateKeyspace(context.Background(), "ks", &topodatapb.Keyspace{
-		ShardingColumnName: "keyspace_id",
-		ShardingColumnType: topodatapb.KeyspaceIdType_UINT64,
-	}); err != nil {
+	if err := ts.CreateKeyspace(context.Background(), "ks", &topodatapb.Keyspace{}); err != nil {
 		t.Fatalf("CreateKeyspace failed: %v", err)
 	}
 
-	tablet1 := testlib.NewFakeTablet(t, wr, "cell1", 0, topodatapb.TabletType_MASTER, nil, testlib.TabletKeyspaceShard(t, "ks", "-80"))
+	tablet1 := testlib.NewFakeTablet(t, wr, "cell1", 0, topodatapb.TabletType_PRIMARY, nil, testlib.TabletKeyspaceShard(t, "ks", "-80"))
 	shsq := newStreamHealthTabletServer(t)
 	grpcqueryservice.Register(tablet1.RPCServer, shsq)
 	tablet1.StartActionLoop(t, wr)
 	defer tablet1.StopActionLoop(t)
 
 	thc := newTabletHealthCache(ts)
-
-	stats := &querypb.RealtimeStats{
-		HealthError:         "testHealthError",
-		SecondsBehindMaster: 72,
-		CpuUsage:            1.1,
-	}
 
 	// Keep broadcasting until the first result goes through.
 	stop := make(chan struct{})
@@ -137,19 +135,25 @@ func TestTabletData(t *testing.T) {
 			case <-stop:
 				return
 			default:
-				shsq.BroadcastHealth(42, stats)
+				shsq.BroadcastHealth()
 			}
 		}
 	}()
 
 	// Start streaming and wait for the first result.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	result, err := thc.Get(ctx, tablet1.Tablet.Alias)
-	cancel()
+	requestCtx, requestCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer requestCancel()
+	result, err := thc.Get(requestCtx, tablet1.Tablet.Alias)
 	close(stop)
 
 	if err != nil {
 		t.Fatalf("thc.Get failed: %v", err)
+	}
+
+	stats := &querypb.RealtimeStats{
+		HealthError:           "testHealthError",
+		ReplicationLagSeconds: 72,
+		CpuUsage:              1.1,
 	}
 	if got, want := result.RealtimeStats, stats; !proto.Equal(got, want) {
 		t.Errorf("RealtimeStats = %#v, want %#v", got, want)

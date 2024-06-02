@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ limitations under the License.
 package grpcbinlogplayer
 
 import (
+	"context"
 	"net"
 	"testing"
 
@@ -33,7 +34,7 @@ import (
 // implementation, and runs the test suite against the setup.
 func TestGRPCBinlogStreamer(t *testing.T) {
 	// Listen on a random port
-	listener, err := net.Listen("tcp", ":0")
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Cannot listen: %v", err)
 	}
@@ -48,9 +49,11 @@ func TestGRPCBinlogStreamer(t *testing.T) {
 
 	// Create a GRPC client to talk to the fake tablet
 	c := &client{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	// and send it to the test suite
-	binlogplayertest.Run(t, c, &topodatapb.Tablet{
+	binlogplayertest.Run(ctx, t, c, &topodatapb.Tablet{
 		Hostname: host,
 		PortMap: map[string]int32{
 			"grpc": int32(port),

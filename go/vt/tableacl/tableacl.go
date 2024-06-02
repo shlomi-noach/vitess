@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,21 +20,17 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"sort"
 	"strings"
 	"sync"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/tchap/go-patricia/patricia"
-	"vitess.io/vitess/go/json2"
-	"vitess.io/vitess/go/vt/health"
-	"vitess.io/vitess/go/vt/log"
-	"vitess.io/vitess/go/vt/servenv"
-	"vitess.io/vitess/go/vt/tableacl/acl"
-	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 
+	"vitess.io/vitess/go/json2"
+	"vitess.io/vitess/go/vt/log"
 	tableaclpb "vitess.io/vitess/go/vt/proto/tableacl"
+	"vitess.io/vitess/go/vt/tableacl/acl"
 )
 
 // ACLResult embeds an acl.ACL and also tell which table group it belongs to.
@@ -75,7 +71,7 @@ type tableACL struct {
 	// mutex protects entries, config, and callback
 	sync.RWMutex
 	entries aclEntries
-	config  tableaclpb.Config
+	config  *tableaclpb.Config
 	// callback is executed on successful reload.
 	callback func()
 	// ACL Factory override for testing
@@ -90,16 +86,16 @@ var currentTableACL tableACL
 // The config file can be binary-proto-encoded, or json-encoded.
 // In the json case, it looks like this:
 //
-// {
-//   "table_groups": [
-//     {
-//       "table_names_or_prefixes": ["name1"],
-//       "readers": ["client1"],
-//       "writers": ["client1"],
-//       "admins": ["client1"]
-//     }
-//   ]
-// }
+//	{
+//	  "table_groups": [
+//	    {
+//	      "table_names_or_prefixes": ["name1"],
+//	      "readers": ["client1"],
+//	      "writers": ["client1"],
+//	      "admins": ["client1"]
+//	    }
+//	  ]
+//	}
 func Init(configFile string, aclCB func()) error {
 	return currentTableACL.init(configFile, aclCB)
 }
@@ -109,19 +105,17 @@ func (tacl *tableACL) init(configFile string, aclCB func()) error {
 	if configFile == "" {
 		return nil
 	}
-	log.Infof("Loading Table ACL from local file: %v", configFile)
-	data, err := ioutil.ReadFile(configFile)
+	data, err := os.ReadFile(configFile)
 	if err != nil {
-		log.Infof("unable to read tableACL config file: %v", err)
+		log.Infof("unable to read tableACL config file: %v  Error: %v", configFile, err)
 		return err
 	}
 	config := &tableaclpb.Config{}
-	if err := proto.Unmarshal(data, config); err != nil {
-		log.Infof("unable to parse tableACL config file as a protobuf file: %v", err)
+	if err := config.UnmarshalVT(data); err != nil {
 		// try to parse tableacl as json file
 		if jsonErr := json2.Unmarshal(data, config); jsonErr != nil {
-			log.Infof("unable to parse tableACL config file as a json file: %v", jsonErr)
-			return fmt.Errorf("Unable to unmarshal Table ACL data: %v", data)
+			log.Infof("unable to parse tableACL config file as a protobuf or json file.  protobuf err: %v  json err: %v", err, jsonErr)
+			return fmt.Errorf("unable to unmarshal Table ACL data: %s", data)
 		}
 	}
 	return tacl.Set(config)
@@ -176,7 +170,7 @@ func load(config *tableaclpb.Config, newACL func([]string) (acl.ACL, error)) (en
 
 func (tacl *tableACL) aclFactory() (acl.Factory, error) {
 	if tacl.factory == nil {
-		return GetCurrentAclFactory()
+		return GetCurrentACLFactory()
 	}
 	return tacl.factory, nil
 }
@@ -192,7 +186,7 @@ func (tacl *tableACL) Set(config *tableaclpb.Config) error {
 	}
 	tacl.Lock()
 	tacl.entries = entries
-	tacl.config = *config
+	tacl.config = config.CloneVT()
 	callback := tacl.callback
 	tacl.Unlock()
 	if callback != nil {
@@ -281,7 +275,7 @@ func GetCurrentConfig() *tableaclpb.Config {
 func (tacl *tableACL) Config() *tableaclpb.Config {
 	tacl.RLock()
 	defer tacl.RUnlock()
-	return proto.Clone(&tacl.config).(*tableaclpb.Config)
+	return tacl.config.CloneVT()
 }
 
 // Register registers an AclFactory.
@@ -301,8 +295,8 @@ func SetDefaultACL(name string) {
 	defaultACL = name
 }
 
-// GetCurrentAclFactory returns current table acl implementation.
-func GetCurrentAclFactory() (acl.Factory, error) {
+// GetCurrentACLFactory returns current table acl implementation.
+func GetCurrentACLFactory() (acl.Factory, error) {
 	mu.Lock()
 	defer mu.Unlock()
 	if len(acls) == 0 {
@@ -320,23 +314,4 @@ func GetCurrentAclFactory() (acl.Factory, error) {
 		return aclFactory, nil
 	}
 	return nil, fmt.Errorf("aclFactory for given default: %s is not found", defaultACL)
-}
-
-func checkHealth(acl *tableACL) error {
-	if !acl.Valid() {
-		return errors.New("the tableacl is not valid")
-	}
-	return nil
-}
-
-func init() {
-	servenv.OnRun(func() {
-		if !tabletenv.Config.StrictTableACL {
-			return
-		}
-		if tabletenv.Config.EnableTableACLDryRun {
-			return
-		}
-		health.DefaultAggregator.RegisterSimpleCheck("tableacl", func() error { return checkHealth(&currentTableACL) })
-	})
 }

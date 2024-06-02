@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,14 +17,21 @@ limitations under the License.
 package grpctabletconn
 
 import (
+	"context"
+	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"os"
+	"sync"
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 
+	"vitess.io/vitess/go/sqltypes"
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	queryservicepb "vitess.io/vitess/go/vt/proto/queryservice"
 	"vitess.io/vitess/go/vt/servenv"
 	"vitess.io/vitess/go/vt/vttablet/grpcqueryservice"
 	"vitess.io/vitess/go/vt/vttablet/tabletconntest"
@@ -38,7 +45,7 @@ func TestGRPCTabletConn(t *testing.T) {
 	service := tabletconntest.CreateFakeServer(t)
 
 	// listen on a random port
-	listener, err := net.Listen("tcp", ":0")
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Cannot listen: %v", err)
 	}
@@ -49,12 +56,17 @@ func TestGRPCTabletConn(t *testing.T) {
 	server := grpc.NewServer()
 	grpcqueryservice.Register(server, service)
 	go server.Serve(listener)
+	defer server.Stop()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	// run the test suite
-	tabletconntest.TestSuite(t, protocolName, &topodatapb.Tablet{
+	tabletconntest.TestSuite(ctx, t, protocolName, &topodatapb.Tablet{
 		Keyspace: tabletconntest.TestTarget.Keyspace,
 		Shard:    tabletconntest.TestTarget.Shard,
 		Type:     tabletconntest.TestTarget.TabletType,
+		Alias:    tabletconntest.TestAlias,
 		Hostname: host,
 		PortMap: map[string]int32{
 			"grpc": int32(port),
@@ -68,7 +80,7 @@ func TestGRPCTabletAuthConn(t *testing.T) {
 	service := tabletconntest.CreateFakeServer(t)
 
 	// listen on a random port
-	listener, err := net.Listen("tcp", ":0")
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Cannot listen: %v", err)
 	}
@@ -83,13 +95,14 @@ func TestGRPCTabletAuthConn(t *testing.T) {
 
 	grpcqueryservice.Register(server, service)
 	go server.Serve(listener)
+	defer server.Stop()
 
 	authJSON := `{
          "Username": "valid",
          "Password": "valid"
         }`
 
-	f, err := ioutil.TempFile("", "static_auth_creds.json")
+	f, err := os.CreateTemp("", "static_auth_creds.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,14 +114,125 @@ func TestGRPCTabletAuthConn(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	// run the test suite
-	tabletconntest.TestSuite(t, protocolName, &topodatapb.Tablet{
+	tabletconntest.TestSuite(ctx, t, protocolName, &topodatapb.Tablet{
 		Keyspace: tabletconntest.TestTarget.Keyspace,
 		Shard:    tabletconntest.TestTarget.Shard,
 		Type:     tabletconntest.TestTarget.TabletType,
+		Alias:    tabletconntest.TestAlias,
 		Hostname: host,
 		PortMap: map[string]int32{
 			"grpc": int32(port),
 		},
 	}, service, f)
+}
+
+// mockQueryClient is a mock query client that returns an error from Streaming calls,
+// but only after storing the context that was passed to the RPC.
+type mockQueryClient struct {
+	lastCallCtx context.Context
+	queryservicepb.QueryClient
+}
+
+func (m *mockQueryClient) StreamExecute(ctx context.Context, in *querypb.StreamExecuteRequest, opts ...grpc.CallOption) (queryservicepb.Query_StreamExecuteClient, error) {
+	m.lastCallCtx = ctx
+	return nil, fmt.Errorf("A general error")
+}
+
+func (m *mockQueryClient) BeginStreamExecute(ctx context.Context, in *querypb.BeginStreamExecuteRequest, opts ...grpc.CallOption) (queryservicepb.Query_BeginStreamExecuteClient, error) {
+	m.lastCallCtx = ctx
+	return nil, fmt.Errorf("A general error")
+}
+
+func (m *mockQueryClient) ReserveStreamExecute(ctx context.Context, in *querypb.ReserveStreamExecuteRequest, opts ...grpc.CallOption) (queryservicepb.Query_ReserveStreamExecuteClient, error) {
+	m.lastCallCtx = ctx
+	return nil, fmt.Errorf("A general error")
+}
+
+func (m *mockQueryClient) ReserveBeginStreamExecute(ctx context.Context, in *querypb.ReserveBeginStreamExecuteRequest, opts ...grpc.CallOption) (queryservicepb.Query_ReserveBeginStreamExecuteClient, error) {
+	m.lastCallCtx = ctx
+	return nil, fmt.Errorf("A general error")
+}
+
+func (m *mockQueryClient) VStream(ctx context.Context, in *binlogdatapb.VStreamRequest, opts ...grpc.CallOption) (queryservicepb.Query_VStreamClient, error) {
+	m.lastCallCtx = ctx
+	return nil, fmt.Errorf("A general error")
+}
+
+func (m *mockQueryClient) VStreamRows(ctx context.Context, in *binlogdatapb.VStreamRowsRequest, opts ...grpc.CallOption) (queryservicepb.Query_VStreamRowsClient, error) {
+	m.lastCallCtx = ctx
+	return nil, fmt.Errorf("A general error")
+}
+
+func (m *mockQueryClient) VStreamTables(ctx context.Context, in *binlogdatapb.VStreamTablesRequest, opts ...grpc.CallOption) (queryservicepb.Query_VStreamTablesClient, error) {
+	m.lastCallCtx = ctx
+	return nil, fmt.Errorf("A general error")
+}
+
+func (m *mockQueryClient) VStreamResults(ctx context.Context, in *binlogdatapb.VStreamResultsRequest, opts ...grpc.CallOption) (queryservicepb.Query_VStreamResultsClient, error) {
+	m.lastCallCtx = ctx
+	return nil, fmt.Errorf("A general error")
+}
+
+func (m *mockQueryClient) GetSchema(ctx context.Context, in *querypb.GetSchemaRequest, opts ...grpc.CallOption) (queryservicepb.Query_GetSchemaClient, error) {
+	m.lastCallCtx = ctx
+	return nil, fmt.Errorf("A general error")
+}
+
+var _ queryservicepb.QueryClient = (*mockQueryClient)(nil)
+
+// TestGoRoutineLeakPrevention tests that after all the RPCs that stream queries, we end up closing the context that was passed to it, to prevent go routines from being leaked.
+func TestGoRoutineLeakPrevention(t *testing.T) {
+	mqc := &mockQueryClient{}
+	qc := &gRPCQueryClient{
+		mu: sync.RWMutex{},
+		cc: &grpc.ClientConn{},
+		c:  mqc,
+	}
+	_ = qc.StreamExecute(context.Background(), nil, "", nil, 0, 0, nil, func(result *sqltypes.Result) error {
+		return nil
+	})
+	require.Error(t, mqc.lastCallCtx.Err())
+
+	_, _ = qc.BeginStreamExecute(context.Background(), nil, nil, "", nil, 0, nil, func(result *sqltypes.Result) error {
+		return nil
+	})
+	require.Error(t, mqc.lastCallCtx.Err())
+
+	_, _ = qc.ReserveBeginStreamExecute(context.Background(), nil, nil, nil, "", nil, nil, func(result *sqltypes.Result) error {
+		return nil
+	})
+	require.Error(t, mqc.lastCallCtx.Err())
+
+	_, _ = qc.ReserveStreamExecute(context.Background(), nil, nil, "", nil, 0, nil, func(result *sqltypes.Result) error {
+		return nil
+	})
+	require.Error(t, mqc.lastCallCtx.Err())
+
+	_ = qc.VStream(context.Background(), &binlogdatapb.VStreamRequest{}, func(events []*binlogdatapb.VEvent) error {
+		return nil
+	})
+	require.Error(t, mqc.lastCallCtx.Err())
+
+	_ = qc.VStreamRows(context.Background(), &binlogdatapb.VStreamRowsRequest{}, func(response *binlogdatapb.VStreamRowsResponse) error {
+		return nil
+	})
+	require.Error(t, mqc.lastCallCtx.Err())
+
+	_ = qc.VStreamResults(context.Background(), nil, "", func(response *binlogdatapb.VStreamResultsResponse) error {
+		return nil
+	})
+	require.Error(t, mqc.lastCallCtx.Err())
+
+	_ = qc.VStreamTables(context.Background(), &binlogdatapb.VStreamTablesRequest{}, func(response *binlogdatapb.VStreamTablesResponse) error {
+		return nil
+	})
+	require.Error(t, mqc.lastCallCtx.Err())
+
+	_ = qc.GetSchema(context.Background(), nil, querypb.SchemaTableType_TABLES, nil, func(schemaRes *querypb.GetSchemaResponse) error {
+		return nil
+	})
+	require.Error(t, mqc.lastCallCtx.Err())
 }

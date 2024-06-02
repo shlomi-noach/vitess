@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -19,6 +19,8 @@ package sync2
 import (
 	"reflect"
 	"testing"
+
+	"vitess.io/vitess/go/sqltypes"
 )
 
 func TestConsolidator(t *testing.T) {
@@ -44,17 +46,17 @@ func TestConsolidator(t *testing.T) {
 		t.Fatalf("did not expect consolidator to register a new entry")
 	}
 
-	result := 1
+	result := &sqltypes.Result{}
 	go func() {
-		orig.Result = &result
+		orig.SetResult(result)
 		orig.Broadcast()
 	}()
 	dup.Wait()
 
-	if *orig.Result.(*int) != result {
+	if orig.Result() != result {
 		t.Errorf("failed to pass result")
 	}
-	if *orig.Result.(*int) != *dup.Result.(*int) {
+	if orig.Result() != dup.Result() {
 		t.Fatalf("failed to share the result")
 	}
 
@@ -71,7 +73,7 @@ func TestConsolidator(t *testing.T) {
 	}
 
 	go func() {
-		second.Result = &result
+		second.SetResult(result)
 		second.Broadcast()
 	}()
 	dup.Wait()

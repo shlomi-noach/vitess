@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,75 +18,14 @@ limitations under the License.
 package netutil
 
 import (
+	"bytes"
 	"fmt"
-	"math/rand"
 	"net"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 )
-
-func init() {
-	rand.Seed(time.Now().UnixNano())
-}
-
-// byPriorityWeight sorts records by ascending priority and weight.
-type byPriorityWeight []*net.SRV
-
-func (addrs byPriorityWeight) Len() int { return len(addrs) }
-
-func (addrs byPriorityWeight) Swap(i, j int) { addrs[i], addrs[j] = addrs[j], addrs[i] }
-
-func (addrs byPriorityWeight) Less(i, j int) bool {
-	return addrs[i].Priority < addrs[j].Priority ||
-		(addrs[i].Priority == addrs[j].Priority && addrs[i].Weight < addrs[j].Weight)
-}
-
-// shuffleByWeight shuffles SRV records by weight using the algorithm
-// described in RFC 2782.
-// NOTE(msolo) This is disabled when the weights are zero.
-func (addrs byPriorityWeight) shuffleByWeight() {
-	sum := 0
-	for _, addr := range addrs {
-		sum += int(addr.Weight)
-	}
-	for sum > 0 && len(addrs) > 1 {
-		s := 0
-		n := rand.Intn(sum)
-		for i := range addrs {
-			s += int(addrs[i].Weight)
-			if s > n {
-				if i > 0 {
-					t := addrs[i]
-					copy(addrs[1:i+1], addrs[0:i])
-					addrs[0] = t
-				}
-				break
-			}
-		}
-		sum -= int(addrs[0].Weight)
-		addrs = addrs[1:]
-	}
-}
-
-func (addrs byPriorityWeight) sortRfc2782() {
-	sort.Sort(addrs)
-	i := 0
-	for j := 1; j < len(addrs); j++ {
-		if addrs[i].Priority != addrs[j].Priority {
-			addrs[i:j].shuffleByWeight()
-			i = j
-		}
-	}
-	addrs[i:].shuffleByWeight()
-}
-
-// SortRfc2782 reorders SRV records as specified in RFC 2782.
-func SortRfc2782(srvs []*net.SRV) {
-	byPriorityWeight(srvs).sortRfc2782()
-}
 
 // SplitHostPort is an alternative to net.SplitHostPort that also parses the
 // integer port. In addition, it is more tolerant of improperly escaped IPv6
@@ -154,7 +93,7 @@ func FullyQualifiedHostname() (string, error) {
 	//   127.0.0.1	localhost.localdomain localhost
 	// If the FQDN isn't returned by this function, check the order in the entry
 	// in your /etc/hosts file.
-	return strings.TrimRight(resolvedHostnames[0], "."), nil
+	return strings.TrimSuffix(resolvedHostnames[0], "."), nil
 }
 
 // FullyQualifiedHostnameOrPanic is the same as FullyQualifiedHostname
@@ -167,22 +106,75 @@ func FullyQualifiedHostnameOrPanic() string {
 	return hostname
 }
 
-// ResolveIPv4Addrs resolves the address:port part into IP address:port pairs
-func ResolveIPv4Addrs(addr string) ([]string, error) {
-	host, port, err := net.SplitHostPort(addr)
+func dnsLookup(host string) ([]net.IP, error) {
+	addrs, err := net.LookupHost(host)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Error looking up dns name [%v]: (%v)", host, err)
 	}
-	ipAddrs, err := net.LookupIP(host)
-	result := make([]string, 0, len(ipAddrs))
-	for _, ipAddr := range ipAddrs {
-		ipv4 := ipAddr.To4()
-		if ipv4 != nil {
-			result = append(result, net.JoinHostPort(ipv4.String(), port))
+	naddr := make([]net.IP, len(addrs))
+	for i, a := range addrs {
+		naddr[i] = net.ParseIP(a)
+	}
+	sort.Slice(naddr, func(i, j int) bool {
+		return bytes.Compare(naddr[i], naddr[j]) < 0
+	})
+	return naddr, nil
+}
+
+// DNSTracker is a closure that persists state for
+//
+//	tracking changes in the DNS resolution of a target dns name
+//	returns true if the DNS name resolution has changed
+//	If there is a lookup problem, we pretend nothing has changed
+func DNSTracker(host string) func() (bool, error) {
+	dnsName := host
+	var addrs []net.IP
+	if dnsName != "" {
+		addrs, _ = dnsLookup(dnsName)
+	}
+
+	return func() (bool, error) {
+		if dnsName == "" {
+			return false, nil
+		}
+		newaddrs, err := dnsLookup(dnsName)
+		if err != nil {
+			return false, err
+		}
+		if len(newaddrs) == 0 { // Should not happen, but just in case
+			return false, fmt.Errorf("Connection DNS for %s reporting as empty, ignoring", dnsName)
+		}
+		if !addrEqual(addrs, newaddrs) {
+			oldaddr := addrs
+			addrs = newaddrs // Update the closure variable
+			return true, fmt.Errorf("Connection DNS for %s has changed; old: %v  new: %v", dnsName, oldaddr, newaddrs)
+		}
+		return false, nil
+	}
+}
+
+func addrEqual(a, b []net.IP) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for idx, v := range a {
+		if !net.IP.Equal(v, b[idx]) {
+			return false
 		}
 	}
-	if len(result) == 0 {
-		return nil, fmt.Errorf("no IPv4addr for name %v", host)
+	return true
+}
+
+// NormalizeIP normalizes loopback addresses to avoid spurious errors when
+// communicating to different representations of the loopback.
+//
+// Note: this also maps IPv6 localhost to IPv4 localhost, as
+// TabletManagerClient.GetReplicas() (the only place this function is used on)
+// will return only IPv4 addresses.
+func NormalizeIP(s string) string {
+	if ip := net.ParseIP(s); ip != nil && ip.IsLoopback() {
+		return "127.0.0.1"
 	}
-	return result, nil
+
+	return s
 }

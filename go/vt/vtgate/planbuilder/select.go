@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,213 +17,325 @@ limitations under the License.
 package planbuilder
 
 import (
-	"errors"
 	"fmt"
 
+	"vitess.io/vitess/go/vt/key"
+	querypb "vitess.io/vitess/go/vt/proto/query"
 	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/engine"
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
+	"vitess.io/vitess/go/vt/vtgate/planbuilder/operators"
+	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
+	"vitess.io/vitess/go/vt/vtgate/semantics"
 )
 
-// buildSelectPlan is the new function to build a Select plan.
-func buildSelectPlan(sel *sqlparser.Select, vschema ContextVSchema) (primitive engine.Primitive, err error) {
-	pb := newPrimitiveBuilder(vschema, newJointab(sqlparser.GetBindvars(sel)))
-	if err := pb.processSelect(sel, nil); err != nil {
-		return nil, err
-	}
-	if err := pb.bldr.Wireup(pb.bldr, pb.jt); err != nil {
-		return nil, err
-	}
-	return pb.bldr.Primitive(), nil
-}
-
-// processSelect builds a primitive tree for the given query or subquery.
-// The tree built by this function has the following general structure:
-//
-// The leaf nodes can be a route, vindexFunc or subquery. In the symtab,
-// the tables map has columns that point to these leaf nodes. A subquery
-// itself contains a builder tree, but it's opaque and is made to look
-// like a table for the analysis of the current tree.
-//
-// The leaf nodes are usually tied together by join nodes. While the join
-// nodes are built, they have ON clauses. Those are analyzed and pushed
-// down into the leaf nodes as the tree is formed. Join nodes are formed
-// during analysis of the FROM clause.
-//
-// During the WHERE clause analysis, the target leaf node is identified
-// for each part, and the PushFilter function is used to push the condition
-// down. The same strategy is used for the other clauses.
-//
-// So, a typical plan would either be a simple leaf node, or may consist
-// of leaf nodes tied together by join nodes.
-//
-// If a query has aggregates that cannot be pushed down, an aggregator
-// primitive is built. The current orderedAggregate primitive can only
-// be built on top of a route. The orderedAggregate expects the rows
-// to be ordered as they are returned. This work is performed by the
-// underlying route. This means that a compatible ORDER BY clause
-// can also be handled by this combination of primitives. In this case,
-// the tree would consist of an orderedAggregate whose input is a route.
-//
-// If a query has an ORDER BY, but the route is a scatter, then the
-// ordering is pushed down into the route itself. This results in a simple
-// route primitive.
-//
-// The LIMIT clause is the last construct of a query. If it cannot be
-// pushed into a route, then a primitve is created on top of any
-// of the above trees to make it discard unwanted rows.
-func (pb *primitiveBuilder) processSelect(sel *sqlparser.Select, outer *symtab) error {
-	if err := pb.processTableExprs(sel.From); err != nil {
-		return err
-	}
-
-	if rb, ok := pb.bldr.(*route); ok {
-		directives := sqlparser.ExtractCommentDirectives(sel.Comments)
-		rb.ERoute.QueryTimeout = queryTimeout(directives)
-		if rb.ERoute.TargetDestination != nil {
-			return errors.New("unsupported: SELECT with a target destination")
-		}
-	}
-	// Set the outer symtab after processing of FROM clause.
-	// This is because correlation is not allowed there.
-	pb.st.Outer = outer
-	if sel.Where != nil {
-		if err := pb.pushFilter(sel.Where.Expr, sqlparser.WhereStr); err != nil {
-			return err
-		}
-	}
-	grouper, err := pb.checkAggregates(sel)
-	if err != nil {
-		return err
-	}
-	if err := pb.pushSelectExprs(sel, grouper); err != nil {
-		return err
-	}
-	if sel.Having != nil {
-		if err := pb.pushFilter(sel.Having.Expr, sqlparser.HavingStr); err != nil {
-			return err
-		}
-	}
-	if err := pb.pushOrderBy(sel.OrderBy); err != nil {
-		return err
-	}
-	if err := pb.pushLimit(sel.Limit); err != nil {
-		return err
-	}
-	pb.bldr.PushMisc(sel)
-	return nil
-}
-
-// pushFilter identifies the target route for the specified bool expr,
-// pushes it down, and updates the route info if the new constraint improves
-// the primitive. This function can push to a WHERE or HAVING clause.
-func (pb *primitiveBuilder) pushFilter(boolExpr sqlparser.Expr, whereType string) error {
-	filters := splitAndExpression(nil, boolExpr)
-	reorderBySubquery(filters)
-	for _, filter := range filters {
-		origin, expr, err := pb.findOrigin(filter)
+func gen4SelectStmtPlanner(
+	query string,
+	plannerVersion querypb.ExecuteOptions_PlannerVersion,
+	stmt sqlparser.SelectStatement,
+	reservedVars *sqlparser.ReservedVars,
+	vschema plancontext.VSchema,
+) (*planResult, error) {
+	sel, isSel := stmt.(*sqlparser.Select)
+	if isSel {
+		// handle dual table for processing at vtgate.
+		p, err := handleDualSelects(sel, vschema)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if err := pb.bldr.PushFilter(pb, expr, whereType, origin); err != nil {
-			return err
+		if p != nil {
+			used := "dual"
+			keyspace, ksErr := vschema.DefaultKeyspace()
+			if ksErr == nil {
+				// we are just getting the ks to log the correct table use.
+				// no need to fail this if we can't find the default keyspace
+				used = keyspace.Name + ".dual"
+			}
+			return newPlanResult(p, used), nil
+		}
+
+		if sel.SQLCalcFoundRows && sel.Limit != nil {
+			return gen4planSQLCalcFoundRows(vschema, sel, query, reservedVars)
+		}
+		// if there was no limit, we can safely ignore the SQLCalcFoundRows directive
+		sel.SQLCalcFoundRows = false
+	}
+
+	getPlan := func(selStatement sqlparser.SelectStatement) (engine.Primitive, []string, error) {
+		return newBuildSelectPlan(selStatement, reservedVars, vschema, plannerVersion)
+	}
+
+	plan, tablesUsed, err := getPlan(stmt)
+	if err != nil {
+		return nil, err
+	}
+
+	if shouldRetryAfterPredicateRewriting(plan) {
+		// by transforming the predicates to CNF, the planner will sometimes find better plans
+		// TODO: this should move to the operator side of planning
+		prim2, tablesUsed := gen4PredicateRewrite(stmt, getPlan)
+		if prim2 != nil {
+			return newPlanResult(prim2, tablesUsed...), nil
 		}
 	}
-	return nil
+
+	if !isSel {
+		return newPlanResult(plan, tablesUsed...), nil
+	}
+
+	// this is done because engine.Route doesn't handle the empty result well
+	// if it doesn't find a shard to send the query to.
+	// All other engine primitives can handle this, so we only need it when
+	// Route is the last (and only) instruction before the user sees a result
+	if isOnlyDual(sel) || (sel.GroupBy == nil && sel.SelectExprs.AllAggregation()) {
+		switch prim := plan.(type) {
+		case *engine.Route:
+			prim.NoRoutesSpecialHandling = true
+		case *engine.VindexLookup:
+			prim.SendTo.NoRoutesSpecialHandling = true
+		}
+	}
+	return newPlanResult(plan, tablesUsed...), nil
 }
 
-// reorderBySubquery reorders the filters by pushing subqueries
-// to the end. This allows the non-subquery filters to be
-// pushed first because they can potentially improve the routing
-// plan, which can later allow a filter containing a subquery
-// to successfully merge with the corresponding route.
-func reorderBySubquery(filters []sqlparser.Expr) {
-	max := len(filters)
-	for i := 0; i < max; i++ {
-		if !hasSubquery(filters[i]) {
+func gen4planSQLCalcFoundRows(vschema plancontext.VSchema, sel *sqlparser.Select, query string, reservedVars *sqlparser.ReservedVars) (*planResult, error) {
+	ksName := ""
+	if ks, _ := vschema.DefaultKeyspace(); ks != nil {
+		ksName = ks.Name
+	}
+	semTable, err := semantics.Analyze(sel, ksName, vschema)
+	if err != nil {
+		return nil, err
+	}
+	// record any warning as planner warning.
+	vschema.PlannerWarning(semTable.Warning)
+
+	plan, tablesUsed, err := buildSQLCalcFoundRowsPlan(query, sel, reservedVars, vschema)
+	if err != nil {
+		return nil, err
+	}
+	return newPlanResult(plan, tablesUsed...), nil
+}
+
+func buildSQLCalcFoundRowsPlan(
+	originalQuery string,
+	sel *sqlparser.Select,
+	reservedVars *sqlparser.ReservedVars,
+	vschema plancontext.VSchema,
+) (engine.Primitive, []string, error) {
+	limitPlan, _, err := newBuildSelectPlan(sel, reservedVars, vschema, Gen4)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	statement2, reserved2, err := vschema.Environment().Parser().Parse2(originalQuery)
+	if err != nil {
+		return nil, nil, err
+	}
+	sel2 := statement2.(*sqlparser.Select)
+
+	sel2.SQLCalcFoundRows = false
+	sel2.OrderBy = nil
+	sel2.Limit = nil
+
+	countStartExpr := []sqlparser.SelectExpr{&sqlparser.AliasedExpr{
+		Expr: &sqlparser.CountStar{},
+	}}
+	if sel2.GroupBy == nil && sel2.Having == nil {
+		// if there is no grouping, we can use the same query and
+		// just replace the SELECT sub-clause to have a single count(*)
+		sel2.SelectExprs = countStartExpr
+	} else {
+		// when there is grouping, we have to move the original query into a derived table.
+		//                       select id, sum(12) from user group by id =>
+		// select count(*) from (select id, sum(12) from user group by id) t
+		sel3 := &sqlparser.Select{
+			SelectExprs: countStartExpr,
+			From: []sqlparser.TableExpr{
+				&sqlparser.AliasedTableExpr{
+					Expr: &sqlparser.DerivedTable{Select: sel2},
+					As:   sqlparser.NewIdentifierCS("t"),
+				},
+			},
+		}
+		sel2 = sel3
+	}
+
+	reservedVars2 := sqlparser.NewReservedVars("vtg", reserved2)
+
+	countPlan, tablesUsed, err := newBuildSelectPlan(sel2, reservedVars2, vschema, Gen4)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	rb, ok := countPlan.(*engine.Route)
+	if ok {
+		// if our count query is an aggregation, we want the no-match result to still return a zero
+		rb.NoRoutesSpecialHandling = true
+	}
+	return &engine.SQLCalcFoundRows{
+		LimitPrimitive: limitPlan,
+		CountPrimitive: countPlan,
+	}, tablesUsed, nil
+}
+
+func gen4PredicateRewrite(stmt sqlparser.Statement, getPlan func(selStatement sqlparser.SelectStatement) (engine.Primitive, []string, error)) (engine.Primitive, []string) {
+	rewritten, isSel := sqlparser.RewritePredicate(stmt).(sqlparser.SelectStatement)
+	if !isSel {
+		// Fail-safe code, should never happen
+		return nil, nil
+	}
+	plan2, op, err := getPlan(rewritten)
+	if err == nil && !shouldRetryAfterPredicateRewriting(plan2) {
+		// we only use this new plan if it's better than the old one we got
+		return plan2, op
+	}
+	return nil, nil
+}
+
+func newBuildSelectPlan(
+	selStmt sqlparser.SelectStatement,
+	reservedVars *sqlparser.ReservedVars,
+	vschema plancontext.VSchema,
+	version querypb.ExecuteOptions_PlannerVersion,
+) (plan engine.Primitive, tablesUsed []string, err error) {
+	ctx, err := plancontext.CreatePlanningContext(selStmt, reservedVars, vschema, version)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if ks, _ := ctx.SemTable.SingleUnshardedKeyspace(); ks != nil {
+		plan, tablesUsed, err = selectUnshardedShortcut(ctx, selStmt, ks)
+		if err != nil {
+			return nil, nil, err
+		}
+		setCommentDirectivesOnPlan(plan, selStmt)
+		return plan, tablesUsed, err
+	}
+
+	// From this point on, we know it is not an unsharded query and return the NotUnshardedErr if there is any
+	if ctx.SemTable.NotUnshardedErr != nil {
+		return nil, nil, ctx.SemTable.NotUnshardedErr
+	}
+
+	op, err := createSelectOperator(ctx, selStmt, reservedVars)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	plan, err = transformToPrimitive(ctx, op)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return plan, operators.TablesUsed(op), nil
+}
+
+func createSelectOperator(ctx *plancontext.PlanningContext, selStmt sqlparser.SelectStatement, reservedVars *sqlparser.ReservedVars) (operators.Operator, error) {
+	err := queryRewrite(ctx, selStmt)
+	if err != nil {
+		return nil, err
+	}
+
+	return operators.PlanQuery(ctx, selStmt)
+}
+
+func isOnlyDual(sel *sqlparser.Select) bool {
+	if sel.Where != nil || sel.GroupBy != nil || sel.Having != nil || sel.Limit != nil || sel.OrderBy != nil {
+		// we can only deal with queries without any other subclauses - just SELECT and FROM, nothing else is allowed
+		return false
+	}
+
+	if len(sel.From) > 1 {
+		return false
+	}
+	table, ok := sel.From[0].(*sqlparser.AliasedTableExpr)
+	if !ok {
+		return false
+	}
+	tableName, ok := table.Expr.(sqlparser.TableName)
+
+	return ok && tableName.Name.String() == "dual" && tableName.Qualifier.IsEmpty()
+}
+
+func shouldRetryAfterPredicateRewriting(plan engine.Primitive) bool {
+	// if we have a I_S query, but have not found table_schema or table_name, let's try CNF
+	switch eroute := plan.(type) {
+	case *engine.Route:
+		return eroute.Opcode == engine.DBA &&
+			len(eroute.SysTableTableName) == 0 &&
+			len(eroute.SysTableTableSchema) == 0
+	default:
+		return false
+	}
+}
+
+func handleDualSelects(sel *sqlparser.Select, vschema plancontext.VSchema) (engine.Primitive, error) {
+	if !isOnlyDual(sel) {
+		return nil, nil
+	}
+
+	exprs := make([]evalengine.Expr, len(sel.SelectExprs))
+	cols := make([]string, len(sel.SelectExprs))
+	var lockFunctions []*engine.LockFunc
+	for i, e := range sel.SelectExprs {
+		expr, ok := e.(*sqlparser.AliasedExpr)
+		if !ok {
+			return nil, nil
+		}
+		var err error
+		lFunc, isLFunc := expr.Expr.(*sqlparser.LockingFunc)
+		if isLFunc {
+			elem := &engine.LockFunc{Typ: expr.Expr.(*sqlparser.LockingFunc)}
+			if lFunc.Name != nil {
+				n, err := evalengine.Translate(lFunc.Name, &evalengine.Config{
+					Collation:   vschema.ConnCollation(),
+					Environment: vschema.Environment(),
+				})
+				if err != nil {
+					return nil, err
+				}
+				elem.Name = n
+			}
+			lockFunctions = append(lockFunctions, elem)
 			continue
 		}
-		saved := filters[i]
-		for j := i; j < len(filters)-1; j++ {
-			filters[j] = filters[j+1]
+		if len(lockFunctions) > 0 {
+			return nil, vterrors.VT12001(fmt.Sprintf("LOCK function and other expression: [%s] in same select query", sqlparser.String(expr)))
 		}
-		filters[len(filters)-1] = saved
-		max--
+		exprs[i], err = evalengine.Translate(expr.Expr, &evalengine.Config{
+			Collation:   vschema.ConnCollation(),
+			Environment: vschema.Environment(),
+		})
+		if err != nil {
+			return nil, nil
+		}
+		cols[i] = expr.As.String()
+		if cols[i] == "" {
+			cols[i] = sqlparser.String(expr.Expr)
+		}
 	}
+	if len(lockFunctions) > 0 {
+		return buildLockingPrimitive(sel, vschema, lockFunctions)
+	}
+	return &engine.Projection{
+		Exprs: exprs,
+		Cols:  cols,
+		Input: &engine.SingleRow{},
+	}, nil
 }
 
-// pushSelectExprs identifies the target route for the
-// select expressions and pushes them down.
-func (pb *primitiveBuilder) pushSelectExprs(sel *sqlparser.Select, grouper groupByHandler) error {
-	resultColumns, err := pb.pushSelectRoutes(sel.SelectExprs)
+func buildLockingPrimitive(sel *sqlparser.Select, vschema plancontext.VSchema, lockFunctions []*engine.LockFunc) (engine.Primitive, error) {
+	ks, err := vschema.FirstSortedKeyspace()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	pb.st.SetResultColumns(resultColumns)
-	return pb.pushGroupBy(sel, grouper)
-}
-
-// pusheSelectRoutes is a convenience function that pushes all the select
-// expressions and returns the list of resultColumns generated for it.
-func (pb *primitiveBuilder) pushSelectRoutes(selectExprs sqlparser.SelectExprs) ([]*resultColumn, error) {
-	resultColumns := make([]*resultColumn, len(selectExprs))
-	for i, node := range selectExprs {
-		switch node := node.(type) {
-		case *sqlparser.AliasedExpr:
-			origin, expr, err := pb.findOrigin(node.Expr)
-			if err != nil {
-				return nil, err
-			}
-			node.Expr = expr
-			resultColumns[i], _, err = pb.bldr.PushSelect(node, origin)
-			if err != nil {
-				return nil, err
-			}
-		case *sqlparser.StarExpr:
-			// We'll allow select * for simple routes.
-			rb, ok := pb.bldr.(*route)
-			if !ok {
-				return nil, errors.New("unsupported: '*' expression in cross-shard query")
-			}
-			// Validate keyspace reference if any.
-			if !node.TableName.IsEmpty() {
-				if qual := node.TableName.Qualifier; !qual.IsEmpty() {
-					if qual.String() != rb.ERoute.Keyspace.Name {
-						return nil, fmt.Errorf("cannot resolve %s to keyspace %s", sqlparser.String(node), rb.ERoute.Keyspace.Name)
-					}
-				}
-			}
-			resultColumns[i] = rb.PushAnonymous(node)
-		case sqlparser.Nextval:
-			rb, ok := pb.bldr.(*route)
-			if !ok {
-				// This code is unreachable because the parser doesn't allow joins for next val statements.
-				return nil, errors.New("unsupported: SELECT NEXT query in cross-shard query")
-			}
-			if err := rb.SetOpcode(engine.SelectNext); err != nil {
-				return nil, err
-			}
-			resultColumns[i] = rb.PushAnonymous(node)
-		default:
-			panic(fmt.Sprintf("BUG: unexpceted select expression type: %T", node))
-		}
-	}
-	return resultColumns, nil
-}
-
-// queryTimeout returns DirectiveQueryTimeout value if set, otherwise returns 0.
-func queryTimeout(d sqlparser.CommentDirectives) int {
-	if d == nil {
-		return 0
-	}
-
-	val, ok := d[sqlparser.DirectiveQueryTimeout]
-	if !ok {
-		return 0
-	}
-
-	intVal, ok := val.(int)
-	if ok {
-		return intVal
-	}
-	return 0
+	buf := sqlparser.NewTrackedBuffer(sqlparser.FormatImpossibleQuery).WriteNode(sel)
+	return &engine.Lock{
+		Keyspace:          ks,
+		TargetDestination: key.DestinationKeyspaceID{0},
+		FieldQuery:        buf.String(),
+		LockFunctions:     lockFunctions,
+	}, nil
 }

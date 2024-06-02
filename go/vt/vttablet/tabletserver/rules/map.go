@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -86,12 +86,12 @@ func (qri *Map) Get(ruleSource string) (*Rules, error) {
 
 // FilterByPlan creates a new Rules by prefiltering on all query rules that are contained in internal
 // Rules structures, in other words, query rules from all predefined sources will be applied.
-func (qri *Map) FilterByPlan(query string, planid planbuilder.PlanType, tableName string) (newqrs *Rules) {
+func (qri *Map) FilterByPlan(query string, planid planbuilder.PlanType, tableNames ...string) (newqrs *Rules) {
 	qri.mu.Lock()
 	defer qri.mu.Unlock()
 	newqrs = New()
 	for _, rules := range qri.queryRulesMap {
-		newqrs.Append(rules.FilterByPlan(query, planid, tableName))
+		newqrs.Append(rules.FilterByPlan(query, planid, tableNames...))
 	}
 	return newqrs
 }

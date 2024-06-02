@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,37 +17,29 @@ limitations under the License.
 package connpool
 
 import (
-	"sync"
+	"context"
+	"encoding/json"
+	"net"
+	"strings"
 	"time"
 
-	"golang.org/x/net/context"
-
-	"vitess.io/vitess/go/mysql"
-	"vitess.io/vitess/go/pools"
-	"vitess.io/vitess/go/stats"
+	"vitess.io/vitess/go/netutil"
+	"vitess.io/vitess/go/pools/smartconnpool"
+	"vitess.io/vitess/go/trace"
 	"vitess.io/vitess/go/vt/callerid"
+	"vitess.io/vitess/go/vt/dbconfigs"
 	"vitess.io/vitess/go/vt/dbconnpool"
-	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/mysqlctl"
+	"vitess.io/vitess/go/vt/servenv"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
-
-	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
-// ErrConnPoolClosed is returned when the connection pool is closed.
-var ErrConnPoolClosed = vterrors.New(vtrpcpb.Code_INTERNAL, "internal error: unexpected: conn pool is closed")
+const (
+	getWithoutS = "GetWithoutSettings"
+	getWithS    = "GetWithSettings"
+)
 
-// usedNames is for preventing expvar from panicking. Tests
-// create pool objects multiple time. If a name was previously
-// used, expvar initialization is skipped.
-// TODO(sougou): Find a way to still crash if this happened
-// through non-test code.
-var usedNames = make(map[string]bool)
-
-// MySQLChecker defines the CheckMySQL interface that lower
-// level objects can use to call back into TabletServer.
-type MySQLChecker interface {
-	CheckMySQL()
-}
+type PooledConn = smartconnpool.Pooled[*Conn]
 
 // Pool implements a custom connection pool for tabletserver.
 // It's similar to dbconnpool.ConnPool, but the connections it creates
@@ -56,230 +48,136 @@ type MySQLChecker interface {
 // Other than the connection type, ConnPool maintains an additional
 // pool of dba connections that are used to kill connections.
 type Pool struct {
-	mu             sync.Mutex
-	connections    *pools.ResourcePool
-	capacity       int
-	idleTimeout    time.Duration
-	dbaPool        *dbconnpool.ConnectionPool
-	checker        MySQLChecker
-	appDebugParams *mysql.ConnParams
+	*smartconnpool.ConnPool[*Conn]
+	dbaPool *dbconnpool.ConnectionPool
+
+	timeout time.Duration
+	env     tabletenv.Env
+
+	appDebugParams dbconfigs.Connector
+	getConnTime    *servenv.TimingsWrapper
 }
 
-// New creates a new Pool. The name is used
+// NewPool creates a new Pool. The name is used
 // to publish stats only.
-func New(
-	name string,
-	capacity int,
-	idleTimeout time.Duration,
-	checker MySQLChecker) *Pool {
+func NewPool(env tabletenv.Env, name string, cfg tabletenv.ConnPoolConfig) *Pool {
 	cp := &Pool{
-		capacity:    capacity,
-		idleTimeout: idleTimeout,
-		dbaPool:     dbconnpool.NewConnectionPool("", 1, idleTimeout),
-		checker:     checker,
+		timeout: cfg.Timeout,
+		env:     env,
 	}
-	if name == "" || usedNames[name] {
-		return cp
+
+	config := smartconnpool.Config[*Conn]{
+		Capacity:        int64(cfg.Size),
+		IdleTimeout:     cfg.IdleTimeout,
+		MaxLifetime:     cfg.MaxLifetime,
+		RefreshInterval: mysqlctl.PoolDynamicHostnameResolution,
 	}
-	usedNames[name] = true
-	stats.NewGaugeFunc(name+"Capacity", "Tablet server conn pool capacity", cp.Capacity)
-	stats.NewGaugeFunc(name+"Available", "Tablet server conn pool available", cp.Available)
-	stats.NewGaugeFunc(name+"Active", "Tablet server conn pool active", cp.Active)
-	stats.NewGaugeFunc(name+"InUse", "Tablet server conn pool in use", cp.InUse)
-	stats.NewGaugeFunc(name+"MaxCap", "Tablet server conn pool max cap", cp.MaxCap)
-	stats.NewCounterFunc(name+"WaitCount", "Tablet server conn pool wait count", cp.WaitCount)
-	stats.NewCounterDurationFunc(name+"WaitTime", "Tablet server wait time", cp.WaitTime)
-	stats.NewGaugeDurationFunc(name+"IdleTimeout", "Tablet server idle timeout", cp.IdleTimeout)
-	stats.NewCounterFunc(name+"IdleClosed", "Tablet server conn pool idle closed", cp.IdleClosed)
+
+	if name != "" {
+		config.LogWait = func(start time.Time) {
+			env.Stats().WaitTimings.Record(name+"ResourceWaitTime", start)
+		}
+
+		cp.getConnTime = env.Exporter().NewTimings(name+"GetConnTime", "Tracks the amount of time it takes to get a connection", "Settings")
+	}
+
+	cp.ConnPool = smartconnpool.NewPool(&config)
+	cp.ConnPool.RegisterStats(env.Exporter(), name)
+
+	cp.dbaPool = dbconnpool.NewConnectionPool("", env.Exporter(), 1, config.IdleTimeout, config.MaxLifetime, 0)
+
 	return cp
 }
 
-func (cp *Pool) pool() (p *pools.ResourcePool) {
-	cp.mu.Lock()
-	p = cp.connections
-	cp.mu.Unlock()
-	return p
-}
-
 // Open must be called before starting to use the pool.
-func (cp *Pool) Open(appParams, dbaParams, appDebugParams *mysql.ConnParams) {
-	cp.mu.Lock()
-	defer cp.mu.Unlock()
-
-	f := func() (pools.Resource, error) {
-		return NewDBConn(cp, appParams)
-	}
-	cp.connections = pools.NewResourcePool(f, cp.capacity, cp.capacity, cp.idleTimeout)
+func (cp *Pool) Open(appParams, dbaParams, appDebugParams dbconfigs.Connector) {
 	cp.appDebugParams = appDebugParams
 
-	cp.dbaPool.Open(dbaParams, tabletenv.MySQLStats)
+	var refresh smartconnpool.RefreshCheck
+	if net.ParseIP(appParams.Host()) == nil {
+		refresh = netutil.DNSTracker(appParams.Host())
+	}
+
+	connect := func(ctx context.Context) (*Conn, error) {
+		return newPooledConn(ctx, cp, appParams)
+	}
+
+	cp.ConnPool.Open(connect, refresh)
+	cp.dbaPool.Open(dbaParams)
 }
 
 // Close will close the pool and wait for connections to be returned before
 // exiting.
 func (cp *Pool) Close() {
-	p := cp.pool()
-	if p == nil {
-		return
-	}
-	// We should not hold the lock while calling Close
-	// because it waits for connections to be returned.
-	p.Close()
-	cp.mu.Lock()
-	cp.connections = nil
-	cp.mu.Unlock()
+	cp.ConnPool.Close()
 	cp.dbaPool.Close()
 }
 
 // Get returns a connection.
 // You must call Recycle on DBConn once done.
-func (cp *Pool) Get(ctx context.Context) (*DBConn, error) {
+func (cp *Pool) Get(ctx context.Context, setting *smartconnpool.Setting) (*PooledConn, error) {
+	span, ctx := trace.NewSpan(ctx, "Pool.Get")
+	defer span.Finish()
+
 	if cp.isCallerIDAppDebug(ctx) {
-		return NewDBConnNoPool(cp.appDebugParams, cp.dbaPool)
+		conn, err := NewConn(ctx, cp.appDebugParams, cp.dbaPool, setting, cp.env)
+		if err != nil {
+			return nil, err
+		}
+		return &smartconnpool.Pooled[*Conn]{Conn: conn}, nil
 	}
-	p := cp.pool()
-	if p == nil {
-		return nil, ErrConnPoolClosed
+	span.Annotate("capacity", cp.Capacity())
+	span.Annotate("in_use", cp.InUse())
+	span.Annotate("available", cp.Available())
+	span.Annotate("active", cp.Active())
+
+	if cp.timeout != 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, cp.timeout)
+		defer cancel()
 	}
-	r, err := p.Get(ctx)
+
+	start := time.Now()
+	conn, err := cp.ConnPool.Get(ctx, setting)
 	if err != nil {
 		return nil, err
 	}
-	return r.(*DBConn), nil
-}
-
-// Put puts a connection into the pool.
-func (cp *Pool) Put(conn *DBConn) {
-	p := cp.pool()
-	if p == nil {
-		panic(ErrConnPoolClosed)
-	}
-	if conn == nil {
-		p.Put(nil)
-	} else {
-		p.Put(conn)
-	}
-}
-
-// SetCapacity alters the size of the pool at runtime.
-func (cp *Pool) SetCapacity(capacity int) (err error) {
-	cp.mu.Lock()
-	defer cp.mu.Unlock()
-	if cp.connections != nil {
-		err = cp.connections.SetCapacity(capacity)
-		if err != nil {
-			return err
+	if cp.getConnTime != nil {
+		if setting == nil {
+			cp.getConnTime.Record(getWithoutS, start)
+		} else {
+			cp.getConnTime.Record(getWithS, start)
 		}
 	}
-	cp.capacity = capacity
-	return nil
+	return conn, nil
 }
 
 // SetIdleTimeout sets the idleTimeout on the pool.
 func (cp *Pool) SetIdleTimeout(idleTimeout time.Duration) {
-	cp.mu.Lock()
-	defer cp.mu.Unlock()
-	if cp.connections != nil {
-		cp.connections.SetIdleTimeout(idleTimeout)
-	}
+	cp.ConnPool.SetIdleTimeout(idleTimeout)
 	cp.dbaPool.SetIdleTimeout(idleTimeout)
-	cp.idleTimeout = idleTimeout
 }
 
 // StatsJSON returns the pool stats as a JSON object.
 func (cp *Pool) StatsJSON() string {
-	p := cp.pool()
-	if p == nil {
+	if !cp.ConnPool.IsOpen() {
 		return "{}"
 	}
-	return p.StatsJSON()
-}
 
-// Capacity returns the pool capacity.
-func (cp *Pool) Capacity() int64 {
-	p := cp.pool()
-	if p == nil {
-		return 0
-	}
-	return p.Capacity()
-}
-
-// Available returns the number of available connections in the pool
-func (cp *Pool) Available() int64 {
-	p := cp.pool()
-	if p == nil {
-		return 0
-	}
-	return p.Available()
-}
-
-// Active returns the number of active connections in the pool
-func (cp *Pool) Active() int64 {
-	p := cp.pool()
-	if p == nil {
-		return 0
-	}
-	return p.Active()
-}
-
-// InUse returns the number of in-use connections in the pool
-func (cp *Pool) InUse() int64 {
-	p := cp.pool()
-	if p == nil {
-		return 0
-	}
-	return p.InUse()
-}
-
-// MaxCap returns the maximum size of the pool
-func (cp *Pool) MaxCap() int64 {
-	p := cp.pool()
-	if p == nil {
-		return 0
-	}
-	return p.MaxCap()
-}
-
-// WaitCount returns how many clients are waiting for a connection
-func (cp *Pool) WaitCount() int64 {
-	p := cp.pool()
-	if p == nil {
-		return 0
-	}
-	return p.WaitCount()
-}
-
-// WaitTime return the pool WaitTime.
-func (cp *Pool) WaitTime() time.Duration {
-	p := cp.pool()
-	if p == nil {
-		return 0
-	}
-	return p.WaitTime()
-}
-
-// IdleTimeout returns the idle timeout for the pool.
-func (cp *Pool) IdleTimeout() time.Duration {
-	p := cp.pool()
-	if p == nil {
-		return 0
-	}
-	return p.IdleTimeout()
-}
-
-// IdleClosed returns the number of closed connections for the pool.
-func (cp *Pool) IdleClosed() int64 {
-	p := cp.pool()
-	if p == nil {
-		return 0
-	}
-	return p.IdleClosed()
+	var buf strings.Builder
+	enc := json.NewEncoder(&buf)
+	_ = enc.Encode(cp.ConnPool.StatsJSON())
+	return buf.String()
 }
 
 func (cp *Pool) isCallerIDAppDebug(ctx context.Context) bool {
-	callerID := callerid.ImmediateCallerIDFromContext(ctx)
-	if cp.appDebugParams.Uname == "" {
+	params, err := cp.appDebugParams.MysqlParams()
+	if err != nil {
 		return false
 	}
-	return callerID != nil && callerID.Username == cp.appDebugParams.Uname
+	if params == nil || params.Uname == "" {
+		return false
+	}
+	callerID := callerid.ImmediateCallerIDFromContext(ctx)
+	return callerID != nil && callerID.Username == params.Uname
 }

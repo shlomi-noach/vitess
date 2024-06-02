@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -17,20 +17,30 @@ limitations under the License.
 package memorytopo
 
 import (
-	"fmt"
+	"context"
 
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
 
 	"vitess.io/vitess/go/vt/topo"
 )
 
 // ListDir is part of the topo.Conn interface.
 func (c *Conn) ListDir(ctx context.Context, dirPath string, full bool) ([]topo.DirEntry, error) {
+	c.factory.callstats.Add([]string{"ListDir"}, 1)
+
+	if err := c.dial(ctx); err != nil {
+		return nil, err
+	}
+
 	c.factory.mu.Lock()
 	defer c.factory.mu.Unlock()
 
 	if c.factory.err != nil {
 		return nil, c.factory.err
+	}
+	if err := c.factory.getOperationError(ListDir, dirPath); err != nil {
+		return nil, err
 	}
 
 	isRoot := false
@@ -46,7 +56,7 @@ func (c *Conn) ListDir(ctx context.Context, dirPath string, full bool) ([]topo.D
 
 	// Check it's a directory.
 	if !n.isDirectory() {
-		return nil, fmt.Errorf("node %v in cell %v is not a directory", dirPath, c.cell)
+		return nil, vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "node %v in cell %v is not a directory", dirPath, c.cell)
 	}
 
 	result := make([]topo.DirEntry, 0, len(n.children))

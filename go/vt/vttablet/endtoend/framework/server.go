@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,12 +17,21 @@ limitations under the License.
 package framework
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
 	"time"
 
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/stats"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/vtenv"
+	"vitess.io/vitess/go/yaml2"
+
+	"vitess.io/vitess/go/vt/topo/memorytopo"
+	"vitess.io/vitess/go/vt/vterrors"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/vt/dbconfigs"
@@ -37,22 +46,24 @@ import (
 
 var (
 	// Target is the target info for the server.
-	Target querypb.Target
+	Target *querypb.Target
 	// Server is the TabletServer for the framework.
 	Server *tabletserver.TabletServer
 	// ServerAddress is the http URL for the server.
 	ServerAddress string
 	// ResolveChan is the channel that sends dtids that are to be resolved.
 	ResolveChan = make(chan string, 1)
+	// TopoServer is the topology for the server
+	TopoServer *topo.Server
 )
 
-// StartServer starts the server and initializes
+// StartCustomServer starts the server and initializes
 // all the global variables. This function should only be called
 // once at the beginning of the test.
-func StartServer(connParams, connAppDebugParams mysql.ConnParams, dbName string) error {
+func StartCustomServer(ctx context.Context, connParams, connAppDebugParams mysql.ConnParams, dbName string, cfg *tabletenv.TabletConfig) error {
 	// Setup a fake vtgate server.
 	protocol := "resolveTest"
-	*vtgateconn.VtgateProtocol = protocol
+	vtgateconn.SetVTGateProtocol(protocol)
 	vtgateconn.RegisterDialer(protocol, func(context.Context, string) (vtgateconn.Impl, error) {
 		return &txResolver{
 			FakeVTGateConn: fakerpcvtgateconn.FakeVTGateConn{},
@@ -61,34 +72,33 @@ func StartServer(connParams, connAppDebugParams mysql.ConnParams, dbName string)
 
 	dbcfgs := dbconfigs.NewTestDBConfigs(connParams, connAppDebugParams, dbName)
 
-	config := tabletenv.DefaultQsConfig
-	config.EnableAutoCommit = true
-	config.StrictTableACL = true
-	config.TwoPCEnable = true
-	config.TwoPCAbandonAge = 1
-	config.TwoPCCoordinatorAddress = "fake"
-	config.EnableHotRowProtection = true
-
-	Target = querypb.Target{
+	Target = &querypb.Target{
 		Keyspace:   "vttest",
 		Shard:      "0",
-		TabletType: topodatapb.TabletType_MASTER,
+		TabletType: topodatapb.TabletType_PRIMARY,
 	}
+	TopoServer = memorytopo.NewServer(ctx, "")
 
-	Server = tabletserver.NewTabletServerWithNilTopoServer(config)
+	srvTopoCounts := stats.NewCountersWithSingleLabel("", "Resilient srvtopo server operations", "type")
+	Server = tabletserver.NewTabletServer(ctx, vtenv.NewTestEnv(), "", cfg, TopoServer, &topodatapb.TabletAlias{}, srvTopoCounts)
 	Server.Register()
-	err := Server.StartService(Target, dbcfgs)
+	err := Server.StartService(Target, dbcfgs, nil /* mysqld */)
 	if err != nil {
-		return fmt.Errorf("could not start service: %v", err)
+		return vterrors.Wrap(err, "could not start service")
 	}
 
 	// Start http service.
-	ln, err := net.Listen("tcp", ":0")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return fmt.Errorf("could not start listener: %v", err)
+		return vterrors.Wrap(err, "could not start listener")
 	}
 	ServerAddress = fmt.Sprintf("http://%s", ln.Addr().String())
-	go http.Serve(ln, nil)
+	go func() {
+		err := servenv.HTTPServe(ln)
+		if err != nil {
+			log.Errorf("HTTPServe failed: %v", err)
+		}
+	}()
 	for {
 		time.Sleep(10 * time.Millisecond)
 		response, err := http.Get(fmt.Sprintf("%s/debug/vars", ServerAddress))
@@ -100,12 +110,36 @@ func StartServer(connParams, connAppDebugParams mysql.ConnParams, dbName string)
 	return nil
 }
 
+// StartServer starts the server and initializes
+// all the global variables. This function should only be called
+// once at the beginning of the test.
+func StartServer(ctx context.Context, connParams, connAppDebugParams mysql.ConnParams, dbName string) error {
+	config := tabletenv.NewDefaultConfig()
+	config.StrictTableACL = true
+	config.TwoPCEnable = true
+	config.TwoPCAbandonAge = 1
+	config.TwoPCCoordinatorAddress = "fake"
+	config.HotRowProtection.Mode = tabletenv.Enable
+	config.TrackSchemaVersions = true
+	config.GracePeriods.Shutdown = 2 * time.Second
+	config.SignalWhenSchemaChange = true
+	config.Healthcheck.Interval = 100 * time.Millisecond
+	config.Oltp.TxTimeout = 5 * time.Second
+	config.Olap.TxTimeout = 5 * time.Second
+	config.EnableViews = true
+	config.QueryCacheDoorkeeper = false
+	config.SchemaReloadInterval = 5 * time.Second
+	gotBytes, _ := yaml2.Marshal(config)
+	log.Infof("Config:\n%s", gotBytes)
+	return StartCustomServer(ctx, connParams, connAppDebugParams, dbName, config)
+}
+
 // StopServer must be called once all the tests are done.
 func StopServer() {
 	Server.StopService()
 }
 
-// txReolver transmits dtids to be resolved through ResolveChan.
+// txResolver transmits dtids to be resolved through ResolveChan.
 type txResolver struct {
 	fakerpcvtgateconn.FakeVTGateConn
 }

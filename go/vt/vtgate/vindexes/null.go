@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,14 +18,17 @@ package vindexes
 
 import (
 	"bytes"
+	"context"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
 )
 
 var (
-	_        Vindex = (*Null)(nil)
-	nullksid        = []byte{0}
+	_ Vindex          = (*Null)(nil)
+	_ ParamValidating = (*Null)(nil)
+
+	nullksid = []byte{0}
 )
 
 // Null defines a vindex that always return 0. It's Unique and
@@ -35,12 +38,16 @@ var (
 // Unlike other vindexes, this one will work even for NULL input values. This
 // will allow you to keep MySQL auto-inc columns unchanged.
 type Null struct {
-	name string
+	name          string
+	unknownParams []string
 }
 
-// NewNull creates a new Null.
-func NewNull(name string, m map[string]string) (Vindex, error) {
-	return &Null{name: name}, nil
+// newNull creates a new Null.
+func newNull(name string, m map[string]string) (Vindex, error) {
+	return &Null{
+		name:          name,
+		unknownParams: FindUnknownParams(m, nil),
+	}, nil
 }
 
 // String returns the name of the vindex.
@@ -48,9 +55,9 @@ func (vind *Null) String() string {
 	return vind.name
 }
 
-// Cost returns the cost of this index as 0.
+// Cost returns the cost of this index as 100.
 func (vind *Null) Cost() int {
-	return 0
+	return 100
 }
 
 // IsUnique returns true since the Vindex is unique.
@@ -58,13 +65,13 @@ func (vind *Null) IsUnique() bool {
 	return true
 }
 
-// IsFunctional returns true since the Vindex is functional.
-func (vind *Null) IsFunctional() bool {
-	return true
+// NeedsVCursor satisfies the Vindex interface.
+func (vind *Null) NeedsVCursor() bool {
+	return false
 }
 
 // Map can map ids to key.Destination objects.
-func (vind *Null) Map(cursor VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
+func (vind *Null) Map(ctx context.Context, vcursor VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
 	out := make([]key.Destination, 0, len(ids))
 	for i := 0; i < len(ids); i++ {
 		out = append(out, key.DestinationKeyspaceID(nullksid))
@@ -73,14 +80,19 @@ func (vind *Null) Map(cursor VCursor, ids []sqltypes.Value) ([]key.Destination, 
 }
 
 // Verify returns true if ids maps to ksids.
-func (vind *Null) Verify(cursor VCursor, ids []sqltypes.Value, ksids [][]byte) ([]bool, error) {
+func (vind *Null) Verify(ctx context.Context, vcursor VCursor, ids []sqltypes.Value, ksids [][]byte) ([]bool, error) {
 	out := make([]bool, len(ids))
 	for i := range ids {
-		out[i] = bytes.Compare(nullksid, ksids[i]) == 0
+		out[i] = bytes.Equal(nullksid, ksids[i])
 	}
 	return out, nil
 }
 
+// UnknownParams implements the ParamValidating interface.
+func (vind *Null) UnknownParams() []string {
+	return vind.unknownParams
+}
+
 func init() {
-	Register("null", NewNull)
+	Register("null", newNull)
 }

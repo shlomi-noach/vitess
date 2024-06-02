@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,10 +20,21 @@ limitations under the License.
 package vtexplain
 
 import (
-	"bytes"
+	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
+
+	"github.com/spf13/pflag"
+
+	"vitess.io/vitess/go/stats"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/vtenv"
+
+	"vitess.io/vitess/go/vt/discovery"
+	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/vtgate"
 
 	"vitess.io/vitess/go/jsonutil"
 	"vitess.io/vitess/go/sync2"
@@ -32,12 +43,20 @@ import (
 	"vitess.io/vitess/go/vt/vtgate/engine"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
+	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
 )
 
-// ExecutorMode controls the mode of operation for the vtexplain simulator
-type ExecutorMode string
+var batchInterval = 10 * time.Millisecond
+
+func init() {
+	servenv.OnParseFor("vtexplain", func(fs *pflag.FlagSet) {
+		fs.DurationVar(&batchInterval, "batch-interval", 10*time.Millisecond, "Interval between logical time slots.")
+	})
+}
 
 const (
+	Cell = "explainCell"
+
 	// ModeMulti is the default mode with autocommit implemented at vtgate
 	ModeMulti = "multi"
 
@@ -45,57 +64,104 @@ const (
 	ModeTwoPC = "twopc"
 )
 
-// Options to control the explain process
-type Options struct {
-	// NumShards indicates the number of shards in the topology
-	NumShards int
+type (
+	// ExecutorMode controls the mode of operation for the vtexplain simulator
+	ExecutorMode string
 
-	// ReplicationMode must be set to either "ROW" or "STATEMENT" before
-	// initialization
-	ReplicationMode string
+	// Options to control the explain process
+	Options struct {
+		// NumShards indicates the number of shards in the topology
+		NumShards int
 
-	// Normalize controls whether or not vtgate does query normalization
-	Normalize bool
+		// PlannerVersion indicates whether or not we should use the Gen4 planner
+		PlannerVersion querypb.ExecuteOptions_PlannerVersion
 
-	// ExecutionMode must be set to one of the modes above
-	ExecutionMode string
+		// ReplicationMode must be set to either "ROW" or "STATEMENT" before
+		// initialization
+		ReplicationMode string
 
-	// StrictDDL is used in unit tests only to verify that the schema
-	// is parsed properly.
-	StrictDDL bool
-}
+		// Normalize controls whether or not vtgate does query normalization
+		Normalize bool
 
-// TabletQuery defines a query that was sent to a given tablet and how it was
-// processed in mysql
-type TabletQuery struct {
-	// Logical time of the query
-	Time int
+		// ExecutionMode must be set to one of the modes above
+		ExecutionMode string
 
-	// SQL command sent to the given tablet
-	SQL string
+		// StrictDDL is used in unit tests only to verify that the schema
+		// is parsed properly.
+		StrictDDL bool
 
-	// BindVars sent with the command
-	BindVars map[string]*querypb.BindVariable
-}
+		// Target is used to override the "database" target in the
+		// vtgate session to simulate `USE <target>`
+		Target string
+	}
 
-// MysqlQuery defines a query that was sent to a given tablet and how it was
-// processed in mysql
-type MysqlQuery struct {
-	// Sequence number of the query
-	Time int
+	// TabletQuery defines a query that was sent to a given tablet and how it was
+	// processed in mysql
+	TabletQuery struct {
+		// Logical time of the query
+		Time int
 
-	// SQL command sent to the given tablet
-	SQL string
-}
+		// SQL command sent to the given tablet
+		SQL string
+
+		// BindVars sent with the command
+		BindVars map[string]*querypb.BindVariable
+	}
+
+	// MysqlQuery defines a query that was sent to a given tablet and how it was
+	// processed in mysql
+	MysqlQuery struct {
+		// Sequence number of the query
+		Time int
+
+		// SQL command sent to the given tablet
+		SQL string
+	}
+
+	// Explain defines how vitess will execute a given sql query, including the vtgate
+	// query plans and all queries run on each tablet.
+	Explain struct {
+		// original sql statement
+		SQL string
+
+		// the vtgate plan(s)
+		Plans []*engine.Plan
+
+		// list of queries / bind vars sent to each tablet
+		TabletActions map[string]*TabletActions
+	}
+
+	outputQuery struct {
+		tablet string
+		Time   int
+		sql    string
+	}
+
+	VTExplain struct {
+		explainTopo    *ExplainTopo
+		vtgateExecutor *vtgate.Executor
+		healthCheck    *discovery.FakeHealthCheck
+		vtgateSession  *vtgatepb.Session
+		spMap          map[string]string
+		spCount        int
+
+		// time simulator
+		batchTime       *sync2.Batcher
+		globalTabletEnv *tabletEnv
+
+		env *vtenv.Environment
+	}
+)
 
 // MarshalJSON renders the json structure
 func (tq *TabletQuery) MarshalJSON() ([]byte, error) {
 	// Convert Bindvars to strings for nicer output
 	bindVars := make(map[string]string)
+	var buf strings.Builder
 	for k, v := range tq.BindVars {
-		var b bytes.Buffer
-		sqlparser.EncodeValue(&b, v)
-		bindVars[k] = b.String()
+		buf.Reset()
+		sqlparser.EncodeValue(&buf, v)
+		bindVars[k] = buf.String()
 	}
 
 	return jsonutil.MarshalNoEscape(&struct {
@@ -118,52 +184,60 @@ type TabletActions struct {
 	MysqlQueries []*MysqlQuery
 }
 
-// Explain defines how vitess will execute a given sql query, including the vtgate
-// query plans and all queries run on each tablet.
-type Explain struct {
-	// original sql statement
-	SQL string
-
-	// the vtgate plan(s)
-	Plans []*engine.Plan
-
-	// list of queries / bind vars sent to each tablet
-	TabletActions map[string]*TabletActions
-}
-
-const (
-	vtexplainCell = "explainCell"
-)
-
 // Init sets up the fake execution environment
-func Init(vSchemaStr, sqlSchema string, opts *Options) error {
+func Init(ctx context.Context, env *vtenv.Environment, ts *topo.Server, vSchemaStr, sqlSchema, ksShardMapStr string, opts *Options, srvTopoCounts *stats.CountersWithSingleLabel) (*VTExplain, error) {
 	// Verify options
 	if opts.ReplicationMode != "ROW" && opts.ReplicationMode != "STATEMENT" {
-		return fmt.Errorf("invalid replication mode \"%s\"", opts.ReplicationMode)
+		return nil, fmt.Errorf("invalid replication mode \"%s\"", opts.ReplicationMode)
 	}
 
-	parsedDDLs, err := parseSchema(sqlSchema, opts)
+	parsedDDLs, err := parseSchema(sqlSchema, opts, env.Parser())
 	if err != nil {
-		return fmt.Errorf("parseSchema: %v", err)
+		return nil, fmt.Errorf("parseSchema: %v", err)
 	}
 
-	err = initTabletEnvironment(parsedDDLs, opts)
+	tabletEnv, err := newTabletEnvironment(parsedDDLs, opts, env.CollationEnv())
 	if err != nil {
-		return fmt.Errorf("initTabletEnvironment: %v", err)
+		return nil, fmt.Errorf("initTabletEnvironment: %v", err)
 	}
-
-	err = initVtgateExecutor(vSchemaStr, opts)
+	vte := &VTExplain{
+		vtgateSession: &vtgatepb.Session{
+			TargetString: "",
+			Autocommit:   true,
+		},
+		env: env,
+	}
+	vte.setGlobalTabletEnv(tabletEnv)
+	err = vte.initVtgateExecutor(ctx, ts, vSchemaStr, ksShardMapStr, opts, srvTopoCounts)
 	if err != nil {
-		return fmt.Errorf("initVtgateExecutor: %v", err)
+		return nil, fmt.Errorf("initVtgateExecutor: %v", err.Error())
 	}
 
-	return nil
+	return vte, nil
 }
 
-func parseSchema(sqlSchema string, opts *Options) ([]*sqlparser.DDL, error) {
-	parsedDDLs := make([]*sqlparser.DDL, 0, 16)
+// Stop and cleans up fake execution environment
+func (vte *VTExplain) Stop() {
+	if vte.vtgateExecutor != nil {
+		vte.vtgateExecutor.Close()
+	}
+
+	// Cleanup all created fake dbs.
+	if vte.explainTopo != nil {
+		for _, conn := range vte.explainTopo.TabletConns {
+			conn.tsv.StopService()
+			conn.tsv.Close(context.Background())
+		}
+		for _, conn := range vte.explainTopo.TabletConns {
+			conn.db.Close()
+		}
+	}
+}
+
+func parseSchema(sqlSchema string, opts *Options, parser *sqlparser.Parser) ([]sqlparser.DDLStatement, error) {
+	parsedDDLs := make([]sqlparser.DDLStatement, 0, 16)
 	for {
-		sql, rem, err := sqlparser.SplitStatement(sqlSchema)
+		sql, rem, err := parser.SplitStatement(sqlSchema)
 		sqlSchema = rem
 		if err != nil {
 			return nil, err
@@ -171,34 +245,34 @@ func parseSchema(sqlSchema string, opts *Options) ([]*sqlparser.DDL, error) {
 		if sql == "" {
 			break
 		}
-		sql = sqlparser.StripComments(sql)
+		sql, _ = sqlparser.SplitMarginComments(sql)
 		if sql == "" {
 			continue
 		}
 
 		var stmt sqlparser.Statement
 		if opts.StrictDDL {
-			stmt, err = sqlparser.ParseStrictDDL(sql)
+			stmt, err = parser.ParseStrictDDL(sql)
 			if err != nil {
 				return nil, err
 			}
 		} else {
-			stmt, err = sqlparser.Parse(sql)
+			stmt, err = parser.Parse(sql)
 			if err != nil {
 				log.Errorf("ERROR: failed to parse sql: %s, got error: %v", sql, err)
 				continue
 			}
 		}
-		ddl, ok := stmt.(*sqlparser.DDL)
+		ddl, ok := stmt.(sqlparser.DDLStatement)
 		if !ok {
 			log.Infof("ignoring non-DDL statement: %s", sql)
 			continue
 		}
-		if ddl.Action != sqlparser.CreateStr {
-			log.Infof("ignoring %s table statement", ddl.Action)
+		if ddl.GetAction() != sqlparser.CreateDDLAction {
+			log.Infof("ignoring %s table statement", ddl.GetAction().ToString())
 			continue
 		}
-		if ddl.TableSpec == nil {
+		if ddl.GetTableSpec() == nil && ddl.GetOptLike() == nil {
 			log.Errorf("invalid create table statement: %s", sql)
 			continue
 		}
@@ -208,7 +282,7 @@ func parseSchema(sqlSchema string, opts *Options) ([]*sqlparser.DDL, error) {
 }
 
 // Run the explain analysis on the given queries
-func Run(sql string) ([]*Explain, error) {
+func (vte *VTExplain) Run(sql string) ([]*Explain, error) {
 	explains := make([]*Explain, 0, 16)
 
 	var (
@@ -227,16 +301,18 @@ func Run(sql string) ([]*Explain, error) {
 			sql = s
 		}
 
-		sql, rem, err = sqlparser.SplitStatement(sql)
+		sql, rem, err = vte.env.Parser().SplitStatement(sql)
 		if err != nil {
 			return nil, err
 		}
 
 		if sql != "" {
-			// Reset the global time simulator for each query
-			batchTime = sync2.NewBatcher(time.Duration(10 * time.Millisecond))
-			log.V(100).Infof("explain %s", sql)
-			e, err := explain(sql)
+			// Reset the global time simulator unless there's an open transaction
+			// in the session from the previous statement.
+			if vte.vtgateSession == nil || !vte.vtgateSession.GetInTransaction() {
+				vte.batchTime = sync2.NewBatcher(batchInterval)
+			}
+			e, err := vte.explain(sql)
 			if err != nil {
 				return nil, err
 			}
@@ -252,8 +328,8 @@ func Run(sql string) ([]*Explain, error) {
 	return explains, nil
 }
 
-func explain(sql string) (*Explain, error) {
-	plans, tabletActions, err := vtgateExecute(sql)
+func (vte *VTExplain) explain(sql string) (*Explain, error) {
+	plans, tabletActions, err := vte.vtgateExecute(sql)
 	if err != nil {
 		return nil, err
 	}
@@ -265,16 +341,10 @@ func explain(sql string) (*Explain, error) {
 	}, nil
 }
 
-type outputQuery struct {
-	tablet string
-	Time   int
-	sql    string
-}
-
 // ExplainsAsText returns a text representation of the explains in logical time
 // order
-func ExplainsAsText(explains []*Explain) string {
-	var b bytes.Buffer
+func (vte *VTExplain) ExplainsAsText(explains []*Explain) (string, error) {
+	var b strings.Builder
 	for _, explain := range explains {
 		fmt.Fprintf(&b, "----------------------------------------------------------------------\n")
 		fmt.Fprintf(&b, "%s\n\n", explain.SQL)
@@ -282,6 +352,11 @@ func ExplainsAsText(explains []*Explain) string {
 		queries := make([]outputQuery, 0, 4)
 		for tablet, actions := range explain.TabletActions {
 			for _, q := range actions.MysqlQueries {
+				// change savepoint for printing out, that are internal to vitess.
+				err := vte.specialHandlingOfSavepoints(q)
+				if err != nil {
+					return "", err
+				}
 				queries = append(queries, outputQuery{
 					tablet: tablet,
 					Time:   q.Time,
@@ -305,7 +380,40 @@ func ExplainsAsText(explains []*Explain) string {
 		fmt.Fprintf(&b, "\n")
 	}
 	fmt.Fprintf(&b, "----------------------------------------------------------------------\n")
-	return string(b.Bytes())
+	return b.String(), nil
+}
+
+func (vte *VTExplain) specialHandlingOfSavepoints(q *MysqlQuery) error {
+	if !strings.HasPrefix(q.SQL, "savepoint") {
+		return nil
+	}
+
+	stmt, err := vte.env.Parser().Parse(q.SQL)
+	if err != nil {
+		return err
+	}
+
+	sp, ok := stmt.(*sqlparser.Savepoint)
+	if !ok {
+		return fmt.Errorf("savepoint expected, got: %s", q.SQL)
+	}
+	if !strings.Contains(sp.Name.String(), "_vt") {
+		return nil
+	}
+
+	if vte.spMap == nil {
+		vte.spMap = map[string]string{}
+	}
+	spName := vte.spMap[sp.Name.String()]
+	if spName == "" {
+		spName = fmt.Sprintf("x%d", vte.spCount+1)
+		vte.spMap[sp.Name.String()] = spName
+		vte.spCount++
+	}
+	sp.Name = sqlparser.NewIdentifierCI(spName)
+	q.SQL = sqlparser.String(sp)
+
+	return nil
 }
 
 // ExplainsAsJSON returns a json representation of the explains

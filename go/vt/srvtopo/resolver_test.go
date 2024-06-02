@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,38 +17,28 @@ limitations under the License.
 package srvtopo
 
 import (
+	"context"
 	"testing"
 
-	"golang.org/x/net/context"
+	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/stats"
 	"vitess.io/vitess/go/vt/key"
 	"vitess.io/vitess/go/vt/logutil"
-	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 	"vitess.io/vitess/go/vt/topotools"
-	"vitess.io/vitess/go/vt/vttablet/queryservice"
+	"vitess.io/vitess/go/vt/vttablet/tabletconntest"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
-// fakeStats implements TargetStats.
-type fakeStats struct{}
-
-func (s *fakeStats) GetAggregateStats(target *querypb.Target) (*querypb.AggregateStats, queryservice.QueryService, error) {
-	return &querypb.AggregateStats{}, nil, nil
-}
-
-func (s *fakeStats) GetMasterCell(keyspace, shard string) (cell string, qs queryservice.QueryService, err error) {
-	return "", nil, nil
-}
-
-func initResolver(t *testing.T, name string) *Resolver {
-	ctx := context.Background()
+func initResolver(t *testing.T, ctx context.Context) *Resolver {
 	cell := "cell1"
-	ts := memorytopo.NewServer(cell)
-	rs := NewResilientServer(ts, name)
+	ts := memorytopo.NewServer(ctx, cell)
+	counts := stats.NewCountersWithSingleLabel("", "Resilient srvtopo server operations", "type")
+	rs := NewResilientServer(ctx, ts, counts)
 
 	// Create sharded keyspace and shards.
 	if err := ts.CreateKeyspace(ctx, "sks", &topodatapb.Keyspace{}); err != nil {
@@ -63,12 +53,6 @@ func initResolver(t *testing.T, name string) *Resolver {
 		if err := ts.CreateShard(ctx, "sks", shard); err != nil {
 			t.Fatalf("CreateShard(\"%v\") failed: %v", shard, err)
 		}
-		if _, err := ts.UpdateShardFields(ctx, "sks", shard, func(si *topo.ShardInfo) error {
-			si.Shard.Cells = []string{"cell1"}
-			return nil
-		}); err != nil {
-			t.Fatalf("UpdateShardFields(\"%v\") failed: %v", shard, err)
-		}
 	}
 
 	// Create unsharded keyspace and shard.
@@ -78,25 +62,44 @@ func initResolver(t *testing.T, name string) *Resolver {
 	if err := ts.CreateShard(ctx, "uks", "0"); err != nil {
 		t.Fatalf("CreateShard(0) failed: %v", err)
 	}
-	if _, err := ts.UpdateShardFields(ctx, "uks", "0", func(si *topo.ShardInfo) error {
-		si.Shard.Cells = []string{"cell1"}
-		return nil
-	}); err != nil {
-		t.Fatalf("UpdateShardFields(0) failed: %v", err)
-	}
 
 	// And rebuild both.
 	for _, keyspace := range []string{"sks", "uks"} {
-		if err := topotools.RebuildKeyspace(ctx, logutil.NewConsoleLogger(), ts, keyspace, []string{cell}); err != nil {
+		if err := topotools.RebuildKeyspace(ctx, logutil.NewConsoleLogger(), ts, keyspace, []string{cell}, false); err != nil {
 			t.Fatalf("RebuildKeyspace(%v) failed: %v", keyspace, err)
 		}
 	}
 
-	return NewResolver(rs, &fakeStats{}, cell)
+	// Create snapshot keyspace and shard.
+	err = ts.CreateKeyspace(ctx, "rks", &topodatapb.Keyspace{KeyspaceType: topodatapb.KeyspaceType_SNAPSHOT})
+	require.NoError(t, err, "CreateKeyspace(rks) failed: %v")
+	err = ts.CreateShard(ctx, "rks", "-80")
+	require.NoError(t, err, "CreateShard(-80) failed: %v")
+
+	// Rebuild should error because allowPartial is false and shard does not cover full keyrange
+	err = topotools.RebuildKeyspace(ctx, logutil.NewConsoleLogger(), ts, "rks", []string{cell}, false)
+	require.Error(t, err, "RebuildKeyspace(rks) failed")
+	require.EqualError(t, err, "keyspace partition for PRIMARY in cell cell1 does not end with max key")
+
+	// Rebuild should succeed with allowPartial true
+	err = topotools.RebuildKeyspace(ctx, logutil.NewConsoleLogger(), ts, "rks", []string{cell}, true)
+	require.NoError(t, err, "RebuildKeyspace(rks) failed")
+
+	// Create missing shard
+	err = ts.CreateShard(ctx, "rks", "80-")
+	require.NoError(t, err, "CreateShard(80-) failed: %v")
+
+	// Rebuild should now succeed even with allowPartial false
+	err = topotools.RebuildKeyspace(ctx, logutil.NewConsoleLogger(), ts, "rks", []string{cell}, false)
+	require.NoError(t, err, "RebuildKeyspace(rks) failed")
+
+	return NewResolver(rs, &tabletconntest.FakeQueryService{}, cell)
 }
 
 func TestResolveDestinations(t *testing.T) {
-	resolver := initResolver(t, "TestResolveDestinations")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	resolver := initResolver(t, ctx)
 
 	id1 := &querypb.Value{
 		Type:  sqltypes.VarChar,

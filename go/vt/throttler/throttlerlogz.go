@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -18,13 +18,16 @@ package throttler
 
 import (
 	"fmt"
-	"html/template"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/google/safehtml/template"
+
 	"vitess.io/vitess/go/vt/logz"
+	"vitess.io/vitess/go/vt/servenv"
 )
 
 const logHeaderHTML = `
@@ -53,8 +56,8 @@ const logHeaderHTML = `
 			<th>New State</th>
 			<th>Lag Before</th>
 			<th>Recorded Ago</th>
-			<th>Master Rate</th>
-			<th>Slave Rate</th>
+			<th>Primary Rate</th>
+			<th>Replica Rate</th>
 			<th>Old Backlog</th>
 			<th>New Backlog</th>
 			<th>Reason</th>
@@ -69,7 +72,7 @@ const logEntryHTML = `
       <td>{{.OldRate}}</td>
       <td>{{.NewRate}}</td>
       <td>{{.Alias}}</td>
-      <td>{{.LagRecordNow.Stats.SecondsBehindMaster}}s</td>
+      <td>{{.LagRecordNow.Stats.ReplicationLagSeconds}}s</td>
       <td>{{.TimeSinceLastRateChange}}</td>
       <td>{{.CurrentRate}}</td>
       <td>{{.GoodOrBad}}</td>
@@ -81,10 +84,10 @@ const logEntryHTML = `
       <td>{{.NewState}}</td>
       <td>{{.LagBefore}}</td>
       <td>{{.AgeOfBeforeLag}}</td>
-      <td>{{.MasterRate}}</td>
-      <td>{{.GuessedSlaveRate}}</td>
-      <td>{{.GuessedSlaveBacklogOld}}</td>
-      <td>{{.GuessedSlaveBacklogNew}}</td>
+      <td>{{.PrimaryRate}}</td>
+      <td>{{.GuessedReplicationRate}}</td>
+      <td>{{.GuessedReplicationBacklogOld}}</td>
+      <td>{{.GuessedReplicationBacklogNew}}</td>
       <td>{{.Reason}}</td>
     </tr>
 `
@@ -99,7 +102,7 @@ var (
 )
 
 func init() {
-	http.HandleFunc("/throttlerlogz/", func(w http.ResponseWriter, r *http.Request) {
+	servenv.HTTPHandleFunc("/throttlerlogz/", func(w http.ResponseWriter, r *http.Request) {
 		throttlerlogzHandler(w, r, GlobalManager)
 	})
 }
@@ -109,8 +112,7 @@ func throttlerlogzHandler(w http.ResponseWriter, r *http.Request, m *managerImpl
 	parts := strings.SplitN(r.URL.Path, "/", 3)
 
 	if len(parts) != 3 {
-		errMsg := fmt.Sprintf("invalid /throttlerlogz path: %q expected paths: /throttlerlogz/ or /throttlerlogz/<throttler name>", r.URL.Path)
-		http.Error(w, errMsg, http.StatusInternalServerError)
+		http.Error(w, "invalid /throttlerlogz path", http.StatusNotFound)
 		return
 	}
 
@@ -121,11 +123,16 @@ func throttlerlogzHandler(w http.ResponseWriter, r *http.Request, m *managerImpl
 		return
 	}
 
+	if !slices.Contains(m.Throttlers(), name) {
+		http.Error(w, "throttler not found", http.StatusNotFound)
+		return
+	}
+
 	showThrottlerLog(w, m, name)
 }
 
 func showThrottlerLog(w http.ResponseWriter, m *managerImpl, name string) {
-	results, err := m.Log(name)
+	results, err := m.log(name)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -169,7 +176,7 @@ func showThrottlerLog(w http.ResponseWriter, m *managerImpl, name string) {
 	if count > 0 {
 		d = results[0].Now.Sub(results[count-1].Now)
 	}
-	if err := logFooterTemplate.Execute(w, map[string]interface{}{
+	if err := logFooterTemplate.Execute(w, map[string]any{
 		"Count":    count,
 		"TimeSpan": fmt.Sprintf("%.1f", d.Minutes()),
 	}); err != nil {

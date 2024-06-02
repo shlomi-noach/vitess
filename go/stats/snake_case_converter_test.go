@@ -1,5 +1,5 @@
 /*
-Copyright 2018 The Vitess Authors.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,7 +16,9 @@ limitations under the License.
 
 package stats
 
-import "testing"
+import (
+	"testing"
+)
 
 func TestToSnakeCase(t *testing.T) {
 	var snakeCaseTest = []struct{ input, output string }{
@@ -34,7 +36,7 @@ func TestToSnakeCase(t *testing.T) {
 	}
 
 	for _, tt := range snakeCaseTest {
-		if got, want := toSnakeCase(tt.input), tt.output; got != want {
+		if got, want := GetSnakeName(tt.input), tt.output; got != want {
 			t.Errorf("want '%s', got '%s'", want, got)
 		}
 	}

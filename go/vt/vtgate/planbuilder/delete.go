@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,108 +17,119 @@ limitations under the License.
 package planbuilder
 
 import (
-	"errors"
-
+	querypb "vitess.io/vitess/go/vt/proto/query"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/engine"
+	"vitess.io/vitess/go/vt/vtgate/planbuilder/operators"
+	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
 	"vitess.io/vitess/go/vt/vtgate/vindexes"
-
-	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
-	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
-// buildDeletePlan builds the instructions for a DELETE statement.
-func buildDeletePlan(del *sqlparser.Delete, vschema ContextVSchema) (*engine.Delete, error) {
-	edel := &engine.Delete{
-		Query: generateQuery(del),
+func gen4DeleteStmtPlanner(
+	version querypb.ExecuteOptions_PlannerVersion,
+	deleteStmt *sqlparser.Delete,
+	reservedVars *sqlparser.ReservedVars,
+	vschema plancontext.VSchema,
+) (*planResult, error) {
+	if deleteStmt.With != nil {
+		return nil, vterrors.VT12001("WITH expression in DELETE statement")
 	}
-	pb := newPrimitiveBuilder(vschema, newJointab(sqlparser.GetBindvars(del)))
-	if err := pb.processTableExprs(del.TableExprs); err != nil {
-		return nil, err
-	}
-	rb, ok := pb.bldr.(*route)
-	if !ok {
-		return nil, errors.New("unsupported: multi-table delete statement in sharded keyspace")
-	}
-	edel.Keyspace = rb.ERoute.Keyspace
-	if !edel.Keyspace.Sharded {
-		// We only validate non-table subexpressions because the previous analysis has already validated them.
-		if !pb.validateSubquerySamePlan(del.Targets, del.Where, del.OrderBy, del.Limit) {
-			return nil, errors.New("unsupported: sharded subqueries in DML")
+
+	var err error
+	if len(deleteStmt.TableExprs) == 1 && len(deleteStmt.Targets) == 1 {
+		deleteStmt, err = rewriteSingleTbl(deleteStmt)
+		if err != nil {
+			return nil, err
 		}
-		edel.Opcode = engine.DeleteUnsharded
-		return edel, nil
 	}
-	if del.Targets != nil || len(pb.st.tables) != 1 {
-		return nil, errors.New("unsupported: multi-table delete statement in sharded keyspace")
-	}
-	if hasSubquery(del) {
-		return nil, errors.New("unsupported: subqueries in sharded DML")
-	}
-	var tableName sqlparser.TableName
-	for t := range pb.st.tables {
-		tableName = t
-	}
-	table, _, destTabletType, destTarget, err := vschema.FindTable(tableName)
+
+	ctx, err := plancontext.CreatePlanningContext(deleteStmt, reservedVars, vschema, version)
 	if err != nil {
 		return nil, err
 	}
-	edel.Table = table
 
-	directives := sqlparser.ExtractCommentDirectives(del.Comments)
-	if directives.IsSet(sqlparser.DirectiveMultiShardAutocommit) {
-		edel.MultiShardAutocommit = true
-	}
-
-	if destTarget != nil {
-		if destTabletType != topodatapb.TabletType_MASTER {
-			return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unsupported: DELETE statement with a replica target")
-		}
-		edel.Opcode = engine.DeleteByDestination
-		edel.TargetDestination = destTarget
-		return edel, nil
-	}
-	edel.Vindex, edel.Values, err = getDMLRouting(del.Where, edel.Table)
-	// We couldn't generate a route for a single shard
-	// Execute a delete sharded
+	err = queryRewrite(ctx, deleteStmt)
 	if err != nil {
-		edel.Opcode = engine.DeleteScatter
-	} else {
-		edel.Opcode = engine.DeleteEqual
+		return nil, err
 	}
 
-	if edel.Opcode == engine.DeleteScatter {
-		if len(edel.Table.Owned) != 0 {
-			return edel, errors.New("unsupported: multi shard delete on a table with owned lookup vindexes")
-		}
-		if del.Limit != nil {
-			return edel, errors.New("unsupported: multi shard delete with limit")
+	// Remove all the foreign keys that don't require any handling.
+	err = ctx.SemTable.RemoveNonRequiredForeignKeys(ctx.VerifyAllFKs, vindexes.DeleteAction)
+	if err != nil {
+		return nil, err
+	}
+
+	if ks, tables := ctx.SemTable.SingleUnshardedKeyspace(); ks != nil {
+		if !ctx.SemTable.ForeignKeysPresent() {
+			plan := deleteUnshardedShortcut(deleteStmt, ks, tables)
+			return newPlanResult(plan, operators.QualifiedTables(ks, tables)...), nil
 		}
 	}
 
-	edel.OwnedVindexQuery = generateDeleteSubquery(del, edel.Table)
-	return edel, nil
+	// error out here if delete query cannot bypass the planner and
+	// planner cannot plan such query due to different reason like missing full information, etc.
+	if ctx.SemTable.NotUnshardedErr != nil {
+		return nil, ctx.SemTable.NotUnshardedErr
+	}
+
+	op, err := operators.PlanQuery(ctx, deleteStmt)
+	if err != nil {
+		return nil, err
+	}
+
+	plan, err := transformToPrimitive(ctx, op)
+	if err != nil {
+		return nil, err
+	}
+
+	return newPlanResult(plan, operators.TablesUsed(op)...), nil
 }
 
-// generateDeleteSubquery generates the query to fetch the rows
-// that will be deleted. This allows VTGate to clean up any
-// owned vindexes as needed.
-func generateDeleteSubquery(del *sqlparser.Delete, table *vindexes.Table) string {
-	if len(table.Owned) == 0 {
-		return ""
+func rewriteSingleTbl(del *sqlparser.Delete) (*sqlparser.Delete, error) {
+	atExpr, ok := del.TableExprs[0].(*sqlparser.AliasedTableExpr)
+	if !ok {
+		return del, nil
 	}
-	buf := sqlparser.NewTrackedBuffer(nil)
-	buf.WriteString("select ")
-	for vIdx, cv := range table.Owned {
-		for cIdx, column := range cv.Columns {
-			if cIdx == 0 && vIdx == 0 {
-				buf.Myprintf("%v", column)
-			} else {
-				buf.Myprintf(", %v", column)
+	if atExpr.As.NotEmpty() && !sqlparser.Equals.IdentifierCS(del.Targets[0].Name, atExpr.As) {
+		// Unknown table in MULTI DELETE
+		return nil, vterrors.VT03003(del.Targets[0].Name.String())
+	}
+
+	tbl, ok := atExpr.Expr.(sqlparser.TableName)
+	if !ok {
+		// derived table
+		return nil, vterrors.VT03004(atExpr.As.String())
+	}
+	if atExpr.As.IsEmpty() && !sqlparser.Equals.IdentifierCS(del.Targets[0].Name, tbl.Name) {
+		// Unknown table in MULTI DELETE
+		return nil, vterrors.VT03003(del.Targets[0].Name.String())
+	}
+
+	del.TableExprs = sqlparser.TableExprs{&sqlparser.AliasedTableExpr{Expr: tbl}}
+	del.Targets = nil
+	if del.Where != nil {
+		_ = sqlparser.Walk(func(node sqlparser.SQLNode) (kontinue bool, err error) {
+			col, ok := node.(*sqlparser.ColName)
+			if !ok {
+				return true, nil
 			}
-		}
+			if !col.Qualifier.IsEmpty() {
+				col.Qualifier = tbl
+			}
+			return true, nil
+		}, del.Where)
 	}
-	buf.Myprintf(" from %v%v for update", table.Name, del.Where)
-	return buf.String()
+	return del, nil
+}
+
+func deleteUnshardedShortcut(stmt *sqlparser.Delete, ks *vindexes.Keyspace, tables []*vindexes.Table) engine.Primitive {
+	edml := engine.NewDML()
+	edml.Keyspace = ks
+	edml.Opcode = engine.Unsharded
+	edml.Query = generateQuery(stmt)
+	for _, tbl := range tables {
+		edml.TableNames = append(edml.TableNames, tbl.Name.String())
+	}
+	return &engine.Delete{DML: edml}
 }

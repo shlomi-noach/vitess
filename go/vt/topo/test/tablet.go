@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -17,21 +17,18 @@ limitations under the License.
 package test
 
 import (
+	"context"
 	"testing"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	"google.golang.org/protobuf/proto"
 
 	"vitess.io/vitess/go/vt/topo"
-	"vitess.io/vitess/go/vt/topo/topoproto"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 // checkTablet verifies the topo server API is correct for managing tablets.
-func checkTablet(t *testing.T, ts *topo.Server) {
-	ctx := context.Background()
-
+func checkTablet(t *testing.T, ctx context.Context, ts *topo.Server) {
 	tablet := &topodatapb.Tablet{
 		Alias: &topodatapb.TabletAlias{
 			Cell: LocalCellName,
@@ -45,10 +42,10 @@ func checkTablet(t *testing.T, ts *topo.Server) {
 
 		Tags:     map[string]string{"tag": "value"},
 		Keyspace: "test_keyspace",
-		Type:     topodatapb.TabletType_MASTER,
+		Type:     topodatapb.TabletType_PRIMARY,
 		KeyRange: newKeyRange("-10"),
 	}
-	topoproto.SetMysqlPort(tablet, 3334)
+	tablet.MysqlPort = 3334
 	if err := ts.CreateTablet(ctx, tablet); err != nil {
 		t.Fatalf("CreateTablet: %v", err)
 	}
@@ -71,11 +68,11 @@ func checkTablet(t *testing.T, ts *topo.Server) {
 		t.Errorf("put and got tablets are not identical:\n%#v\n%#v", tablet, t)
 	}
 
-	if _, err := ts.GetTabletsByCell(ctx, "666"); !topo.IsErrType(err, topo.NoNode) {
+	if _, err := ts.GetTabletAliasesByCell(ctx, "666"); !topo.IsErrType(err, topo.NoNode) {
 		t.Errorf("GetTabletsByCell(666): %v", err)
 	}
 
-	inCell, err := ts.GetTabletsByCell(ctx, LocalCellName)
+	inCell, err := ts.GetTabletAliasesByCell(ctx, LocalCellName)
 	if err != nil {
 		t.Fatalf("GetTabletsByCell: %v", err)
 	}

@@ -1,5 +1,7 @@
+//go:build !windows
+
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -30,13 +32,13 @@ func TestReparentSyslog(t *testing.T) {
 	wantSev, wantMsg := syslog.LOG_INFO, "keyspace-123/shard-123 [reparent cell-0000012345 -> cell-0000054321] status (123-456-789)"
 	tc := &Reparent{
 		ShardInfo: *topo.NewShardInfo("keyspace-123", "shard-123", nil, nil),
-		OldMaster: topodatapb.Tablet{
+		OldPrimary: &topodatapb.Tablet{
 			Alias: &topodatapb.TabletAlias{
 				Cell: "cell",
 				Uid:  12345,
 			},
 		},
-		NewMaster: topodatapb.Tablet{
+		NewPrimary: &topodatapb.Tablet{
 			Alias: &topodatapb.TabletAlias{
 				Cell: "cell",
 				Uid:  54321,

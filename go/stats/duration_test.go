@@ -1,5 +1,5 @@
 /*
-Copyright 2018 The Vitess Authors
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@ import (
 func TestCounterDuration(t *testing.T) {
 	var gotname string
 	var gotv *CounterDuration
-	clear()
+	clearStats()
 	Register(func(name string, v expvar.Var) {
 		gotname = name
 		gotv = v.(*CounterDuration)
@@ -52,7 +52,7 @@ func TestCounterDuration(t *testing.T) {
 func TestCounterDurationFunc(t *testing.T) {
 	var gotname string
 	var gotv *CounterDurationFunc
-	clear()
+	clearStats()
 	Register(func(name string, v expvar.Var) {
 		gotname = name
 		gotv = v.(*CounterDurationFunc)
@@ -75,7 +75,7 @@ func TestCounterDurationFunc(t *testing.T) {
 func TestGaugeDuration(t *testing.T) {
 	var gotname string
 	var gotv *GaugeDuration
-	clear()
+	clearStats()
 	Register(func(name string, v expvar.Var) {
 		gotname = name
 		gotv = v.(*GaugeDuration)
@@ -103,7 +103,7 @@ func TestGaugeDuration(t *testing.T) {
 func TestGaugeDurationFunc(t *testing.T) {
 	var gotname string
 	var gotv *GaugeDurationFunc
-	clear()
+	clearStats()
 	Register(func(name string, v expvar.Var) {
 		gotname = name
 		gotv = v.(*GaugeDurationFunc)

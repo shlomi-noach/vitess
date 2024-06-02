@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,10 +22,8 @@ const (
 <table style="vertical-align: middle; width: 100%">
 <tr>
 <td width="50%">
-  <div>
   <!-- The div in the next line will be overwritten by the JavaScript graph. -->
-    <div id="qps_chart">QPS</div>
-  </div>
+    <div id="qps_chart" style="height: 500px; width: 900px;">QPS</div>
 </td>
 
 <td width="50%" style="padding: 20px;">
@@ -33,15 +31,14 @@ const (
   <a href="/debug/querylogz">Current Query Log</a><br>
   <a href="/debug/queryz">Query Plan Stats</a><br>
   <a href="/debug/query_plans">Query Plans</a><br>
+  <a href="/debug/scatter_stats">Scatter Query Statistics</a><br>
 </td>
 </tr>
 </table>
 
-
-<script type="text/javascript" src="https://www.google.com/jsapi"></script>
+<script src="https://www.gstatic.com/charts/loader.js"></script>
 <script type="text/javascript">
 
-google.load("jquery", "1.4.0");
 google.load("visualization", "1", {packages:["corechart"]});
 
 function sampleDate(d, i) {
@@ -51,7 +48,7 @@ function sampleDate(d, i) {
 }
 
 function drawQPSChart() {
-  var div = $('#qps_chart').height(500).width(900).unwrap()[0]
+  var div = document.getElementById("qps_chart")
   var chart = new google.visualization.LineChart(div);
 
   var options = {
@@ -70,8 +67,9 @@ function drawQPSChart() {
     vars_url = window.location.pathname.substring(0, pos) + vars_url;
   }
 
-  var redraw = function() {
-    $.getJSON(vars_url, function(input_data) {
+  const redraw = () => fetch(vars_url)
+  .then(async (response) => {
+      const input_data = await response.json();
       var now = new Date();
       var qps = input_data.QPSByDbType;
       var planTypes = Object.keys(qps);
@@ -94,15 +92,14 @@ function drawQPSChart() {
           	var idx = qps[planTypes[j]].length - i - 1;
             datum.push(+qps[planTypes[j]][idx].toFixed(2));
           } else {
-            // Assume 0.0 QPS for older, non-existant data points.
+            // Assume 0.0 QPS for older, non-existent data points.
             datum.push(0);
           }
         }
         data.push(datum)
       }
       chart.draw(google.visualization.arrayToDataTable(data), options);
-    })
-  };
+  })
 
   redraw();
 

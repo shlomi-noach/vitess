@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -19,8 +19,9 @@ package etcd2topo
 import (
 	"path"
 
-	"github.com/coreos/etcd/clientv3"
-	"golang.org/x/net/context"
+	"context"
+
+	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"vitess.io/vitess/go/vt/topo"
 )
@@ -85,6 +86,43 @@ func (s *Server) Get(ctx context.Context, filePath string) ([]byte, topo.Version
 	}
 
 	return resp.Kvs[0].Value, EtcdVersion(resp.Kvs[0].ModRevision), nil
+}
+
+// GetVersion is part of the topo.Conn interface.
+func (s *Server) GetVersion(ctx context.Context, filePath string, version int64) ([]byte, error) {
+	nodePath := path.Join(s.root, filePath)
+
+	resp, err := s.cli.Get(ctx, nodePath, clientv3.WithRev(version))
+	if err != nil {
+		return nil, convertError(err, nodePath)
+	}
+	if len(resp.Kvs) != 1 {
+		return nil, topo.NewError(topo.NoNode, nodePath)
+	}
+
+	return resp.Kvs[0].Value, nil
+}
+
+// List is part of the topo.Conn interface.
+func (s *Server) List(ctx context.Context, filePathPrefix string) ([]topo.KVInfo, error) {
+	nodePathPrefix := path.Join(s.root, filePathPrefix)
+
+	resp, err := s.cli.Get(ctx, nodePathPrefix, clientv3.WithPrefix())
+	if err != nil {
+		return []topo.KVInfo{}, err
+	}
+	pairs := resp.Kvs
+	if len(pairs) == 0 {
+		return []topo.KVInfo{}, topo.NewError(topo.NoNode, nodePathPrefix)
+	}
+	results := make([]topo.KVInfo, len(pairs))
+	for n := range pairs {
+		results[n].Key = pairs[n].Key
+		results[n].Value = pairs[n].Value
+		results[n].Version = EtcdVersion(pairs[n].ModRevision)
+	}
+
+	return results, nil
 }
 
 // Delete is part of the topo.Conn interface.

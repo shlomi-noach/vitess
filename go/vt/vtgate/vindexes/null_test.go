@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,49 +17,92 @@ limitations under the License.
 package vindexes
 
 import (
+	"context"
 	"reflect"
-	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
 )
 
-var null Vindex
+var null SingleColumn
 
 func init() {
-	hv, err := CreateVindex("null", "nn", map[string]string{"Table": "t", "Column": "c"})
+	hv, err := CreateVindex("null", "nn", map[string]string{})
 	if err != nil {
 		panic(err)
 	}
-	null = hv
+	unknownParams := hv.(ParamValidating).UnknownParams()
+	if len(unknownParams) > 0 {
+		panic("null test init: expected 0 unknown params")
+	}
+	null = hv.(SingleColumn)
 }
 
-func TestNullCost(t *testing.T) {
-	if null.Cost() != 0 {
-		t.Errorf("Cost(): %d, want 0", null.Cost())
+func nullCreateVindexTestCase(
+	testName string,
+	vindexParams map[string]string,
+	expectErr error,
+	expectUnknownParams []string,
+) createVindexTestCase {
+	return createVindexTestCase{
+		testName: testName,
+
+		vindexType:   "null",
+		vindexName:   "null",
+		vindexParams: vindexParams,
+
+		expectCost:          100,
+		expectErr:           expectErr,
+		expectIsUnique:      true,
+		expectNeedsVCursor:  false,
+		expectString:        "null",
+		expectUnknownParams: expectUnknownParams,
 	}
 }
 
-func TestNullString(t *testing.T) {
-	if strings.Compare("nn", null.String()) != 0 {
-		t.Errorf("String(): %s, want null", null.String())
+func TestNullCreateVindex(t *testing.T) {
+	cases := []createVindexTestCase{
+		nullCreateVindexTestCase(
+			"no params",
+			nil,
+			nil,
+			nil,
+		),
+		nullCreateVindexTestCase(
+			"empty params",
+			map[string]string{},
+			nil,
+			nil,
+		),
+		nullCreateVindexTestCase(
+			"unknown params",
+			map[string]string{"hello": "world"},
+			nil,
+			[]string{"hello"},
+		),
 	}
+
+	testCreateVindexes(t, cases)
 }
 
 func TestNullMap(t *testing.T) {
-	got, err := null.Map(nil, []sqltypes.Value{
+	got, err := null.Map(context.Background(), nil, []sqltypes.Value{
 		sqltypes.NewInt64(1),
 		sqltypes.NewInt64(2),
 		sqltypes.NewInt64(3),
 		sqltypes.NewInt64(4),
 		sqltypes.NewInt64(5),
 		sqltypes.NewInt64(6),
+		sqltypes.NewVarChar("1234567890123"),
+		sqltypes.NULL,
 	})
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	want := []key.Destination{
+		key.DestinationKeyspaceID([]byte{0}),
+		key.DestinationKeyspaceID([]byte{0}),
 		key.DestinationKeyspaceID([]byte{0}),
 		key.DestinationKeyspaceID([]byte{0}),
 		key.DestinationKeyspaceID([]byte{0}),
@@ -75,12 +118,12 @@ func TestNullMap(t *testing.T) {
 func TestNullVerify(t *testing.T) {
 	ids := []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)}
 	ksids := [][]byte{{0}, {1}}
-	got, err := null.Verify(nil, ids, ksids)
+	got, err := null.Verify(context.Background(), nil, ids, ksids)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := []bool{true, false}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("binaryMD5.Verify: %v, want %v", got, want)
+		t.Errorf("null.Verify: %v, want %v", got, want)
 	}
 }

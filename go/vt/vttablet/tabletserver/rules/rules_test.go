@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,8 +23,12 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
 
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/planbuilder"
 
@@ -81,7 +85,7 @@ func TestQueryRules(t *testing.T) {
 func TestCopy(t *testing.T) {
 	qrs1 := New()
 	qr1 := NewQueryRule("rule 1", "r1", QRFail)
-	qr1.AddPlanCond(planbuilder.PlanPassSelect)
+	qr1.AddPlanCond(planbuilder.PlanSelect)
 	qr1.AddTableCond("aa")
 	qr1.AddBindVarCond("a", true, false, QRNoOp, nil)
 
@@ -107,12 +111,12 @@ func TestFilterByPlan(t *testing.T) {
 	qr1 := NewQueryRule("rule 1", "r1", QRFail)
 	qr1.SetIPCond("123")
 	qr1.SetQueryCond("select")
-	qr1.AddPlanCond(planbuilder.PlanPassSelect)
+	qr1.AddPlanCond(planbuilder.PlanSelect)
 	qr1.AddBindVarCond("a", true, false, QRNoOp, nil)
 
 	qr2 := NewQueryRule("rule 2", "r2", QRFail)
-	qr2.AddPlanCond(planbuilder.PlanPassSelect)
-	qr2.AddPlanCond(planbuilder.PlanSelectLock)
+	qr2.AddPlanCond(planbuilder.PlanSelect)
+	qr2.AddPlanCond(planbuilder.PlanSelect)
 	qr2.AddBindVarCond("a", true, false, QRNoOp, nil)
 
 	qr3 := NewQueryRule("rule 3", "r3", QRFail)
@@ -128,7 +132,7 @@ func TestFilterByPlan(t *testing.T) {
 	qrs.Add(qr3)
 	qrs.Add(qr4)
 
-	qrs1 := qrs.FilterByPlan("select", planbuilder.PlanPassSelect, "a")
+	qrs1 := qrs.FilterByPlan("select", planbuilder.PlanSelect, "a")
 	want := compacted(`[{
 		"Description":"rule 1",
 		"Name":"r1",
@@ -163,7 +167,7 @@ func TestFilterByPlan(t *testing.T) {
 		t.Errorf("qrs1:\n%s, want\n%s", got, want)
 	}
 
-	qrs1 = qrs.FilterByPlan("insert", planbuilder.PlanPassSelect, "a")
+	qrs1 = qrs.FilterByPlan("insert", planbuilder.PlanSelect, "a")
 	want = compacted(`[{
 		"Description":"rule 2",
 		"Name":"r2",
@@ -178,14 +182,51 @@ func TestFilterByPlan(t *testing.T) {
 	if got != want {
 		t.Errorf("qrs1:\n%s, want\n%s", got, want)
 	}
+	{
+		// test multiple tables:
+		qrs1 := qrs.FilterByPlan("insert", planbuilder.PlanSelect, "a", "other_table")
+		want := compacted(`[{
+			"Description":"rule 2",
+			"Name":"r2",
+			"BindVarConds":[{
+				"Name":"a",
+				"OnAbsent":true,
+				"Operator":""
+			}],
+			"Action":"FAIL"
+		}]`)
+		got = marshalled(qrs1)
+		if got != want {
+			t.Errorf("qrs1:\n%s, want\n%s", got, want)
+		}
 
-	qrs1 = qrs.FilterByPlan("insert", planbuilder.PlanSelectLock, "a")
+	}
+	{
+		// test multiple tables:
+		qrs1 := qrs.FilterByPlan("insert", planbuilder.PlanSelect, "other_table", "a")
+		want := compacted(`[{
+			"Description":"rule 2",
+			"Name":"r2",
+			"BindVarConds":[{
+				"Name":"a",
+				"OnAbsent":true,
+				"Operator":""
+			}],
+			"Action":"FAIL"
+		}]`)
+		got = marshalled(qrs1)
+		if got != want {
+			t.Errorf("qrs1:\n%s, want\n%s", got, want)
+		}
+	}
+
+	qrs1 = qrs.FilterByPlan("insert", planbuilder.PlanSelect, "a")
 	got = marshalled(qrs1)
 	if got != want {
 		t.Errorf("qrs1:\n%s, want\n%s", got, want)
 	}
 
-	qrs1 = qrs.FilterByPlan("select", planbuilder.PlanInsertPK, "a")
+	qrs1 = qrs.FilterByPlan("select", planbuilder.PlanInsert, "a")
 	want = compacted(`[{
 		"Description":"rule 3",
 		"Name":"r3",
@@ -201,12 +242,12 @@ func TestFilterByPlan(t *testing.T) {
 		t.Errorf("qrs1:\n%s, want\n%s", got, want)
 	}
 
-	qrs1 = qrs.FilterByPlan("sel", planbuilder.PlanInsertPK, "a")
+	qrs1 = qrs.FilterByPlan("sel", planbuilder.PlanInsert, "a")
 	if qrs1.rules != nil {
 		t.Errorf("want nil, got non-nil")
 	}
 
-	qrs1 = qrs.FilterByPlan("table", planbuilder.PlanPassDML, "b")
+	qrs1 = qrs.FilterByPlan("table", planbuilder.PlanInsert, "b")
 	want = compacted(`[{
 		"Description":"rule 4",
 		"Name":"r4",
@@ -220,7 +261,7 @@ func TestFilterByPlan(t *testing.T) {
 	qr5 := NewQueryRule("rule 5", "r5", QRFail)
 	qrs.Add(qr5)
 
-	qrs1 = qrs.FilterByPlan("sel", planbuilder.PlanInsertPK, "a")
+	qrs1 = qrs.FilterByPlan("sel", planbuilder.PlanInsert, "a")
 	want = compacted(`[{
 		"Description":"rule 5",
 		"Name":"r5",
@@ -232,7 +273,7 @@ func TestFilterByPlan(t *testing.T) {
 	}
 
 	qrsnil1 := New()
-	if qrsnil2 := qrsnil1.FilterByPlan("", planbuilder.PlanPassSelect, "a"); qrsnil2.rules != nil {
+	if qrsnil2 := qrsnil1.FilterByPlan("", planbuilder.PlanSelect, "a"); qrsnil2.rules != nil {
 		t.Errorf("want nil, got non-nil")
 	}
 }
@@ -257,13 +298,13 @@ func TestQueryRule(t *testing.T) {
 		t.Errorf("want error")
 	}
 
-	qr.AddPlanCond(planbuilder.PlanPassSelect)
-	qr.AddPlanCond(planbuilder.PlanInsertPK)
+	qr.AddPlanCond(planbuilder.PlanSelect)
+	qr.AddPlanCond(planbuilder.PlanInsert)
 
-	if qr.plans[0] != planbuilder.PlanPassSelect {
+	if qr.plans[0] != planbuilder.PlanSelect {
 		t.Errorf("want PASS_SELECT, got %s", qr.plans[0].String())
 	}
-	if qr.plans[1] != planbuilder.PlanInsertPK {
+	if qr.plans[1] != planbuilder.PlanInsert {
 		t.Errorf("want INSERT_PK, got %s", qr.plans[1].String())
 	}
 
@@ -276,8 +317,10 @@ func TestQueryRule(t *testing.T) {
 func TestBindVarStruct(t *testing.T) {
 	qr := NewQueryRule("rule 1", "r1", QRFail)
 
-	var err error
-	err = qr.AddBindVarCond("b", false, true, QRNoOp, nil)
+	err := qr.AddBindVarCond("b", false, true, QRNoOp, nil)
+	if err != nil {
+		t.Errorf("unexpected: %v", err)
+	}
 	err = qr.AddBindVarCond("a", true, false, QRNoOp, nil)
 	if err != nil {
 		t.Errorf("unexpected: %v", err)
@@ -304,7 +347,7 @@ type BVCreation struct {
 	onAbsent   bool
 	onMismatch bool
 	op         Operator
-	value      interface{}
+	value      any
 	expecterr  bool
 }
 
@@ -494,32 +537,53 @@ func TestAction(t *testing.T) {
 
 	bv := make(map[string]*querypb.BindVariable)
 	bv["a"] = sqltypes.Uint64BindVariable(0)
-	action, desc := qrs.GetAction("123", "user1", bv)
-	if action != QRFail {
-		t.Errorf("want fail")
+
+	mc := sqlparser.MarginComments{
+		Leading:  "some comments leading the query",
+		Trailing: "other trailing comments",
 	}
-	if desc != "rule 1" {
-		t.Errorf("want rule 1, got %s", desc)
-	}
-	action, desc = qrs.GetAction("1234", "user", bv)
-	if action != QRFailRetry {
-		t.Errorf("want fail_retry")
-	}
-	if desc != "rule 2" {
-		t.Errorf("want rule 2, got %s", desc)
-	}
-	action, desc = qrs.GetAction("1234", "user1", bv)
-	if action != QRContinue {
-		t.Errorf("want continue")
-	}
+
+	action, cancelCtx, timeout, desc := qrs.GetAction("123", "user1", bv, mc)
+	assert.Equalf(t, action, QRFail, "expected fail, got %v", action)
+	assert.Equalf(t, timeout, time.Duration(0), "expected zero timeout")
+	assert.Equalf(t, desc, "rule 1", "want rule 1, got %s", desc)
+	assert.Nil(t, cancelCtx)
+
+	action, cancelCtx, timeout, desc = qrs.GetAction("1234", "user", bv, mc)
+	assert.Equalf(t, action, QRFailRetry, "want fail_retry, got: %s", action)
+	assert.Equalf(t, timeout, time.Duration(0), "expected zero timeout")
+	assert.Equalf(t, desc, "rule 2", "want rule 2, got %s", desc)
+	assert.Nil(t, cancelCtx)
+
+	action, _, _, _ = qrs.GetAction("1234", "user1", bv, mc)
+	assert.Equalf(t, action, QRContinue, "want continue, got %s", action)
+
 	bv["a"] = sqltypes.Uint64BindVariable(1)
-	action, desc = qrs.GetAction("1234", "user1", bv)
-	if action != QRFail {
-		t.Errorf("want fail")
-	}
-	if desc != "rule 3" {
-		t.Errorf("want rule 2, got %s", desc)
-	}
+	action, _, _, desc = qrs.GetAction("1234", "user1", bv, mc)
+	assert.Equalf(t, action, QRFail, "want fail, got %s", action)
+	assert.Equalf(t, desc, "rule 3", "want rule 3, got %s", desc)
+
+	// reset bound variable 'a' to 0 so it doesn't match rule 3
+	bv["a"] = sqltypes.Uint64BindVariable(0)
+
+	qr4 := NewQueryRule("rule 4", "r4", QRFail)
+	qr4.SetTrailingCommentCond(".*trailing.*")
+
+	newQrs := qrs.Copy()
+	newQrs.Add(qr4)
+
+	action, _, _, desc = newQrs.GetAction("1234", "user1", bv, mc)
+	assert.Equalf(t, action, QRFail, "want fail, got %s", action)
+	assert.Equalf(t, desc, "rule 4", "want rule 4, got %s", desc)
+
+	qr5 := NewQueryRule("rule 5", "r4", QRFail)
+	qr5.SetLeadingCommentCond(".*leading.*")
+
+	newQrs = qrs.Copy()
+	newQrs.Add(qr5)
+	action, _, _, desc = newQrs.GetAction("1234", "user1", bv, mc)
+	assert.Equalf(t, action, QRFail, "want fail, got %s", action)
+	assert.Equalf(t, desc, "rule 5", "want rule 5, got %s", desc)
 }
 
 func TestImport(t *testing.T) {
@@ -530,7 +594,7 @@ func TestImport(t *testing.T) {
 		"RequestIP": "123.123.123",
 		"User": "user",
 		"Query": "query",
-		"Plans": ["PASS_SELECT", "INSERT_PK"],
+		"Plans": ["Select", "Insert"],
 		"TableNames":["a", "b"],
 		"BindVarConds": [{
 			"Name": "bvname1",
@@ -693,7 +757,7 @@ func TestInvalidJSON(t *testing.T) {
 }
 
 func TestBuildQueryRuleActionFail(t *testing.T) {
-	var ruleInfo map[string]interface{}
+	var ruleInfo map[string]any
 	err := json.Unmarshal([]byte(`{"Action": "FAIL" }`), &ruleInfo)
 	if err != nil {
 		t.Fatalf("failed to unmarshal json, got error: %v", err)
@@ -741,7 +805,7 @@ func compacted(in string) string {
 	return dst.String()
 }
 
-func marshalled(in interface{}) string {
+func marshalled(in any) string {
 	b, err := json.Marshal(in)
 	if err != nil {
 		panic(err)

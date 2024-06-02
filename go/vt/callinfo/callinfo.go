@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -19,9 +19,9 @@ limitations under the License.
 package callinfo
 
 import (
-	"html/template"
+	"context"
 
-	"golang.org/x/net/context"
+	"github.com/google/safehtml"
 )
 
 // CallInfo is the extra data stored in the Context
@@ -36,7 +36,7 @@ type CallInfo interface {
 	Text() string
 
 	// HTML represents this rpc call connection in a web-friendly way.
-	HTML() template.HTML
+	HTML() safehtml.HTML
 }
 
 // internal type and value
@@ -57,8 +57,8 @@ func FromContext(ctx context.Context) (CallInfo, bool) {
 
 // HTMLFromContext returns that value of HTML() from the context, or "" if we're
 // not able to recover one
-func HTMLFromContext(ctx context.Context) template.HTML {
-	var h template.HTML
+func HTMLFromContext(ctx context.Context) safehtml.HTML {
+	var h safehtml.HTML
 	ci, ok := FromContext(ctx)
 	if ok {
 		return ci.HTML()

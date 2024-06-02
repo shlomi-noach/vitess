@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ limitations under the License.
 package tabletenv
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/url"
@@ -24,7 +25,7 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
+	"github.com/google/safehtml/testconversions"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/streamlog"
@@ -49,43 +50,46 @@ func TestLogStats(t *testing.T) {
 	if logStats.SizeOfResponse() <= 0 {
 		t.Fatalf("log stats has some rows, should have positive response size")
 	}
+}
 
-	params := map[string][]string{"full": {}}
-
-	logStats.Format(url.Values(params))
+func testFormat(stats *LogStats, params url.Values) string {
+	var b strings.Builder
+	stats.Logf(&b, params)
+	return b.String()
 }
 
 func TestLogStatsFormat(t *testing.T) {
 	logStats := NewLogStats(context.Background(), "test")
 	logStats.StartTime = time.Date(2017, time.January, 1, 1, 2, 3, 0, time.UTC)
-	logStats.EndTime = time.Date(2017, time.January, 1, 1, 2, 4, 0, time.UTC)
+	logStats.EndTime = time.Date(2017, time.January, 1, 1, 2, 4, 1234, time.UTC)
 	logStats.OriginalSQL = "sql"
 	logStats.BindVariables = map[string]*querypb.BindVariable{"intVal": sqltypes.Int64BindVariable(1)}
 	logStats.AddRewrittenSQL("sql with pii", time.Now())
 	logStats.MysqlResponseTime = 0
+	logStats.TransactionID = 12345
 	logStats.Rows = [][]sqltypes.Value{{sqltypes.NewVarBinary("a")}}
 	params := map[string][]string{"full": {}}
 
-	*streamlog.RedactDebugUIQueries = false
-	*streamlog.QueryLogFormat = "text"
-	got := logStats.Format(url.Values(params))
-	want := "test\t\t\t''\t''\tJan  1 01:02:03.000000\tJan  1 01:02:04.000000\t1.000000\t\t\"sql\"\tmap[intVal:type:INT64 value:\"1\" ]\t1\t\"sql with pii\"\tmysql\t0.000000\t0.000000\t0\t1\t\"\"\t\n"
+	streamlog.SetRedactDebugUIQueries(false)
+	streamlog.SetQueryLogFormat("text")
+	got := testFormat(logStats, url.Values(params))
+	want := "test\t\t\t''\t''\t2017-01-01 01:02:03.000000\t2017-01-01 01:02:04.000001\t1.000001\t\t\"sql\"\t{\"intVal\": {\"type\": \"INT64\", \"value\": 1}}\t1\t\"sql with pii\"\tmysql\t0.000000\t0.000000\t0\t12345\t1\t\"\"\t\n"
 	if got != want {
 		t.Errorf("logstats format: got:\n%q\nwant:\n%q\n", got, want)
 	}
 
-	*streamlog.RedactDebugUIQueries = true
-	*streamlog.QueryLogFormat = "text"
-	got = logStats.Format(url.Values(params))
-	want = "test\t\t\t''\t''\tJan  1 01:02:03.000000\tJan  1 01:02:04.000000\t1.000000\t\t\"sql\"\t\"[REDACTED]\"\t1\t\"[REDACTED]\"\tmysql\t0.000000\t0.000000\t0\t1\t\"\"\t\n"
+	streamlog.SetRedactDebugUIQueries(true)
+	streamlog.SetQueryLogFormat("text")
+	got = testFormat(logStats, url.Values(params))
+	want = "test\t\t\t''\t''\t2017-01-01 01:02:03.000000\t2017-01-01 01:02:04.000001\t1.000001\t\t\"sql\"\t\"[REDACTED]\"\t1\t\"[REDACTED]\"\tmysql\t0.000000\t0.000000\t0\t12345\t1\t\"\"\t\n"
 	if got != want {
 		t.Errorf("logstats format: got:\n%q\nwant:\n%q\n", got, want)
 	}
 
-	*streamlog.RedactDebugUIQueries = false
-	*streamlog.QueryLogFormat = "json"
-	got = logStats.Format(url.Values(params))
-	var parsed map[string]interface{}
+	streamlog.SetRedactDebugUIQueries(false)
+	streamlog.SetQueryLogFormat("json")
+	got = testFormat(logStats, url.Values(params))
+	var parsed map[string]any
 	err := json.Unmarshal([]byte(got), &parsed)
 	if err != nil {
 		t.Errorf("logstats format: error unmarshaling json: %v -- got:\n%v", err, got)
@@ -94,14 +98,14 @@ func TestLogStatsFormat(t *testing.T) {
 	if err != nil {
 		t.Errorf("logstats format: error marshaling json: %v -- got:\n%v", err, got)
 	}
-	want = "{\n    \"BindVars\": {\n        \"intVal\": {\n            \"type\": \"INT64\",\n            \"value\": 1\n        }\n    },\n    \"ConnWaitTime\": 0,\n    \"Effective Caller\": \"\",\n    \"End\": \"Jan  1 01:02:04.000000\",\n    \"Error\": \"\",\n    \"ImmediateCaller\": \"\",\n    \"Method\": \"test\",\n    \"MysqlTime\": 0,\n    \"OriginalSQL\": \"sql\",\n    \"PlanType\": \"\",\n    \"Queries\": 1,\n    \"QuerySources\": \"mysql\",\n    \"RemoteAddr\": \"\",\n    \"ResponseSize\": 1,\n    \"RewrittenSQL\": \"sql with pii\",\n    \"RowsAffected\": 0,\n    \"Start\": \"Jan  1 01:02:03.000000\",\n    \"TotalTime\": 1,\n    \"Username\": \"\"\n}"
+	want = "{\n    \"BindVars\": {\n        \"intVal\": {\n            \"type\": \"INT64\",\n            \"value\": 1\n        }\n    },\n    \"CallInfo\": \"\",\n    \"ConnWaitTime\": 0,\n    \"Effective Caller\": \"\",\n    \"End\": \"2017-01-01 01:02:04.000001\",\n    \"Error\": \"\",\n    \"ImmediateCaller\": \"\",\n    \"Method\": \"test\",\n    \"MysqlTime\": 0,\n    \"OriginalSQL\": \"sql\",\n    \"PlanType\": \"\",\n    \"Queries\": 1,\n    \"QuerySources\": \"mysql\",\n    \"ResponseSize\": 1,\n    \"RewrittenSQL\": \"sql with pii\",\n    \"RowsAffected\": 0,\n    \"Start\": \"2017-01-01 01:02:03.000000\",\n    \"TotalTime\": 1.000001,\n    \"TransactionID\": 12345,\n    \"Username\": \"\"\n}"
 	if string(formatted) != want {
 		t.Errorf("logstats format: got:\n%q\nwant:\n%v\n", string(formatted), want)
 	}
 
-	*streamlog.RedactDebugUIQueries = true
-	*streamlog.QueryLogFormat = "json"
-	got = logStats.Format(url.Values(params))
+	streamlog.SetRedactDebugUIQueries(true)
+	streamlog.SetQueryLogFormat("json")
+	got = testFormat(logStats, url.Values(params))
 	err = json.Unmarshal([]byte(got), &parsed)
 	if err != nil {
 		t.Errorf("logstats format: error unmarshaling json: %v -- got:\n%v", err, got)
@@ -110,26 +114,26 @@ func TestLogStatsFormat(t *testing.T) {
 	if err != nil {
 		t.Errorf("logstats format: error marshaling json: %v -- got:\n%v", err, got)
 	}
-	want = "{\n    \"BindVars\": \"[REDACTED]\",\n    \"ConnWaitTime\": 0,\n    \"Effective Caller\": \"\",\n    \"End\": \"Jan  1 01:02:04.000000\",\n    \"Error\": \"\",\n    \"ImmediateCaller\": \"\",\n    \"Method\": \"test\",\n    \"MysqlTime\": 0,\n    \"OriginalSQL\": \"sql\",\n    \"PlanType\": \"\",\n    \"Queries\": 1,\n    \"QuerySources\": \"mysql\",\n    \"RemoteAddr\": \"\",\n    \"ResponseSize\": 1,\n    \"RewrittenSQL\": \"[REDACTED]\",\n    \"RowsAffected\": 0,\n    \"Start\": \"Jan  1 01:02:03.000000\",\n    \"TotalTime\": 1,\n    \"Username\": \"\"\n}"
+	want = "{\n    \"BindVars\": \"[REDACTED]\",\n    \"CallInfo\": \"\",\n    \"ConnWaitTime\": 0,\n    \"Effective Caller\": \"\",\n    \"End\": \"2017-01-01 01:02:04.000001\",\n    \"Error\": \"\",\n    \"ImmediateCaller\": \"\",\n    \"Method\": \"test\",\n    \"MysqlTime\": 0,\n    \"OriginalSQL\": \"sql\",\n    \"PlanType\": \"\",\n    \"Queries\": 1,\n    \"QuerySources\": \"mysql\",\n    \"ResponseSize\": 1,\n    \"RewrittenSQL\": \"[REDACTED]\",\n    \"RowsAffected\": 0,\n    \"Start\": \"2017-01-01 01:02:03.000000\",\n    \"TotalTime\": 1.000001,\n    \"TransactionID\": 12345,\n    \"Username\": \"\"\n}"
 	if string(formatted) != want {
 		t.Errorf("logstats format: got:\n%q\nwant:\n%v\n", string(formatted), want)
 	}
 
-	*streamlog.RedactDebugUIQueries = false
+	streamlog.SetRedactDebugUIQueries(false)
 
 	// Make sure formatting works for string bind vars. We can't do this as part of a single
 	// map because the output ordering is undefined.
 	logStats.BindVariables = map[string]*querypb.BindVariable{"strVal": sqltypes.StringBindVariable("abc")}
 
-	*streamlog.QueryLogFormat = "text"
-	got = logStats.Format(url.Values(params))
-	want = "test\t\t\t''\t''\tJan  1 01:02:03.000000\tJan  1 01:02:04.000000\t1.000000\t\t\"sql\"\tmap[strVal:type:VARCHAR value:\"abc\" ]\t1\t\"sql with pii\"\tmysql\t0.000000\t0.000000\t0\t1\t\"\"\t\n"
+	streamlog.SetQueryLogFormat("text")
+	got = testFormat(logStats, url.Values(params))
+	want = "test\t\t\t''\t''\t2017-01-01 01:02:03.000000\t2017-01-01 01:02:04.000001\t1.000001\t\t\"sql\"\t{\"strVal\": {\"type\": \"VARCHAR\", \"value\": \"abc\"}}\t1\t\"sql with pii\"\tmysql\t0.000000\t0.000000\t0\t12345\t1\t\"\"\t\n"
 	if got != want {
 		t.Errorf("logstats format: got:\n%q\nwant:\n%q\n", got, want)
 	}
 
-	*streamlog.QueryLogFormat = "json"
-	got = logStats.Format(url.Values(params))
+	streamlog.SetQueryLogFormat("json")
+	got = testFormat(logStats, url.Values(params))
 	err = json.Unmarshal([]byte(got), &parsed)
 	if err != nil {
 		t.Errorf("logstats format: error unmarshaling json: %v -- got:\n%v", err, got)
@@ -138,58 +142,45 @@ func TestLogStatsFormat(t *testing.T) {
 	if err != nil {
 		t.Errorf("logstats format: error marshaling json: %v -- got:\n%v", err, got)
 	}
-	want = "{\n    \"BindVars\": {\n        \"strVal\": {\n            \"type\": \"VARCHAR\",\n            \"value\": \"abc\"\n        }\n    },\n    \"ConnWaitTime\": 0,\n    \"Effective Caller\": \"\",\n    \"End\": \"Jan  1 01:02:04.000000\",\n    \"Error\": \"\",\n    \"ImmediateCaller\": \"\",\n    \"Method\": \"test\",\n    \"MysqlTime\": 0,\n    \"OriginalSQL\": \"sql\",\n    \"PlanType\": \"\",\n    \"Queries\": 1,\n    \"QuerySources\": \"mysql\",\n    \"RemoteAddr\": \"\",\n    \"ResponseSize\": 1,\n    \"RewrittenSQL\": \"sql with pii\",\n    \"RowsAffected\": 0,\n    \"Start\": \"Jan  1 01:02:03.000000\",\n    \"TotalTime\": 1,\n    \"Username\": \"\"\n}"
+	want = "{\n    \"BindVars\": {\n        \"strVal\": {\n            \"type\": \"VARCHAR\",\n            \"value\": \"abc\"\n        }\n    },\n    \"CallInfo\": \"\",\n    \"ConnWaitTime\": 0,\n    \"Effective Caller\": \"\",\n    \"End\": \"2017-01-01 01:02:04.000001\",\n    \"Error\": \"\",\n    \"ImmediateCaller\": \"\",\n    \"Method\": \"test\",\n    \"MysqlTime\": 0,\n    \"OriginalSQL\": \"sql\",\n    \"PlanType\": \"\",\n    \"Queries\": 1,\n    \"QuerySources\": \"mysql\",\n    \"ResponseSize\": 1,\n    \"RewrittenSQL\": \"sql with pii\",\n    \"RowsAffected\": 0,\n    \"Start\": \"2017-01-01 01:02:03.000000\",\n    \"TotalTime\": 1.000001,\n    \"TransactionID\": 12345,\n    \"Username\": \"\"\n}"
 	if string(formatted) != want {
 		t.Errorf("logstats format: got:\n%q\nwant:\n%v\n", string(formatted), want)
 	}
 
-	*streamlog.QueryLogFormat = "text"
+	streamlog.SetQueryLogFormat("text")
 }
 
-func TestLogStatsFormatBindVariables(t *testing.T) {
-	tupleBindVar, err := sqltypes.BuildBindVariable([]int64{1, 2})
-	if err != nil {
-		t.Fatalf("failed to create a tuple bind var: %v", err)
-	}
+func TestLogStatsFilter(t *testing.T) {
+	defer func() { streamlog.SetQueryLogFilterTag("") }()
 
 	logStats := NewLogStats(context.Background(), "test")
-	logStats.BindVariables = map[string]*querypb.BindVariable{
-		"key_1": sqltypes.StringBindVariable("val_1"),
-		"key_2": sqltypes.Int64BindVariable(789),
-		"key_3": sqltypes.BytesBindVariable([]byte("val_3")),
-		"key_4": tupleBindVar,
+	logStats.StartTime = time.Date(2017, time.January, 1, 1, 2, 3, 0, time.UTC)
+	logStats.EndTime = time.Date(2017, time.January, 1, 1, 2, 4, 1234, time.UTC)
+	logStats.OriginalSQL = "sql /* LOG_THIS_QUERY */"
+	logStats.BindVariables = map[string]*querypb.BindVariable{"intVal": sqltypes.Int64BindVariable(1)}
+	logStats.AddRewrittenSQL("sql with pii", time.Now())
+	logStats.MysqlResponseTime = 0
+	logStats.Rows = [][]sqltypes.Value{{sqltypes.NewVarBinary("a")}}
+	params := map[string][]string{"full": {}}
+
+	got := testFormat(logStats, url.Values(params))
+	want := "test\t\t\t''\t''\t2017-01-01 01:02:03.000000\t2017-01-01 01:02:04.000001\t1.000001\t\t\"sql /* LOG_THIS_QUERY */\"\t{\"intVal\": {\"type\": \"INT64\", \"value\": 1}}\t1\t\"sql with pii\"\tmysql\t0.000000\t0.000000\t0\t0\t1\t\"\"\t\n"
+	if got != want {
+		t.Errorf("logstats format: got:\n%q\nwant:\n%q\n", got, want)
 	}
 
-	formattedStr := logStats.FmtBindVariables(true)
-	if !strings.Contains(formattedStr, "key_1") ||
-		!strings.Contains(formattedStr, "val_1") {
-		t.Fatalf("bind variable 'key_1': 'val_1' is not formatted")
-	}
-	if !strings.Contains(formattedStr, "key_2") ||
-		!strings.Contains(formattedStr, "789") {
-		t.Fatalf("bind variable 'key_2': '789' is not formatted")
-	}
-	if !strings.Contains(formattedStr, "key_3") || !strings.Contains(formattedStr, "val_3") {
-		t.Fatalf("bind variable 'key_3': 'val_3' is not formatted")
-	}
-	if !strings.Contains(formattedStr, "key_4") ||
-		!strings.Contains(formattedStr, "values:<type:INT64 value:\"1\" > values:<type:INT64 value:\"2\" >") {
-		t.Fatalf("bind variable 'key_4': (1, 2) is not formatted")
+	streamlog.SetQueryLogFilterTag("LOG_THIS_QUERY")
+	got = testFormat(logStats, url.Values(params))
+	want = "test\t\t\t''\t''\t2017-01-01 01:02:03.000000\t2017-01-01 01:02:04.000001\t1.000001\t\t\"sql /* LOG_THIS_QUERY */\"\t{\"intVal\": {\"type\": \"INT64\", \"value\": 1}}\t1\t\"sql with pii\"\tmysql\t0.000000\t0.000000\t0\t0\t1\t\"\"\t\n"
+	if got != want {
+		t.Errorf("logstats format: got:\n%q\nwant:\n%q\n", got, want)
 	}
 
-	formattedStr = logStats.FmtBindVariables(false)
-	if !strings.Contains(formattedStr, "key_1") {
-		t.Fatalf("bind variable 'key_1' is not formatted")
-	}
-	if !strings.Contains(formattedStr, "key_2") ||
-		!strings.Contains(formattedStr, "789") {
-		t.Fatalf("bind variable 'key_2': '789' is not formatted")
-	}
-	if !strings.Contains(formattedStr, "key_3") || !strings.Contains(formattedStr, "5 bytes") {
-		t.Fatalf("bind variable 'key_3' is not formatted")
-	}
-	if !strings.Contains(formattedStr, "key_4") || !strings.Contains(formattedStr, "2 items") {
-		t.Fatalf("bind variable 'key_4' is not formatted")
+	streamlog.SetQueryLogFilterTag("NOT_THIS_QUERY")
+	got = testFormat(logStats, url.Values(params))
+	want = ""
+	if got != want {
+		t.Errorf("logstats format: got:\n%q\nwant:\n%q\n", got, want)
 	}
 }
 
@@ -201,24 +192,24 @@ func TestLogStatsFormatQuerySources(t *testing.T) {
 
 	logStats.QuerySources |= QuerySourceMySQL
 	if !strings.Contains(logStats.FmtQuerySources(), "mysql") {
-		t.Fatalf("'mysql' should be in formated query sources")
+		t.Fatalf("'mysql' should be in formatted query sources")
 	}
 
 	logStats.QuerySources |= QuerySourceConsolidator
 	if !strings.Contains(logStats.FmtQuerySources(), "consolidator") {
-		t.Fatalf("'consolidator' should be in formated query sources")
+		t.Fatalf("'consolidator' should be in formatted query sources")
 	}
 }
 
 func TestLogStatsContextHTML(t *testing.T) {
 	html := "HtmlContext"
 	callInfo := &fakecallinfo.FakeCallInfo{
-		Html: html,
+		Html: testconversions.MakeHTMLForTest(html),
 	}
 	ctx := callinfo.NewContext(context.Background(), callInfo)
 	logStats := NewLogStats(ctx, "test")
-	if string(logStats.ContextHTML()) != html {
-		t.Fatalf("expect to get html: %s, but got: %s", html, string(logStats.ContextHTML()))
+	if logStats.ContextHTML().String() != html {
+		t.Fatalf("expect to get html: %s, but got: %s", html, logStats.ContextHTML().String())
 	}
 }
 
@@ -234,11 +225,11 @@ func TestLogStatsErrorStr(t *testing.T) {
 	}
 }
 
-func TestLogStatsRemoteAddrUsername(t *testing.T) {
+func TestLogStatsCallInfo(t *testing.T) {
 	logStats := NewLogStats(context.Background(), "test")
-	addr, user := logStats.RemoteAddrUsername()
-	if addr != "" {
-		t.Fatalf("remote addr should be empty")
+	caller, user := logStats.CallInfo()
+	if caller != "" {
+		t.Fatalf("caller should be empty")
 	}
 	if user != "" {
 		t.Fatalf("username should be empty")
@@ -248,13 +239,15 @@ func TestLogStatsRemoteAddrUsername(t *testing.T) {
 	username := "vt"
 	callInfo := &fakecallinfo.FakeCallInfo{
 		Remote: remoteAddr,
+		Method: "FakeExecute",
 		User:   username,
 	}
 	ctx := callinfo.NewContext(context.Background(), callInfo)
 	logStats = NewLogStats(ctx, "test")
-	addr, user = logStats.RemoteAddrUsername()
-	if addr != remoteAddr {
-		t.Fatalf("expected to get remote addr: %s, but got: %s", remoteAddr, addr)
+	caller, user = logStats.CallInfo()
+	wantCaller := remoteAddr + ":FakeExecute(fakeRPC)"
+	if caller != wantCaller {
+		t.Fatalf("expected to get caller: %s, but got: %s", wantCaller, caller)
 	}
 	if user != username {
 		t.Fatalf("expected to get username: %s, but got: %s", username, user)

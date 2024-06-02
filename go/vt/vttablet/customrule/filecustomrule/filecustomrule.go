@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2021 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,11 +18,15 @@ limitations under the License.
 package filecustomrule
 
 import (
-	"flag"
-	"io/ioutil"
+	"os"
+	"path"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
+	"github.com/spf13/pflag"
+
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/servenv"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/rules"
 )
@@ -30,9 +34,20 @@ import (
 var (
 	// Actual FileCustomRule object in charge of rule updates
 	fileCustomRule = NewFileCustomRule()
+
 	// Commandline flag to specify rule path
-	fileRulePath = flag.String("filecustomrules", "", "file based custom rule path")
+	fileRulePath        string
+	fileRuleShouldWatch bool
 )
+
+func registerFlags(fs *pflag.FlagSet) {
+	fs.StringVar(&fileRulePath, "filecustomrules", fileRulePath, "file based custom rule path")
+	fs.BoolVar(&fileRuleShouldWatch, "filecustomrules_watch", fileRuleShouldWatch, "set up a watch on the target file and reload query rules when it changes")
+}
+
+func init() {
+	servenv.OnParseFor("vttablet", registerFlags)
+}
 
 // FileCustomRule is an implementation of CustomRuleManager, it reads custom query
 // rules from local file for once and push it to vttablet
@@ -53,6 +68,25 @@ func NewFileCustomRule() (fcr *FileCustomRule) {
 	return fcr
 }
 
+// ParseRules will construct a Rules object based on a file path. In the case
+// of error it returns nil and that error. A log will be printed to capture the
+// stage at which parsing failed.
+func ParseRules(path string) (*rules.Rules, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Warningf("Error reading file %v: %v", path, err)
+		// Don't update any internal cache, just return error
+		return nil, err
+	}
+	qrs := rules.New()
+	err = qrs.UnmarshalJSON(data)
+	if err != nil {
+		log.Warningf("Error unmarshaling query rules %v", err)
+		return nil, err
+	}
+	return qrs, nil
+}
+
 // Open try to build query rules from local file and push the rules to vttablet
 func (fcr *FileCustomRule) Open(qsc tabletserver.Controller, rulePath string) error {
 	fcr.path = rulePath
@@ -60,16 +94,9 @@ func (fcr *FileCustomRule) Open(qsc tabletserver.Controller, rulePath string) er
 		// Don't go further if path is empty
 		return nil
 	}
-	data, err := ioutil.ReadFile(fcr.path)
+
+	qrs, err := ParseRules(rulePath)
 	if err != nil {
-		log.Warningf("Error reading file %v: %v", fcr.path, err)
-		// Don't update any internal cache, just return error
-		return err
-	}
-	qrs := rules.New()
-	err = qrs.UnmarshalJSON(data)
-	if err != nil {
-		log.Warningf("Error unmarshaling query rules %v", err)
 		return err
 	}
 	fcr.currentRuleSetTimestamp = time.Now().Unix()
@@ -87,9 +114,50 @@ func (fcr *FileCustomRule) GetRules() (qrs *rules.Rules, version int64, err erro
 
 // ActivateFileCustomRules activates this static file based custom rule mechanism
 func ActivateFileCustomRules(qsc tabletserver.Controller) {
-	if *fileRulePath != "" {
+	if fileRulePath != "" {
 		qsc.RegisterQueryRuleSource(FileCustomRuleSource)
-		fileCustomRule.Open(qsc, *fileRulePath)
+		fileCustomRule.Open(qsc, fileRulePath)
+
+		if !fileRuleShouldWatch {
+			return
+		}
+
+		baseDir := path.Dir(fileRulePath)
+		ruleFileName := path.Base(fileRulePath)
+
+		watcher, err := fsnotify.NewWatcher()
+		if err != nil {
+			log.Fatalf("Unable create new fsnotify watcher: %v", err)
+		}
+		servenv.OnTerm(func() { watcher.Close() })
+
+		go func(tsc tabletserver.Controller) {
+			for {
+				select {
+				case evt, ok := <-watcher.Events:
+					if !ok {
+						return
+					}
+					if path.Base(evt.Name) != ruleFileName {
+						continue
+					}
+					if err := fileCustomRule.Open(tsc, fileRulePath); err != nil {
+						log.Infof("Failed to load custom rules from %q: %v", fileRulePath, err)
+					} else {
+						log.Infof("Loaded custom rules from %q", fileRulePath)
+					}
+				case err, ok := <-watcher.Errors:
+					if !ok {
+						return
+					}
+					log.Errorf("Error watching %v: %v", fileRulePath, err)
+				}
+			}
+		}(qsc)
+
+		if err = watcher.Add(baseDir); err != nil {
+			log.Fatalf("Unable to set up watcher for %v + %v: %v", baseDir, ruleFileName, err)
+		}
 	}
 }
 

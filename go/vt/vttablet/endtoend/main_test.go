@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,10 +17,10 @@ limitations under the License.
 package endtoend
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"testing"
 
@@ -37,6 +37,7 @@ import (
 var (
 	connParams         mysql.ConnParams
 	connAppDebugParams mysql.ConnParams
+	cluster            vttest.LocalCluster
 )
 
 func TestMain(m *testing.M) {
@@ -62,24 +63,32 @@ func TestMain(m *testing.M) {
 				},
 			},
 			OnlyMySQL: true,
+			Charset:   "utf8mb4_general_ci",
 		}
 		if err := cfg.InitSchemas("vttest", testSchema, nil); err != nil {
 			fmt.Fprintf(os.Stderr, "InitSchemas failed: %v\n", err)
 			return 1
 		}
 		defer os.RemoveAll(cfg.SchemaDir)
-		cluster := vttest.LocalCluster{
+		cluster = vttest.LocalCluster{
 			Config: cfg,
 		}
 		if err := cluster.Setup(); err != nil {
 			fmt.Fprintf(os.Stderr, "could not launch mysql: %v\n", err)
 			return 1
 		}
+		err := cluster.Execute(procSQL, "vttest")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v", err)
+			return 1
+		}
 		defer cluster.TearDown()
 
 		connParams = cluster.MySQLConnParams()
 		connAppDebugParams = cluster.MySQLAppDebugConnParams()
-		err := framework.StartServer(connParams, connAppDebugParams, cluster.DbName())
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		err = framework.StartServer(ctx, connParams, connAppDebugParams, cluster.DbName())
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%v", err)
 			return 1
@@ -91,14 +100,13 @@ func TestMain(m *testing.M) {
 			fmt.Fprintf(os.Stderr, "%v", err)
 			return 1
 		}
-
 		return m.Run()
 	}()
 	os.Exit(exitCode)
 }
 
 func initTableACL() error {
-	file, err := ioutil.TempFile("", "tableacl.json")
+	file, err := os.CreateTemp("", "tableacl.json")
 	if err != nil {
 		return err
 	}
@@ -117,7 +125,7 @@ func initTableACL() error {
 	return nil
 }
 
-var testSchema = `create table vitess_test(intval int default 0, floatval float default null, charval varchar(256) default null, binval varbinary(256) default null, primary key(intval));
+var testSchema = `create table vitess_test(intval int default 0, floatval float default null, charval varchar(10) default null, binval varbinary(256) default null, primary key(intval));
 create table vitess_test_debuguser(intval int default 0, floatval float default null, charval varchar(256) default null, binval varbinary(256) default null, primary key(intval));
 grant select, show databases, process on *.* to 'vt_appdebug'@'localhost';
 revoke select on *.* from 'vt_appdebug'@'localhost';
@@ -145,6 +153,7 @@ CREATE TABLE vitess_autoinc_seq (
   UNIQUE KEY name (name)
 );
 
+create table vitess_stress(id int default 0, bval varbinary(4096), primary key (id));
 create table vitess_big(id int default 0, string1 varchar(128) default null, string2 varchar(100) default null, string3 char(1) default null, string4 varchar(50) default null, string5 varchar(50) default null, string6 varchar(16) default null, string7 varchar(120) default null, bigint1 bigint(20) default null, bigint2 bigint(20) default null, integer1 int default null, tinyint1 tinyint(4) default null, primary key(id));
 
 create table vitess_ints(tiny tinyint default 0, tinyu tinyint unsigned default null, small smallint default null, smallu smallint unsigned default null, medium mediumint default null, mediumu mediumint unsigned default null, normal int default null, normalu int unsigned default null, big bigint default null, bigu bigint unsigned default null, y year default null, primary key(tiny));
@@ -203,7 +212,7 @@ var tableACLConfig = `{
     },
     {
       "name": "vitess",
-      "table_names_or_prefixes": ["vitess_a", "vitess_b", "vitess_c", "dual", "vitess_d", "vitess_temp", "vitess_e", "vitess_f", "vitess_mixed_case", "upsert_test", "vitess_strings", "vitess_fracts", "vitess_ints", "vitess_misc", "vitess_bit_default", "vitess_big", "vitess_view", "vitess_json", "vitess_bool", "vitess_autoinc_seq"],
+      "table_names_or_prefixes": ["vitess_a", "vitess_b", "vitess_c", "dual", "vitess_d", "vitess_temp", "vitess_temp1", "vitess_temp2", "vitess_temp3", "vitess_e", "vitess_f", "vitess_mixed_case", "upsert_test", "vitess_strings", "vitess_fracts", "vitess_ints", "vitess_misc", "vitess_bit_default", "vitess_big", "vitess_stress", "vitess_view", "vitess_json", "vitess_bool", "vitess_autoinc_seq"],
       "readers": ["dev"],
       "writers": ["dev"],
       "admins": ["dev"]
@@ -211,6 +220,13 @@ var tableACLConfig = `{
     {
       "name": "vitess_test",
       "table_names_or_prefixes": ["vitess_test"],
+      "readers": ["dev"],
+      "writers": ["dev"],
+      "admins": ["dev"]
+    },
+    {
+      "name": "vitess_test_ddl",
+      "table_names_or_prefixes": ["vitess_test_ddl"],
       "readers": ["dev"],
       "writers": ["dev"],
       "admins": ["dev"]
@@ -225,27 +241,6 @@ var tableACLConfig = `{
     {
       "name": "vitess_reset_seq",
       "table_names_or_prefixes": ["vitess_reset_seq"],
-      "readers": ["dev"],
-      "writers": ["dev"],
-      "admins": ["dev"]
-    },
-    {
-      "name": "vitess_message",
-      "table_names_or_prefixes": ["vitess_message"],
-      "readers": ["dev"],
-      "writers": ["dev"],
-      "admins": ["dev"]
-    },
-    {
-      "name": "vitess_message3",
-      "table_names_or_prefixes": ["vitess_message3"],
-      "readers": ["dev"],
-      "writers": ["dev"],
-      "admins": ["dev"]
-    },
-    {
-      "name": "vitess_message_auto",
-      "table_names_or_prefixes": ["vitess_message_auto"],
       "readers": ["dev"],
       "writers": ["dev"],
       "admins": ["dev"]
@@ -289,6 +284,62 @@ var tableACLConfig = `{
       "table_names_or_prefixes": ["vitess_test_debuguser"],
       "readers": ["dev", "vt_appdebug"],
       "writers": ["dev", "vt_appdebug"]
+    },
+    {
+      "name": "version",
+      "table_names_or_prefixes": ["vitess_version"],
+      "readers": ["dev"],
+      "writers": ["dev"],
+      "admins": ["dev"]
+    },
+    {
+      "name": "schema_version",
+      "table_names_or_prefixes": ["schema_version"],
+      "readers": ["dev"],
+      "writers": ["dev"],
+      "admins": ["dev"]
+    },
+    {
+      "name": "historian_test1",
+      "table_names_or_prefixes": ["historian_test1"],
+      "readers": ["dev"],
+      "writers": ["dev"],
+      "admins": ["dev"]
+    },
+    {
+      "name": "sys_table",
+      "table_names_or_prefixes": ["tables", "user", "processlist", "mutex_instances", "columns", "a", "func"],
+      "readers": ["dev"],
+      "writers": ["dev"],
+      "admins": ["dev"]
+    },
+    {
+      "name": "vitess_healthstream",
+      "table_names_or_prefixes": ["vitess_sc1", "vitess_sc2", "_vt_HOLD_6ace8bcef73211ea87e9f875a4d24e90_20200915120410"],
+      "readers": ["dev"],
+      "writers": ["dev"],
+      "admins": ["dev"]
+    },
+    {
+      "name": "vitess_settings",
+      "table_names_or_prefixes": ["temp"],
+      "readers": ["dev"],
+      "writers": ["dev"],
+      "admins": ["dev"]
+    },
+    {
+      "name": "vitess_views",
+      "table_names_or_prefixes": ["views", "vitess_view1", "vitess_view2", "vitess_view3"],
+      "readers": ["dev"],
+      "writers": ["dev"],
+      "admins": ["dev"]
+    },
+    {
+      "name": "vitess_internal",
+      "table_names_or_prefixes": ["udfs"],
+      "readers": ["dev"],
+      "writers": ["dev"],
+      "admins": ["dev"]
     }
   ]
 }`

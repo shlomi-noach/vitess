@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,8 +24,8 @@ import (
 
 // QueryStat contains the stats for one query.
 type QueryStat struct {
-	Query, Table, Plan                                string
-	QueryCount, Time, MysqlTime, RowCount, ErrorCount int
+	Query, Table, Plan                                                  string
+	QueryCount, Time, MysqlTime, RowsAffected, RowsReturned, ErrorCount int
 }
 
 // QueryStats parses /debug/query_stats and returns

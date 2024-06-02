@@ -1,5 +1,5 @@
 /*
-Copyright 2018 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,9 +17,9 @@ limitations under the License.
 package planbuilder
 
 import (
-	"reflect"
 	"testing"
 
+	"vitess.io/vitess/go/test/utils"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/tableacl"
 )
@@ -68,7 +68,7 @@ func TestBuildPermissions(t *testing.T) {
 		input:  "show variable like 'a%'",
 		output: nil,
 	}, {
-		input:  "describe t",
+		input:  "describe select * from t",
 		output: nil,
 	}, {
 		input: "create table t",
@@ -78,6 +78,15 @@ func TestBuildPermissions(t *testing.T) {
 		}},
 	}, {
 		input: "rename table t1 to t2",
+		output: []Permission{{
+			TableName: "t1",
+			Role:      tableacl.ADMIN,
+		}, {
+			TableName: "t2",
+			Role:      tableacl.ADMIN,
+		}},
+	}, {
+		input: "flush tables t1, t2",
 		output: []Permission{{
 			TableName: "t1",
 			Role:      tableacl.ADMIN,
@@ -160,22 +169,21 @@ func TestBuildPermissions(t *testing.T) {
 	}, {
 		input: "update (select * from t1) as a join t2 on a=b set c=d",
 		output: []Permission{{
-			TableName: "t1",
-			Role:      tableacl.WRITER,
-		}, {
 			TableName: "t2",
 			Role:      tableacl.WRITER,
+		}, {
+			TableName: "t1", // derived table in update or delete needs reader permission as they cannot be modified.
 		}},
 	}}
 
 	for _, tcase := range tcases {
-		stmt, err := sqlparser.Parse(tcase.input)
-		if err != nil {
-			t.Fatal(err)
-		}
-		got := BuildPermissions(stmt)
-		if !reflect.DeepEqual(got, tcase.output) {
-			t.Errorf("BuildPermissions(%s): %v, want %v", tcase.input, got, tcase.output)
-		}
+		t.Run(tcase.input, func(t *testing.T) {
+			stmt, err := sqlparser.NewTestParser().Parse(tcase.input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := BuildPermissions(stmt)
+			utils.MustMatch(t, tcase.output, got)
+		})
 	}
 }

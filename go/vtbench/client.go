@@ -1,5 +1,5 @@
 /*
-Copyright 2018 The Vitess Authors
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@ import (
 	"sync"
 
 	"google.golang.org/grpc"
+
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/grpcclient"
@@ -46,11 +47,12 @@ type mysqlClientConn struct {
 
 func (c *mysqlClientConn) connect(ctx context.Context, cp ConnParams) error {
 	conn, err := mysql.Connect(ctx, &mysql.ConnParams{
-		Host:   cp.Hosts[0],
-		Port:   cp.Port,
-		DbName: cp.DB,
-		Uname:  cp.Username,
-		Pass:   cp.Password,
+		Host:       cp.Hosts[0],
+		Port:       cp.Port,
+		DbName:     cp.DB,
+		Uname:      cp.Username,
+		Pass:       cp.Password,
+		UnixSocket: cp.UnixSocket,
 	})
 
 	if err != nil {
@@ -122,7 +124,7 @@ func (c *grpcVttabletConn) connect(ctx context.Context, cp ConnParams) error {
 	})
 
 	// parse the "db" into the keyspace/shard target
-	keyspace, tabletType, dest, err := topoproto.ParseDestination(cp.DB, topodatapb.TabletType_MASTER)
+	keyspace, tabletType, dest, err := topoproto.ParseDestination(cp.DB, topodatapb.TabletType_PRIMARY)
 	if err != nil {
 		return err
 	}
@@ -135,7 +137,7 @@ func (c *grpcVttabletConn) connect(ctx context.Context, cp ConnParams) error {
 			Keyspace: keyspace,
 		}
 		var err error
-		qs, err = tabletconn.GetDialer()(&tablet, true)
+		qs, err = tabletconn.GetDialer()(ctx, &tablet, true)
 		if err != nil {
 			return err
 		}
@@ -159,5 +161,5 @@ func (c *grpcVttabletConn) connect(ctx context.Context, cp ConnParams) error {
 }
 
 func (c *grpcVttabletConn) execute(ctx context.Context, query string, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
-	return c.qs.Execute(ctx, &c.target, query, bindVars, 0, nil)
+	return c.qs.Execute(ctx, &c.target, query, bindVars, 0, 0, nil)
 }

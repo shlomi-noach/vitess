@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,14 +17,16 @@ limitations under the License.
 package tmutils
 
 import (
-	"crypto/md5"
-	"encoding/hex"
 	"fmt"
 	"regexp"
 	"strings"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
+
+	"vitess.io/vitess/go/sqlescape"
+
 	"vitess.io/vitess/go/vt/concurrency"
+	"vitess.io/vitess/go/vt/schema"
 
 	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
 )
@@ -38,139 +40,132 @@ const (
 	TableView = "VIEW"
 )
 
-// TableDefinitionGetColumn returns the index of a column inside a
-// TableDefinition.
-func TableDefinitionGetColumn(td *tabletmanagerdatapb.TableDefinition, name string) (index int, ok bool) {
-	lowered := strings.ToLower(name)
-	for i, n := range td.Columns {
-		if lowered == strings.ToLower(n) {
-			return i, true
-		}
-	}
-	return -1, false
+// TableFilter is a filter for table names and types.
+type TableFilter struct {
+	includeViews bool
+
+	filterTables bool
+	tableNames   []string
+	tableREs     []*regexp.Regexp
+
+	filterExcludeTables bool
+	excludeTableNames   []string
+	excludeTableREs     []*regexp.Regexp
 }
 
-// TableDefinitions is a list of TableDefinition, for sorting
-type TableDefinitions []*tabletmanagerdatapb.TableDefinition
-
-// Len returns TableDefinitions length.
-func (tds TableDefinitions) Len() int {
-	return len(tds)
-}
-
-// Swap used for sorting TableDefinitions.
-func (tds TableDefinitions) Swap(i, j int) {
-	tds[i], tds[j] = tds[j], tds[i]
-}
-
-// FilterTables returns a copy which includes only whitelisted tables
-// (tables), no blacklisted tables (excludeTables) and optionally
+// NewTableFilter creates a TableFilter for whitelisted tables
+// (tables), no denied tables (excludeTables) and optionally
 // views (includeViews).
-func FilterTables(sd *tabletmanagerdatapb.SchemaDefinition, tables, excludeTables []string, includeViews bool) (*tabletmanagerdatapb.SchemaDefinition, error) {
-	copy := *sd
-	copy.TableDefinitions = make([]*tabletmanagerdatapb.TableDefinition, 0, len(sd.TableDefinitions))
+func NewTableFilter(tables, excludeTables []string, includeViews bool) (*TableFilter, error) {
+	f := &TableFilter{
+		includeViews: includeViews,
+	}
 
 	// Build a list of regexp to match table names against.
 	// We only use regexps if the name starts and ends with '/'.
 	// Otherwise the entry in the arrays is nil, and we use the original
 	// table name.
-	var tableRegexps []*regexp.Regexp
 	if len(tables) > 0 {
-		tableRegexps = make([]*regexp.Regexp, len(tables))
-		for i, table := range tables {
-			if len(table) > 2 && strings.HasPrefix(table, "/") && strings.HasSuffix(table, "/") {
-				table = table[1 : len(table)-1]
-				var err error
-				tableRegexps[i], err = regexp.Compile(table)
+		f.filterTables = true
+		for _, table := range tables {
+			if strings.HasPrefix(table, "/") {
+				table = strings.Trim(table, "/")
+				re, err := regexp.Compile(table)
 				if err != nil {
 					return nil, fmt.Errorf("cannot compile regexp %v for table: %v", table, err)
 				}
+
+				f.tableREs = append(f.tableREs, re)
+			} else {
+				f.tableNames = append(f.tableNames, table)
 			}
 		}
 	}
-	var excludeTableRegexps []*regexp.Regexp
+
 	if len(excludeTables) > 0 {
-		excludeTableRegexps = make([]*regexp.Regexp, len(excludeTables))
-		for i, table := range excludeTables {
-			if len(table) > 2 && strings.HasPrefix(table, "/") && strings.HasSuffix(table, "/") {
-				table = table[1 : len(table)-1]
-				var err error
-				excludeTableRegexps[i], err = regexp.Compile(table)
+		f.filterExcludeTables = true
+		for _, table := range excludeTables {
+			if strings.HasPrefix(table, "/") {
+				table = strings.Trim(table, "/")
+				re, err := regexp.Compile(table)
 				if err != nil {
 					return nil, fmt.Errorf("cannot compile regexp %v for excludeTable: %v", table, err)
 				}
+
+				f.excludeTableREs = append(f.excludeTableREs, re)
+			} else {
+				f.excludeTableNames = append(f.excludeTableNames, table)
 			}
 		}
+	}
+
+	return f, nil
+}
+
+// Includes returns whether a tableName/tableType should be included in this TableFilter.
+func (f *TableFilter) Includes(tableName string, tableType string) bool {
+	if f.filterTables {
+		matches := false
+		for _, name := range f.tableNames {
+			if strings.EqualFold(name, tableName) {
+				matches = true
+				break
+			}
+		}
+
+		if !matches {
+			for _, re := range f.tableREs {
+				if re.MatchString(tableName) {
+					matches = true
+					break
+				}
+			}
+		}
+
+		if !matches {
+			return false
+		}
+	}
+
+	if f.filterExcludeTables {
+		for _, name := range f.excludeTableNames {
+			if strings.EqualFold(name, tableName) {
+				return false
+			}
+		}
+
+		for _, re := range f.excludeTableREs {
+			if re.MatchString(tableName) {
+				return false
+			}
+		}
+	}
+
+	if !f.includeViews && tableType == TableView {
+		return false
+	}
+
+	return true
+}
+
+// FilterTables returns a copy which includes only whitelisted tables
+// (tables), no denied tables (excludeTables) and optionally
+// views (includeViews).
+func FilterTables(sd *tabletmanagerdatapb.SchemaDefinition, tables, excludeTables []string, includeViews bool) (*tabletmanagerdatapb.SchemaDefinition, error) {
+	copy := sd.CloneVT()
+	copy.TableDefinitions = make([]*tabletmanagerdatapb.TableDefinition, 0, len(sd.TableDefinitions))
+
+	f, err := NewTableFilter(tables, excludeTables, includeViews)
+	if err != nil {
+		return nil, err
 	}
 
 	for _, table := range sd.TableDefinitions {
-		// Check it's a table we want.
-		if len(tables) > 0 {
-			foundMatch := false
-			for i, tableRegexp := range tableRegexps {
-				if tableRegexp == nil {
-					// Not a regexp, just compare in a
-					// case insensitive way.
-					if strings.EqualFold(tables[i], table.Name) {
-						foundMatch = true
-						break
-					}
-				} else {
-					if tableRegexp.MatchString(table.Name) {
-						foundMatch = true
-						break
-					}
-				}
-			}
-			if !foundMatch {
-				continue
-			}
-		}
-		excluded := false
-		for i, tableRegexp := range excludeTableRegexps {
-			if tableRegexp == nil {
-				// Not a regexp, just compare in a
-				// case insensitive way.
-				if strings.EqualFold(excludeTables[i], table.Name) {
-					excluded = true
-					break
-				}
-			} else {
-				if tableRegexp.MatchString(table.Name) {
-					excluded = true
-					break
-				}
-			}
-		}
-		if excluded {
-			continue
-		}
-
-		if !includeViews && table.Type == TableView {
-			continue
-		}
-
-		copy.TableDefinitions = append(copy.TableDefinitions, table)
-	}
-
-	// Regenerate hash over tables because it may have changed.
-	if copy.Version != "" {
-		GenerateSchemaVersion(&copy)
-	}
-
-	return &copy, nil
-}
-
-// GenerateSchemaVersion return a unique schema version string based on
-// its TableDefinitions.
-func GenerateSchemaVersion(sd *tabletmanagerdatapb.SchemaDefinition) {
-	hasher := md5.New()
-	for _, td := range sd.TableDefinitions {
-		if _, err := hasher.Write([]byte(td.Schema)); err != nil {
-			panic(err) // extremely unlikely
+		if f.Includes(table.Name, table.Type) {
+			copy.TableDefinitions = append(copy.TableDefinitions, table)
 		}
 	}
-	sd.Version = hex.EncodeToString(hasher.Sum(nil))
+	return copy, nil
 }
 
 // SchemaDefinitionGetTable returns TableDefinition for a given table name.
@@ -190,9 +185,16 @@ func SchemaDefinitionToSQLStrings(sd *tabletmanagerdatapb.SchemaDefinition) []st
 	sqlStrings := make([]string, 0, len(sd.TableDefinitions)+1)
 	createViewSQL := make([]string, 0, len(sd.TableDefinitions))
 
-	sqlStrings = append(sqlStrings, sd.DatabaseSchema)
+	// Backtick database name since keyspace names appear in the routing rules, and they might need to be escaped.
+	// We unescape() them first in case we have an explicitly escaped string was specified.
+	createDatabaseSQL := strings.Replace(sd.DatabaseSchema, "`{{.DatabaseName}}`", "{{.DatabaseName}}", -1)
+	createDatabaseSQL = strings.Replace(createDatabaseSQL, "{{.DatabaseName}}", sqlescape.EscapeID("{{.DatabaseName}}"), -1)
+	sqlStrings = append(sqlStrings, createDatabaseSQL)
 
 	for _, td := range sd.TableDefinitions {
+		if schema.IsInternalOperationTableName(td.Name) {
+			continue
+		}
 		if td.Type == TableView {
 			createViewSQL = append(createViewSQL, td.Schema)
 		} else {
@@ -210,7 +212,7 @@ func SchemaDefinitionToSQLStrings(sd *tabletmanagerdatapb.SchemaDefinition) []st
 }
 
 // DiffSchema generates a report on what's different between two SchemaDefinitions
-// including views.
+// including views, but Vitess internal tables are ignored.
 func DiffSchema(leftName string, left *tabletmanagerdatapb.SchemaDefinition, rightName string, right *tabletmanagerdatapb.SchemaDefinition, er concurrency.ErrorRecorder) {
 	if left == nil && right == nil {
 		return
@@ -228,25 +230,33 @@ func DiffSchema(leftName string, left *tabletmanagerdatapb.SchemaDefinition, rig
 	for leftIndex < len(left.TableDefinitions) && rightIndex < len(right.TableDefinitions) {
 		// extra table on the left side
 		if left.TableDefinitions[leftIndex].Name < right.TableDefinitions[rightIndex].Name {
-			er.RecordError(fmt.Errorf("%v has an extra table named %v", leftName, left.TableDefinitions[leftIndex].Name))
+			if !schema.IsInternalOperationTableName(left.TableDefinitions[leftIndex].Name) {
+				er.RecordError(fmt.Errorf("%v has an extra table named %v", leftName, left.TableDefinitions[leftIndex].Name))
+			}
 			leftIndex++
 			continue
 		}
 
 		// extra table on the right side
 		if left.TableDefinitions[leftIndex].Name > right.TableDefinitions[rightIndex].Name {
-			er.RecordError(fmt.Errorf("%v has an extra table named %v", rightName, right.TableDefinitions[rightIndex].Name))
+			if !schema.IsInternalOperationTableName(right.TableDefinitions[rightIndex].Name) {
+				er.RecordError(fmt.Errorf("%v has an extra table named %v", rightName, right.TableDefinitions[rightIndex].Name))
+			}
 			rightIndex++
 			continue
 		}
 
 		// same name, let's see content
 		if left.TableDefinitions[leftIndex].Schema != right.TableDefinitions[rightIndex].Schema {
-			er.RecordError(fmt.Errorf("schemas differ on table %v:\n%s: %v\n differs from:\n%s: %v", left.TableDefinitions[leftIndex].Name, leftName, left.TableDefinitions[leftIndex].Schema, rightName, right.TableDefinitions[rightIndex].Schema))
+			if !schema.IsInternalOperationTableName(left.TableDefinitions[leftIndex].Name) {
+				er.RecordError(fmt.Errorf("schemas differ on table %v:\n%s: %v\n differs from:\n%s: %v", left.TableDefinitions[leftIndex].Name, leftName, left.TableDefinitions[leftIndex].Schema, rightName, right.TableDefinitions[rightIndex].Schema))
+			}
 		}
 
 		if left.TableDefinitions[leftIndex].Type != right.TableDefinitions[rightIndex].Type {
-			er.RecordError(fmt.Errorf("schemas differ on table type for table %v:\n%s: %v\n differs from:\n%s: %v", left.TableDefinitions[leftIndex].Name, leftName, left.TableDefinitions[leftIndex].Type, rightName, right.TableDefinitions[rightIndex].Type))
+			if !schema.IsInternalOperationTableName(right.TableDefinitions[rightIndex].Name) {
+				er.RecordError(fmt.Errorf("schemas differ on table type for table %v:\n%s: %v\n differs from:\n%s: %v", left.TableDefinitions[leftIndex].Name, leftName, left.TableDefinitions[leftIndex].Type, rightName, right.TableDefinitions[rightIndex].Type))
+			}
 		}
 
 		leftIndex++
@@ -255,7 +265,9 @@ func DiffSchema(leftName string, left *tabletmanagerdatapb.SchemaDefinition, rig
 
 	for leftIndex < len(left.TableDefinitions) {
 		if left.TableDefinitions[leftIndex].Type == TableBaseTable {
-			er.RecordError(fmt.Errorf("%v has an extra table named %v", leftName, left.TableDefinitions[leftIndex].Name))
+			if !schema.IsInternalOperationTableName(left.TableDefinitions[leftIndex].Name) {
+				er.RecordError(fmt.Errorf("%v has an extra table named %v", leftName, left.TableDefinitions[leftIndex].Name))
+			}
 		}
 		if left.TableDefinitions[leftIndex].Type == TableView {
 			er.RecordError(fmt.Errorf("%v has an extra view named %v", leftName, left.TableDefinitions[leftIndex].Name))
@@ -264,7 +276,9 @@ func DiffSchema(leftName string, left *tabletmanagerdatapb.SchemaDefinition, rig
 	}
 	for rightIndex < len(right.TableDefinitions) {
 		if right.TableDefinitions[rightIndex].Type == TableBaseTable {
-			er.RecordError(fmt.Errorf("%v has an extra table named %v", rightName, right.TableDefinitions[rightIndex].Name))
+			if !schema.IsInternalOperationTableName(right.TableDefinitions[rightIndex].Name) {
+				er.RecordError(fmt.Errorf("%v has an extra table named %v", rightName, right.TableDefinitions[rightIndex].Name))
+			}
 		}
 		if right.TableDefinitions[rightIndex].Type == TableView {
 			er.RecordError(fmt.Errorf("%v has an extra view named %v", rightName, right.TableDefinitions[rightIndex].Name))
@@ -286,11 +300,13 @@ func DiffSchemaToArray(leftName string, left *tabletmanagerdatapb.SchemaDefiniti
 // SchemaChange contains all necessary information to apply a schema change.
 // It should not be sent over the wire, it's just a set of parameters.
 type SchemaChange struct {
-	SQL              string
-	Force            bool
-	AllowReplication bool
-	BeforeSchema     *tabletmanagerdatapb.SchemaDefinition
-	AfterSchema      *tabletmanagerdatapb.SchemaDefinition
+	SQL                     string
+	Force                   bool
+	AllowReplication        bool
+	BeforeSchema            *tabletmanagerdatapb.SchemaDefinition
+	AfterSchema             *tabletmanagerdatapb.SchemaDefinition
+	SQLMode                 string
+	DisableForeignKeyChecks bool
 }
 
 // Equal compares two SchemaChange objects.

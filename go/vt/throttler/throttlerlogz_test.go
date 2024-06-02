@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -19,8 +19,9 @@ package throttler
 import (
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestThrottlerlogzHandler_MissingSlash(t *testing.T) {
@@ -30,9 +31,8 @@ func TestThrottlerlogzHandler_MissingSlash(t *testing.T) {
 
 	throttlerlogzHandler(response, request, m)
 
-	if got, want := response.Body.String(), "invalid /throttlerlogz path"; !strings.Contains(got, want) {
-		t.Fatalf("/throttlerlogz without the slash does not work (the Go HTTP server does automatically redirect in practice though). got = %v, want = %v", got, want)
-	}
+	got := response.Body.String()
+	require.Contains(t, got, "invalid /throttlerlogz path", "/throttlerlogz without the slash does not work (the Go HTTP server does automatically redirect in practice though)")
 }
 
 func TestThrottlerlogzHandler_NonExistantThrottler(t *testing.T) {
@@ -41,9 +41,8 @@ func TestThrottlerlogzHandler_NonExistantThrottler(t *testing.T) {
 
 	throttlerlogzHandler(response, request, newManager())
 
-	if got, want := response.Body.String(), `throttler: t1 does not exist`; !strings.Contains(got, want) {
-		t.Fatalf("/throttlerlogz page for non-existant t1 should not succeed. got = %v, want = %v", got, want)
-	}
+	got := response.Body.String()
+	require.Contains(t, got, "throttler not found", "/throttlerlogz page for non-existent t1 should not succeed")
 }
 
 func TestThrottlerlogzHandler(t *testing.T) {
@@ -152,8 +151,6 @@ func TestThrottlerlogzHandler(t *testing.T) {
 		throttlerlogzHandler(response, request, f.m)
 
 		got := response.Body.String()
-		if !strings.Contains(got, tc.want) {
-			t.Fatalf("testcase '%v': result not shown in log. got = %v, want = %v", tc.desc, got, tc.want)
-		}
+		require.Containsf(t, got, tc.want, "testcase '%v': result not shown in log", tc.desc)
 	}
 }

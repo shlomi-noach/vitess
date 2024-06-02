@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,10 +17,13 @@ limitations under the License.
 package srvtopo
 
 import (
+	"context"
 	"sort"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/sqltypes"
+
+	"google.golang.org/protobuf/proto"
+
 	"vitess.io/vitess/go/vt/key"
 	"vitess.io/vitess/go/vt/topo/topoproto"
 	"vitess.io/vitess/go/vt/vterrors"
@@ -31,6 +34,19 @@ import (
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
+// A Gateway is the query processing module for each shard,
+// which is used by ScatterConn.
+type Gateway interface {
+	// the query service that this Gateway wraps around
+	queryservice.QueryService
+
+	// QueryServiceByAlias returns a QueryService
+	QueryServiceByAlias(ctx context.Context, alias *topodatapb.TabletAlias, target *querypb.Target) (queryservice.QueryService, error)
+
+	// GetServingKeyspaces returns list of serving keyspaces.
+	GetServingKeyspaces() []string
+}
+
 // A Resolver can resolve keyspace ids and key ranges into ResolvedShard*
 // objects. It uses an underlying srvtopo.Server to find the topology,
 // and a TargetStats object to find the healthy destinations.
@@ -38,8 +54,8 @@ type Resolver struct {
 	// topoServ is the srvtopo.Server to use for topo queries.
 	topoServ Server
 
-	// stats provides the health information.
-	stats TargetStats
+	// gateway
+	gateway Gateway
 
 	// localCell is the local cell for the queries.
 	localCell string
@@ -50,10 +66,10 @@ type Resolver struct {
 }
 
 // NewResolver creates a new Resolver.
-func NewResolver(topoServ Server, stats TargetStats, localCell string) *Resolver {
+func NewResolver(topoServ Server, gateway Gateway, localCell string) *Resolver {
 	return &Resolver{
 		topoServ:  topoServ,
-		stats:     stats,
+		gateway:   gateway,
 		localCell: localCell,
 	}
 }
@@ -63,46 +79,29 @@ type ResolvedShard struct {
 	// Target describes the target shard.
 	Target *querypb.Target
 
-	// QueryService is the actual way to execute the query.
-	QueryService queryservice.QueryService
+	// Gateway is the way to execute a query on this shard
+	Gateway Gateway
 }
 
-// ResolvedShardEqual is an equality check on *ResolvedShard.
-func ResolvedShardEqual(rs1, rs2 *ResolvedShard) bool {
-	return proto.Equal(rs1.Target, rs2.Target)
-}
-
-// ResolvedShardsEqual is an equality check on []*ResolvedShard.
-func ResolvedShardsEqual(rss1, rss2 []*ResolvedShard) bool {
-	if len(rss1) != len(rss2) {
-		return false
+// WithKeyspace returns a ResolvedShard with a new keyspace keeping other parameters the same
+func (rs *ResolvedShard) WithKeyspace(newKeyspace string) *ResolvedShard {
+	return &ResolvedShard{
+		Target: &querypb.Target{
+			Keyspace:   newKeyspace,
+			Shard:      rs.Target.Shard,
+			TabletType: rs.Target.TabletType,
+			Cell:       rs.Target.Cell,
+		},
+		Gateway: rs.Gateway,
 	}
-	for i, rs1 := range rss1 {
-		if !ResolvedShardEqual(rs1, rss2[i]) {
-			return false
-		}
-	}
-	return true
 }
 
-// GetKeyspaceShards return all the shards in a keyspace. It follows
-// redirection if ServedFrom is set. It is only valid for the local cell.
+// GetKeyspaceShards return all the shards in a keyspace. It is only valid for the local cell.
 // Do not use it to further resolve shards, instead use the Resolve* methods.
 func (r *Resolver) GetKeyspaceShards(ctx context.Context, keyspace string, tabletType topodatapb.TabletType) (string, *topodatapb.SrvKeyspace, []*topodatapb.ShardReference, error) {
 	srvKeyspace, err := r.topoServ.GetSrvKeyspace(ctx, r.localCell, keyspace)
 	if err != nil {
 		return "", nil, nil, vterrors.Errorf(vtrpcpb.Code_UNKNOWN, "keyspace %v fetch error: %v", keyspace, err)
-	}
-
-	// check if the keyspace has been redirected for this tabletType.
-	for _, sf := range srvKeyspace.ServedFrom {
-		if sf.TabletType == tabletType {
-			keyspace = sf.Keyspace
-			srvKeyspace, err = r.topoServ.GetSrvKeyspace(ctx, r.localCell, keyspace)
-			if err != nil {
-				return "", nil, nil, vterrors.Errorf(vtrpcpb.Code_UNKNOWN, "keyspace %v fetch error: %v", keyspace, err)
-			}
-		}
 	}
 
 	partition := topoproto.SrvKeyspaceGetPartition(srvKeyspace, tabletType)
@@ -130,18 +129,13 @@ func (r *Resolver) GetAllShards(ctx context.Context, keyspace string, tabletType
 			TabletType: tabletType,
 			Cell:       r.localCell,
 		}
-		_, qs, err := r.stats.GetAggregateStats(target)
-		if err != nil {
-			return nil, nil, resolverError(err, target)
-		}
-
-		// FIXME(alainjobart) we ignore the stats for now.
+		// Right now we always set the Cell to ""
 		// Later we can fallback to another cell if needed.
 		// We would then need to read the SrvKeyspace there too.
 		target.Cell = ""
 		res[i] = &ResolvedShard{
-			Target:       target,
-			QueryService: qs,
+			Target:  target,
+			Gateway: r.gateway,
 		}
 	}
 	return res, srvKeyspace, nil
@@ -149,7 +143,7 @@ func (r *Resolver) GetAllShards(ctx context.Context, keyspace string, tabletType
 
 // GetAllKeyspaces returns all the known keyspaces in the local cell.
 func (r *Resolver) GetAllKeyspaces(ctx context.Context) ([]string, error) {
-	keyspaces, err := r.topoServ.GetSrvKeyspaceNames(ctx, r.localCell)
+	keyspaces, err := r.topoServ.GetSrvKeyspaceNames(ctx, r.localCell, true)
 	if err != nil {
 		return nil, vterrors.Errorf(vtrpcpb.Code_UNKNOWN, "keyspace names fetch error: %v", err)
 	}
@@ -158,6 +152,83 @@ func (r *Resolver) GetAllKeyspaces(ctx context.Context) ([]string, error) {
 	// But the tests depend on this behavior now.
 	sort.Strings(keyspaces)
 	return keyspaces, nil
+}
+
+// ResolveDestinationsMultiCol resolves values and their destinations into their
+// respective shards for multi col vindex.
+//
+// If ids is nil, the returned [][][]sqltypes.Value is also nil.
+// Otherwise, len(ids) has to match len(destinations), and then the returned
+// [][][]sqltypes.Value is populated with all the values that go in each shard,
+// and len([]*ResolvedShard) matches len([][][]sqltypes.Value).
+//
+// Sample input / output:
+// - destinations: dst1, 			dst2, 		dst3
+// - ids:          [id1a,id1b],  [id2a,id2b],  [id3a,id3b]
+// If dst1 is in shard1, and dst2 and dst3 are in shard2, the output will be:
+// - []*ResolvedShard:   shard1, 			shard2
+// - [][][]sqltypes.Value: [[id1a,id1b]],  [[id2a,id2b], [id3a,id3b]]
+func (r *Resolver) ResolveDestinationsMultiCol(ctx context.Context, keyspace string, tabletType topodatapb.TabletType, ids [][]sqltypes.Value, destinations []key.Destination) ([]*ResolvedShard, [][][]sqltypes.Value, error) {
+	keyspace, _, allShards, err := r.GetKeyspaceShards(ctx, keyspace, tabletType)
+	if err != nil {
+		return nil, nil, err
+	}
+	accumulator := &resultAcc{
+		resolved:   make(map[string]int),
+		resolver:   r,
+		ids:        ids,
+		keyspace:   keyspace,
+		tabletType: tabletType,
+	}
+
+	for i, destination := range destinations {
+		if err := destination.Resolve(allShards, accumulator.resolveShard(i)); err != nil {
+			return nil, nil, err
+		}
+	}
+	return accumulator.shards, accumulator.values, nil
+}
+
+type resultAcc struct {
+	shards     []*ResolvedShard
+	values     [][][]sqltypes.Value
+	resolved   map[string]int
+	resolver   *Resolver
+	ids        [][]sqltypes.Value
+	keyspace   string
+	tabletType topodatapb.TabletType
+}
+
+// resolveShard is called once per shard that is resolved. It will keep track of which shards that are
+// the destinations resolved, and the values that are bound to each shard
+func (acc *resultAcc) resolveShard(idx int) func(shard string) error {
+	return func(shard string) error {
+		offsetInValues, ok := acc.resolved[shard]
+		if !ok {
+			target := &querypb.Target{
+				Keyspace:   acc.keyspace,
+				Shard:      shard,
+				TabletType: acc.tabletType,
+			}
+			// Right now we always set the Cell to ""
+			// Later we can fallback to another cell if needed.
+			// We would then need to read the SrvKeyspace there too.
+			target.Cell = ""
+			offsetInValues = len(acc.shards)
+			acc.shards = append(acc.shards, &ResolvedShard{
+				Target:  target,
+				Gateway: acc.resolver.gateway,
+			})
+			if acc.ids != nil {
+				acc.values = append(acc.values, nil)
+			}
+			acc.resolved[shard] = offsetInValues
+		}
+		if acc.ids != nil {
+			acc.values[offsetInValues] = append(acc.values[offsetInValues], acc.ids[idx])
+		}
+		return nil
+	}
 }
 
 // ResolveDestinations resolves values and their destinations into their
@@ -193,19 +264,14 @@ func (r *Resolver) ResolveDestinations(ctx context.Context, keyspace string, tab
 					TabletType: tabletType,
 					Cell:       r.localCell,
 				}
-				_, qs, err := r.stats.GetAggregateStats(target)
-				if err != nil {
-					return resolverError(err, target)
-				}
-
-				// FIXME(alainjobart) we ignore the stats for now.
+				// Right now we always set the Cell to ""
 				// Later we can fallback to another cell if needed.
 				// We would then need to read the SrvKeyspace there too.
 				target.Cell = ""
 				s = len(result)
 				result = append(result, &ResolvedShard{
-					Target:       target,
-					QueryService: qs,
+					Target:  target,
+					Gateway: r.gateway,
 				})
 				if ids != nil {
 					values = append(values, nil)
@@ -248,6 +314,7 @@ func ValuesEqual(vss1, vss2 [][]*querypb.Value) bool {
 	return true
 }
 
-func resolverError(in error, target *querypb.Target) error {
-	return vterrors.Errorf(vtrpcpb.Code_UNAVAILABLE, "target: %s.%s.%s, no valid tablet: %v", target.Keyspace, target.Shard, topoproto.TabletTypeLString(target.TabletType), in)
+// GetGateway returns the used gateway
+func (r *Resolver) GetGateway() Gateway {
+	return r.gateway
 }

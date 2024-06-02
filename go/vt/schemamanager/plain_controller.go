@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,10 +20,9 @@ import (
 	"encoding/json"
 	"strings"
 
-	"golang.org/x/net/context"
+	"context"
 
 	"vitess.io/vitess/go/vt/log"
-	"vitess.io/vitess/go/vt/sqlparser"
 )
 
 // PlainController implements Controller interface.
@@ -33,15 +32,10 @@ type PlainController struct {
 }
 
 // NewPlainController creates a new PlainController instance.
-func NewPlainController(sqlStr string, keyspace string) *PlainController {
+func NewPlainController(sqls []string, keyspace string) *PlainController {
 	controller := &PlainController{
 		sqls:     make([]string, 0, 32),
 		keyspace: keyspace,
-	}
-
-	sqls, err := sqlparser.SplitStatementToPieces(sqlStr)
-	if err != nil {
-		panic(err.Error())
 	}
 
 	for _, sql := range sqls {

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@ use the topology service in a serving environment.
 package srvtopo
 
 import (
-	"golang.org/x/net/context"
+	"context"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
@@ -32,18 +32,20 @@ import (
 // the serving graph read-only calls used by clients to resolve
 // serving addresses, and to get VSchema.
 type Server interface {
-	// GetTopoServer returns the full topo.Server instance
-	GetTopoServer() *topo.Server
+	// GetTopoServer returns the full topo.Server instance.
+	GetTopoServer() (*topo.Server, error)
 
 	// GetSrvKeyspaceNames returns the list of keyspaces served in
 	// the provided cell.
-	GetSrvKeyspaceNames(ctx context.Context, cell string) ([]string, error)
+	GetSrvKeyspaceNames(ctx context.Context, cell string, staleOK bool) ([]string, error)
 
 	// GetSrvKeyspace returns the SrvKeyspace for a cell/keyspace.
 	GetSrvKeyspace(ctx context.Context, cell, keyspace string) (*topodatapb.SrvKeyspace, error)
 
+	WatchSrvKeyspace(ctx context.Context, cell, keyspace string, callback func(*topodatapb.SrvKeyspace, error) bool)
+
 	// WatchSrvVSchema starts watching the SrvVSchema object for
 	// the provided cell.  It will call the callback when
 	// a new value or an error occurs.
-	WatchSrvVSchema(ctx context.Context, cell string, callback func(*vschemapb.SrvVSchema, error))
+	WatchSrvVSchema(ctx context.Context, cell string, callback func(*vschemapb.SrvVSchema, error) bool)
 }

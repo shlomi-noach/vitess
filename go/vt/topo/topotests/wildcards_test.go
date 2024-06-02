@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -17,9 +17,8 @@ limitations under the License.
 package topotests
 
 import (
+	"context"
 	"testing"
-
-	"golang.org/x/net/context"
 
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
@@ -50,10 +49,12 @@ func (l *topoLayout) initTopo(t *testing.T, ts *topo.Server) {
 }
 
 func validateKeyspaceWildcard(t *testing.T, l *topoLayout, param string, expected []string) {
-	ts := memorytopo.NewServer()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ts := memorytopo.NewServer(ctx)
+	defer ts.Close()
 	l.initTopo(t, ts)
 
-	ctx := context.Background()
 	r, err := ts.ResolveKeyspaceWildcard(ctx, param)
 	if err != nil {
 		if expected != nil {
@@ -86,10 +87,12 @@ func TestResolveKeyspaceWildcard(t *testing.T) {
 }
 
 func validateShardWildcard(t *testing.T, l *topoLayout, param string, expected []topo.KeyspaceShard) {
-	ts := memorytopo.NewServer()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ts := memorytopo.NewServer(ctx)
+	defer ts.Close()
 	l.initTopo(t, ts)
 
-	ctx := context.Background()
 	r, err := ts.ResolveShardWildcard(ctx, param)
 	if err != nil {
 		if expected != nil {
@@ -182,10 +185,12 @@ func TestResolveShardWildcard(t *testing.T) {
 }
 
 func validateWildcards(t *testing.T, l *topoLayout, param string, expected []string) {
-	ts := memorytopo.NewServer()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ts := memorytopo.NewServer(ctx)
+	defer ts.Close()
 	l.initTopo(t, ts)
 
-	ctx := context.Background()
 	r, err := ts.ResolveWildcards(ctx, topo.GlobalCell, []string{param})
 	if err != nil {
 		if expected != nil {

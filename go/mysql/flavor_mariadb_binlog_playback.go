@@ -1,6 +1,6 @@
 /*
 
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,15 +17,17 @@ limitations under the License.
 
 package mysql
 
-// These two methods are isolated here so they can be easily changed
-// in other trees.
-
-// enableBinlogPlaybackCommand is part of the Flavor interface.
-func (mariadbFlavor) enableBinlogPlaybackCommand() string {
-	return ""
+// baseShowTables is part of the Flavor interface.
+func (mariadbFlavor) baseShowTables() string {
+	return mysqlFlavor{}.baseShowTables()
 }
 
-// disableBinlogPlaybackCommand is part of the Flavor interface.
-func (mariadbFlavor) disableBinlogPlaybackCommand() string {
-	return ""
+// baseShowTablesWithSizes is part of the Flavor interface.
+func (mariadbFlavor101) baseShowTablesWithSizes() string {
+	return TablesWithSize56
+}
+
+// baseShowTablesWithSizes is part of the Flavor interface.
+func (mariadbFlavor102) baseShowTablesWithSizes() string {
+	return TablesWithSize57
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,9 +17,14 @@ limitations under the License.
 package json2
 
 import (
+	"fmt"
 	"testing"
 
-	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 func TestUnmarshal(t *testing.T) {
@@ -41,49 +46,48 @@ func TestUnmarshal(t *testing.T) {
 	for _, tcase := range tcases {
 		out := make(map[string]interface{})
 		err := Unmarshal([]byte(tcase.in), &out)
+
 		got := ""
 		if err != nil {
 			got = err.Error()
 		}
-		if got != tcase.err {
-			t.Errorf("Unmarshal(%v) err: %v, want %v", tcase.in, got, tcase.err)
-		}
+		assert.Equal(t, tcase.err, got, "Unmarshal(%v) err", tcase.in)
 	}
 }
 
-func TestUnmarshalPB(t *testing.T) {
+func TestUnmarshalProto(t *testing.T) {
+	protoData := &emptypb.Empty{}
+	protoJSONData, err := protojson.Marshal(protoData)
+	assert.Nil(t, err, "protojson.Marshal error")
+
+	tcase := struct {
+		in  string
+		out *emptypb.Empty
+	}{
+		in:  string(protoJSONData),
+		out: &emptypb.Empty{},
+	}
+
+	err = Unmarshal([]byte(tcase.in), tcase.out)
+
+	assert.Nil(t, err, "Unmarshal(%v) protobuf message", tcase.in)
+	assert.Equal(t, protoData, tcase.out, "Unmarshal(%v) protobuf message result", tcase.in)
+}
+
+func TestAnnotate(t *testing.T) {
 	tcases := []struct {
-		in, err string
-	}{{
-		in: `{
-  "name": "c1",
-	"type": "VARCHAR"
-}`,
-	}, {
-		in: `{
-  "name": "c1",
-	"type": "badtype"
-}`,
-		err: "unknown value \"badtype\" for enum query.Type",
-	}, {
-		in: `{
-  "l2": "val",
-  "l3": [
-    "l4",
-    "l5"asdas"
-  ]
-}`,
-		err: "line: 5, position 9: invalid character 'a' after array element",
-	}}
+		data []byte
+		err  error
+	}{
+		{
+			data: []byte("invalid JSON"),
+			err:  fmt.Errorf("line: 1, position 1: invalid character 'i' looking for beginning of value"),
+		},
+	}
+
 	for _, tcase := range tcases {
-		var out vschemapb.Column
-		err := Unmarshal([]byte(tcase.in), &out)
-		got := ""
-		if err != nil {
-			got = err.Error()
-		}
-		if got != tcase.err {
-			t.Errorf("Unmarshal(%v) err: %v, want %v", tcase.in, got, tcase.err)
-		}
+		err := annotate(tcase.data, tcase.err)
+
+		require.Equal(t, tcase.err, err, "annotate(%s, %v) error", string(tcase.data), tcase.err)
 	}
 }

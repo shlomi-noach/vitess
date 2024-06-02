@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,11 +17,12 @@ limitations under the License.
 package vtgate
 
 import (
-	"flag"
+	"context"
 	"fmt"
+	"hash/fnv"
+	"strconv"
 	"sync"
 
-	"golang.org/x/net/context"
 	"vitess.io/vitess/go/json2"
 	"vitess.io/vitess/go/vt/grpcclient"
 	"vitess.io/vitess/go/vt/key"
@@ -31,26 +32,27 @@ import (
 	"vitess.io/vitess/go/vt/vttablet/queryservice"
 	"vitess.io/vitess/go/vt/vttablet/sandboxconn"
 	"vitess.io/vitess/go/vt/vttablet/tabletconn"
+	"vitess.io/vitess/go/vt/vttablet/tabletconntest"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
-	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
 // sandbox_test.go provides a sandbox for unit testing VTGate.
 
 const (
-	KsTestSharded             = "TestSharded"
-	KsTestUnsharded           = "TestUnsharded"
-	KsTestUnshardedServedFrom = "TestUnshardedServedFrom"
+	KsTestSharded    = "TestExecutor"
+	KsTestUnsharded  = "TestUnsharded"
+	KsTestBadVSchema = "TestXBadVSchema"
 )
 
 func init() {
 	ksToSandbox = make(map[string]*sandbox)
 	createSandbox(KsTestSharded)
 	createSandbox(KsTestUnsharded)
+	createSandbox(KsTestBadVSchema)
 	tabletconn.RegisterDialer("sandbox", sandboxDialer)
-	flag.Set("tablet_protocol", "sandbox")
+	tabletconntest.SetProtocol("go.vt.vtgate.sandbox_test", "sandbox")
 }
 
 var sandboxMu sync.Mutex
@@ -85,13 +87,6 @@ func getSandboxSrvVSchema() *vschemapb.SrvVSchema {
 		result.Keyspaces[keyspace] = &vs
 	}
 	return result
-}
-
-func addSandboxServedFrom(keyspace, servedFrom string) {
-	sandboxMu.Lock()
-	defer sandboxMu.Unlock()
-	ksToSandbox[keyspace].KeyspaceServedFrom = servedFrom
-	ksToSandbox[servedFrom] = ksToSandbox[keyspace]
 }
 
 type sandbox struct {
@@ -161,11 +156,9 @@ func createShardedSrvKeyspace(shardSpec, servedFromKeyspace string) (*topodatapb
 		shards = append(shards, shard)
 	}
 	shardedSrvKeyspace := &topodatapb.SrvKeyspace{
-		ShardingColumnName: "user_id", // exact value is ignored
-		ShardingColumnType: topodatapb.KeyspaceIdType_UINT64,
 		Partitions: []*topodatapb.SrvKeyspace_KeyspacePartition{
 			{
-				ServedType:      topodatapb.TabletType_MASTER,
+				ServedType:      topodatapb.TabletType_PRIMARY,
 				ShardReferences: shards,
 			},
 			{
@@ -178,18 +171,6 @@ func createShardedSrvKeyspace(shardSpec, servedFromKeyspace string) (*topodatapb
 			},
 		},
 	}
-	if servedFromKeyspace != "" {
-		shardedSrvKeyspace.ServedFrom = []*topodatapb.SrvKeyspace_ServedFrom{
-			{
-				TabletType: topodatapb.TabletType_RDONLY,
-				Keyspace:   servedFromKeyspace,
-			},
-			{
-				TabletType: topodatapb.TabletType_MASTER,
-				Keyspace:   servedFromKeyspace,
-			},
-		}
-	}
 	return shardedSrvKeyspace, nil
 }
 
@@ -201,7 +182,7 @@ func createUnshardedKeyspace() (*topodatapb.SrvKeyspace, error) {
 	unshardedSrvKeyspace := &topodatapb.SrvKeyspace{
 		Partitions: []*topodatapb.SrvKeyspace_KeyspacePartition{
 			{
-				ServedType:      topodatapb.TabletType_MASTER,
+				ServedType:      topodatapb.TabletType_PRIMARY,
 				ShardReferences: []*topodatapb.ShardReference{shard},
 			},
 			{
@@ -226,19 +207,19 @@ type sandboxTopo struct {
 // the given cells.
 //
 // when this version is used, WatchSrvVSchema can properly simulate watches
-func newSandboxForCells(cells []string) *sandboxTopo {
+func newSandboxForCells(ctx context.Context, cells []string) *sandboxTopo {
 	return &sandboxTopo{
-		topoServer: memorytopo.NewServer(cells...),
+		topoServer: memorytopo.NewServer(ctx, cells...),
 	}
 }
 
 // GetTopoServer is part of the srvtopo.Server interface
-func (sct *sandboxTopo) GetTopoServer() *topo.Server {
-	return sct.topoServer
+func (sct *sandboxTopo) GetTopoServer() (*topo.Server, error) {
+	return sct.topoServer, nil
 }
 
 // GetSrvKeyspaceNames is part of the srvtopo.Server interface.
-func (sct *sandboxTopo) GetSrvKeyspaceNames(ctx context.Context, cell string) ([]string, error) {
+func (sct *sandboxTopo) GetSrvKeyspaceNames(ctx context.Context, cell string, staleOK bool) ([]string, error) {
 	sandboxMu.Lock()
 	defer sandboxMu.Unlock()
 	keyspaces := make([]string, 0, 1)
@@ -251,6 +232,9 @@ func (sct *sandboxTopo) GetSrvKeyspaceNames(ctx context.Context, cell string) ([
 // GetSrvKeyspace is part of the srvtopo.Server interface.
 func (sct *sandboxTopo) GetSrvKeyspace(ctx context.Context, cell, keyspace string) (*topodatapb.SrvKeyspace, error) {
 	sand := getSandbox(keyspace)
+	if sand == nil {
+		return nil, fmt.Errorf("topo error GetSrvKeyspace")
+	}
 	sand.sandmu.Lock()
 	defer sand.sandmu.Unlock()
 	if sand.SrvKeyspaceCallback != nil {
@@ -262,27 +246,25 @@ func (sct *sandboxTopo) GetSrvKeyspace(ctx context.Context, cell, keyspace strin
 		return nil, fmt.Errorf("topo error GetSrvKeyspace")
 	}
 	switch keyspace {
-	case KsTestUnshardedServedFrom:
-		servedFromKeyspace, err := createUnshardedKeyspace()
-		if err != nil {
-			return nil, err
-		}
-		servedFromKeyspace.ServedFrom = []*topodatapb.SrvKeyspace_ServedFrom{
-			{
-				TabletType: topodatapb.TabletType_RDONLY,
-				Keyspace:   KsTestUnsharded,
-			},
-			{
-				TabletType: topodatapb.TabletType_MASTER,
-				Keyspace:   KsTestUnsharded,
-			},
-		}
-		return servedFromKeyspace, nil
 	case KsTestUnsharded:
 		return createUnshardedKeyspace()
+	default:
+		return createShardedSrvKeyspace(sand.ShardSpec, sand.KeyspaceServedFrom)
 	}
+}
 
-	return createShardedSrvKeyspace(sand.ShardSpec, sand.KeyspaceServedFrom)
+func (sct *sandboxTopo) WatchSrvKeyspace(ctx context.Context, cell, keyspace string, callback func(*topodatapb.SrvKeyspace, error) bool) {
+	// panic("not supported: WatchSrvKeyspace")
+}
+
+func hash(s string) uint32 {
+	h := fnv.New32a()
+	h.Write([]byte(s))
+	return h.Sum32()
+}
+
+func GetSrvVSchemaHash(vs *vschemapb.SrvVSchema) string {
+	return strconv.Itoa(int(hash(vs.String())))
 }
 
 // WatchSrvVSchema is part of the srvtopo.Server interface.
@@ -290,7 +272,7 @@ func (sct *sandboxTopo) GetSrvKeyspace(ctx context.Context, cell, keyspace strin
 // If the sandbox was created with a backing topo service, piggy back on it
 // to properly simulate watches, otherwise just immediately call back the
 // caller.
-func (sct *sandboxTopo) WatchSrvVSchema(ctx context.Context, cell string, callback func(*vschemapb.SrvVSchema, error)) {
+func (sct *sandboxTopo) WatchSrvVSchema(ctx context.Context, cell string, callback func(*vschemapb.SrvVSchema, error) bool) {
 	srvVSchema := getSandboxSrvVSchema()
 
 	if sct.topoServer == nil {
@@ -299,24 +281,51 @@ func (sct *sandboxTopo) WatchSrvVSchema(ctx context.Context, cell string, callba
 	}
 
 	sct.topoServer.UpdateSrvVSchema(ctx, cell, srvVSchema)
-	current, updateChan, _ := sct.topoServer.WatchSrvVSchema(ctx, cell)
-	callback(current.Value, nil)
+	current, updateChan, err := sct.topoServer.WatchSrvVSchema(ctx, cell)
+	if err != nil {
+		panic(fmt.Sprintf("sandboxTopo WatchSrvVSchema returned an error: %v", err))
+	}
+	if !callback(current.Value, nil) {
+		panic("sandboxTopo callback returned false")
+	}
+	if updateChan == nil {
+		panic("sandboxTopo updateChan is nil")
+	}
+	currentHash := GetSrvVSchemaHash(current.Value)
 	go func() {
 		for {
-			update := <-updateChan
-			callback(update.Value, update.Err)
+			select {
+			case <-ctx.Done():
+				return
+			case update := <-updateChan:
+				// If the channel was closed, we're done.
+				if update == nil {
+					return
+				}
+				newHash := GetSrvVSchemaHash(update.Value)
+				if newHash == currentHash {
+					// sometimes we get the same update multiple times. This results in the plan cache to be cleared
+					// causing tests to fail. So we just ignore the duplicate updates.
+					continue
+				}
+				currentHash = newHash
+				if !callback(update.Value, update.Err) {
+					panic("sandboxTopo callback returned false")
+				}
+
+			}
 		}
 	}()
 }
 
-func sandboxDialer(tablet *topodatapb.Tablet, failFast grpcclient.FailFast) (queryservice.QueryService, error) {
+func sandboxDialer(ctx context.Context, tablet *topodatapb.Tablet, failFast grpcclient.FailFast) (queryservice.QueryService, error) {
 	sand := getSandbox(tablet.Keyspace)
 	sand.sandmu.Lock()
 	defer sand.sandmu.Unlock()
 	sand.DialCounter++
 	if sand.DialMustFail > 0 {
 		sand.DialMustFail--
-		return nil, vterrors.New(vtrpcpb.Code_UNAVAILABLE, "conn error")
+		return nil, vterrors.VT14001()
 	}
 	sbc := sandboxconn.NewSandboxConn(tablet)
 	return sbc, nil

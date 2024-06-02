@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,16 +17,20 @@ limitations under the License.
 package testlib
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/discovery"
+	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/vtenv"
+	"vitess.io/vitess/go/vt/vttablet/tmclient"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
-	"vitess.io/vitess/go/vt/vttablet/tmclient"
 	"vitess.io/vitess/go/vt/wrangler"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
@@ -34,28 +38,35 @@ import (
 )
 
 func TestPermissions(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	// Initialize our environment
-	ctx := context.Background()
-	ts := memorytopo.NewServer("cell1", "cell2")
-	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
-	vp := NewVtctlPipe(t, ts)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
+	defer cancel()
+	ts := memorytopo.NewServer(ctx, "cell1", "cell2")
+	wr := wrangler.New(vtenv.NewTestEnv(), logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
+	vp := NewVtctlPipe(ctx, t, ts)
 	defer vp.Close()
 
-	master := NewFakeTablet(t, wr, "cell1", 0, topodatapb.TabletType_MASTER, nil)
+	primary := NewFakeTablet(t, wr, "cell1", 0, topodatapb.TabletType_PRIMARY, nil)
 	replica := NewFakeTablet(t, wr, "cell1", 1, topodatapb.TabletType_REPLICA, nil)
 
-	// mark the master inside the shard
-	_, err := ts.UpdateShardFields(ctx, master.Tablet.Keyspace, master.Tablet.Shard, func(si *topo.ShardInfo) error {
-		si.MasterAlias = master.Tablet.Alias
+	// mark the primary inside the shard
+	_, err := ts.UpdateShardFields(ctx, primary.Tablet.Keyspace, primary.Tablet.Shard, func(si *topo.ShardInfo) error {
+		si.PrimaryAlias = primary.Tablet.Alias
 		return nil
 	})
 	if err != nil {
 		t.Fatalf("UpdateShardFields failed: %v", err)
 	}
 
-	// master will be asked for permissions
-	master.FakeMysqlDaemon.FetchSuperQueryMap = map[string]*sqltypes.Result{
-		"SELECT * FROM mysql.user": {
+	// primary will be asked for permissions
+	primary.FakeMysqlDaemon.FetchSuperQueryMap = map[string]*sqltypes.Result{
+		"SELECT * FROM mysql.user ORDER BY host, user": {
 			Fields: []*querypb.Field{
 				{
 					Name: "Host",
@@ -419,7 +430,7 @@ func TestPermissions(t *testing.T) {
 				},
 			},
 		},
-		"SELECT * FROM mysql.db": {
+		"SELECT * FROM mysql.db ORDER BY host, db, user": {
 			Fields: []*querypb.Field{
 				{
 					Name: "Host",
@@ -540,40 +551,47 @@ func TestPermissions(t *testing.T) {
 			},
 		},
 	}
-	master.StartActionLoop(t, wr)
-	defer master.StopActionLoop(t)
+	primary.StartActionLoop(t, wr)
+	defer primary.StopActionLoop(t)
 
 	// Make a two-level-deep copy, so we can make them diverge later.
-	user := *master.FakeMysqlDaemon.FetchSuperQueryMap["SELECT * FROM mysql.user"]
+	user := *primary.FakeMysqlDaemon.FetchSuperQueryMap["SELECT * FROM mysql.user ORDER BY host, user"]
 	user.Fields = append([]*querypb.Field{}, user.Fields...)
 
 	// replica will be asked for permissions
 	replica.FakeMysqlDaemon.FetchSuperQueryMap = map[string]*sqltypes.Result{
-		"SELECT * FROM mysql.user": &user,
-		"SELECT * FROM mysql.db":   master.FakeMysqlDaemon.FetchSuperQueryMap["SELECT * FROM mysql.db"],
+		"SELECT * FROM mysql.user ORDER BY host, user":   &user,
+		"SELECT * FROM mysql.db ORDER BY host, db, user": primary.FakeMysqlDaemon.FetchSuperQueryMap["SELECT * FROM mysql.db ORDER BY host, db, user"],
+	}
+	replica.FakeMysqlDaemon.SetReplicationSourceInputs = append(replica.FakeMysqlDaemon.SetReplicationSourceInputs, topoproto.MysqlAddr(primary.Tablet))
+	replica.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
+		// These 3 statements come from tablet startup
+		"STOP REPLICA",
+		"FAKE SET SOURCE",
+		"START REPLICA",
 	}
 	replica.StartActionLoop(t, wr)
 	defer replica.StopActionLoop(t)
 
 	// Overwrite with the correct value to make sure it passes.
-	replica.FakeMysqlDaemon.FetchSuperQueryMap["SELECT * FROM mysql.user"].Fields[0] = &querypb.Field{
+	replica.FakeMysqlDaemon.FetchSuperQueryMap["SELECT * FROM mysql.user ORDER BY host, user"].Fields[0] = &querypb.Field{
 		Name: "Host",
 		Type: sqltypes.Char,
 	}
 
 	// run ValidatePermissionsKeyspace, this should work
-	if err := vp.Run([]string{"ValidatePermissionsKeyspace", master.Tablet.Keyspace}); err != nil {
+	if err := vp.Run([]string{"ValidatePermissionsKeyspace", primary.Tablet.Keyspace}); err != nil {
 		t.Fatalf("ValidatePermissionsKeyspace failed: %v", err)
 	}
 
 	// modify one field, this should fail
-	replica.FakeMysqlDaemon.FetchSuperQueryMap["SELECT * FROM mysql.user"].Fields[0] = &querypb.Field{
+	replica.FakeMysqlDaemon.FetchSuperQueryMap["SELECT * FROM mysql.user ORDER BY host, user"].Fields[0] = &querypb.Field{
 		Name: "Wrong",
 		Type: sqltypes.Char,
 	}
 
 	// run ValidatePermissionsKeyspace again, this should now fail
-	if err := vp.Run([]string{"ValidatePermissionsKeyspace", master.Tablet.Keyspace}); err == nil || !strings.Contains(err.Error(), "has an extra user") {
+	if err := vp.Run([]string{"ValidatePermissionsKeyspace", primary.Tablet.Keyspace}); err == nil || !strings.Contains(err.Error(), "has an extra user") {
 		t.Fatalf("ValidatePermissionsKeyspace has unexpected err: %v", err)
 	}
 

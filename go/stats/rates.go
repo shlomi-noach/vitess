@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ limitations under the License.
 package stats
 
 import (
+	"context"
 	"encoding/json"
 	"math"
 	"sync"
@@ -65,6 +66,8 @@ type Rates struct {
 	// totalRate is the rate of total counts per second seen in the latest
 	// sampling interval e.g. 100 queries / 5 seconds sampling interval = 20 QPS.
 	totalRate float64
+	ctx       context.Context
+	cancel    context.CancelFunc
 }
 
 // NewRates reports rolling rate information for countTracker. samples specifies
@@ -76,6 +79,7 @@ func NewRates(name string, countTracker CountTracker, samples int, interval time
 	if interval < 1*time.Second && interval != -1*time.Second {
 		panic("interval too small")
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	rt := &Rates{
 		timeStamps:            NewRingInt64(samples + 1),
 		counts:                make(map[string]*RingInt64),
@@ -83,6 +87,8 @@ func NewRates(name string, countTracker CountTracker, samples int, interval time
 		samples:               samples + 1,
 		interval:              interval,
 		timestampLastSampling: timeNow(),
+		ctx:                   ctx,
+		cancel:                cancel,
 	}
 	if name != "" {
 		publish(name, rt)
@@ -93,10 +99,20 @@ func NewRates(name string, countTracker CountTracker, samples int, interval time
 	return rt
 }
 
+func (rt *Rates) Stop() {
+	rt.cancel()
+}
+
 func (rt *Rates) track() {
+	t := time.NewTicker(rt.interval)
+	defer t.Stop()
 	for {
-		rt.snapshot()
-		<-time.After(rt.interval)
+		select {
+		case <-rt.ctx.Done():
+			return
+		case <-t.C:
+			rt.snapshot()
+		}
 	}
 }
 
@@ -177,6 +193,35 @@ func (rt *Rates) TotalRate() float64 {
 
 func (rt *Rates) String() string {
 	data, err := json.Marshal(rt.Get())
+	if err != nil {
+		data, _ = json.Marshal(err.Error())
+	}
+	return string(data)
+}
+
+type RatesFunc struct {
+	F    func() map[string][]float64
+	help string
+}
+
+func NewRateFunc(name string, help string, f func() map[string][]float64) *RatesFunc {
+	c := &RatesFunc{
+		F:    f,
+		help: help,
+	}
+
+	if name != "" {
+		publish(name, c)
+	}
+	return c
+}
+
+func (rf *RatesFunc) Help() string {
+	return rf.help
+}
+
+func (rf *RatesFunc) String() string {
+	data, err := json.Marshal(rf.F())
 	if err != nil {
 		data, _ = json.Marshal(err.Error())
 	}

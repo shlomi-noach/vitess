@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,38 +17,81 @@ limitations under the License.
 package vindexes
 
 import (
+	"context"
 	"reflect"
-	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
 )
 
-var reverseBits Vindex
+var reverseBits SingleColumn
 
 func init() {
-	hv, err := CreateVindex("reverse_bits", "rr", map[string]string{"Table": "t", "Column": "c"})
+	hv, err := CreateVindex("reverse_bits", "rr", map[string]string{})
 	if err != nil {
 		panic(err)
 	}
-	reverseBits = hv
+	unknownParams := hv.(ParamValidating).UnknownParams()
+	if len(unknownParams) > 0 {
+		panic("reverse_bits test init: expected 0 unknown params")
+	}
+	reverseBits = hv.(SingleColumn)
 }
 
-func TestReverseBitsCost(t *testing.T) {
-	if reverseBits.Cost() != 1 {
-		t.Errorf("Cost(): %d, want 1", reverseBits.Cost())
+func reverseBitsCreateVindexTestCase(
+	testName string,
+	vindexParams map[string]string,
+	expectErr error,
+	expectUnknownParams []string,
+) createVindexTestCase {
+	return createVindexTestCase{
+		testName: testName,
+
+		vindexType:   "reverse_bits",
+		vindexName:   "reverse_bits",
+		vindexParams: vindexParams,
+
+		expectCost:          1,
+		expectErr:           expectErr,
+		expectIsUnique:      true,
+		expectNeedsVCursor:  false,
+		expectString:        "reverse_bits",
+		expectUnknownParams: expectUnknownParams,
 	}
 }
 
-func TestReverseBitsString(t *testing.T) {
-	if strings.Compare("rr", reverseBits.String()) != 0 {
-		t.Errorf("String(): %s, want hash", reverseBits.String())
+func TestReverseBitsCreateVindex(t *testing.T) {
+	cases := []createVindexTestCase{
+		reverseBitsCreateVindexTestCase(
+			"no params",
+			nil,
+			nil,
+			nil,
+		),
+		reverseBitsCreateVindexTestCase(
+			"empty params",
+			map[string]string{},
+			nil,
+			nil,
+		),
+		reverseBitsCreateVindexTestCase(
+			"unknown params",
+			map[string]string{
+				"hello": "world",
+			},
+			nil,
+			[]string{"hello"},
+		),
 	}
+
+	testCreateVindexes(t, cases)
 }
 
 func TestReverseBitsMap(t *testing.T) {
-	got, err := reverseBits.Map(nil, []sqltypes.Value{
+	got, err := reverseBits.Map(context.Background(), nil, []sqltypes.Value{
 		sqltypes.NewInt64(1),
 		sqltypes.NewInt64(2),
 		sqltypes.NewInt64(3),
@@ -57,9 +100,7 @@ func TestReverseBitsMap(t *testing.T) {
 		sqltypes.NewInt64(5),
 		sqltypes.NewInt64(6),
 	})
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	want := []key.Destination{
 		key.DestinationKeyspaceID([]byte("\x80\x00\x00\x00\x00\x00\x00\x00")),
 		key.DestinationKeyspaceID([]byte("@\x00\x00\x00\x00\x00\x00\x00")),
@@ -77,7 +118,7 @@ func TestReverseBitsMap(t *testing.T) {
 func TestReverseBitsVerify(t *testing.T) {
 	ids := []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)}
 	ksids := [][]byte{[]byte("\x80\x00\x00\x00\x00\x00\x00\x00"), []byte("\x80\x00\x00\x00\x00\x00\x00\x00")}
-	got, err := reverseBits.Verify(nil, ids, ksids)
+	got, err := reverseBits.Verify(context.Background(), nil, ids, ksids)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,18 +128,13 @@ func TestReverseBitsVerify(t *testing.T) {
 	}
 
 	// Failure test
-	_, err = reverseBits.Verify(nil, []sqltypes.Value{sqltypes.NewVarBinary("aa")}, [][]byte{nil})
-	wantErr := "reverseBits.Verify: could not parse value: 'aa'"
-	if err == nil || err.Error() != wantErr {
-		t.Errorf("reverseBits.Verify err: %v, want %s", err, wantErr)
-	}
+	_, err = reverseBits.Verify(context.Background(), nil, []sqltypes.Value{sqltypes.NewVarBinary("aa")}, [][]byte{nil})
+	require.EqualError(t, err, "cannot parse uint64 from \"aa\"")
 }
 
 func TestReverseBitsReverseMap(t *testing.T) {
 	got, err := reverseBits.(Reversible).ReverseMap(nil, [][]byte{[]byte("\x80\x00\x00\x00\x00\x00\x00\x00")})
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	want := []sqltypes.Value{sqltypes.NewUint64(uint64(1))}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("ReverseMap(): %v, want %v", got, want)

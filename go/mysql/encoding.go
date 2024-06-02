@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -78,6 +78,10 @@ func writeLenEncInt(data []byte, pos int, i uint64) int {
 
 func lenNullString(value string) int {
 	return len(value) + 1
+}
+
+func lenEOFString(value string) int {
+	return len(value)
 }
 
 func writeNullString(data []byte, pos int, value string) int {
@@ -180,6 +184,15 @@ func readNullString(data []byte, pos int) (string, int, bool) {
 	return string(data[pos : pos+end]), pos + end + 1, true
 }
 
+func readEOFString(data []byte, pos int) (string, int, bool) {
+	return string(data[pos:]), len(data) - pos, true
+}
+
+func readUint8(data []byte, pos int) (uint8, int, bool) {
+	b, pos, ok := readByte(data, pos)
+	return uint8(b), pos, ok
+}
+
 func readUint16(data []byte, pos int) (uint16, int, bool) {
 	if pos+1 >= len(data) {
 		return 0, 0, false
@@ -199,6 +212,30 @@ func readUint64(data []byte, pos int) (uint64, int, bool) {
 		return 0, 0, false
 	}
 	return binary.LittleEndian.Uint64(data[pos : pos+8]), pos + 8, true
+}
+
+// readFixedLenUint64 reads a uint64 from a fixed-length slice
+// of bytes in little endian format.
+// This is used for variable length fields in MySQL packets that
+// are always stored in 1, 3, 4, or 9 bytes -- with the first
+// byte skipped when the length is > 1 byte.
+// It returns the read value and a boolean indicating if the
+// read failed.
+func readFixedLenUint64(data []byte) (uint64, bool) {
+	switch len(data) {
+	case 1: // 1 byte
+		return uint64(uint8(data[0])), true
+	case 3: // 2 bytes
+		return uint64(binary.LittleEndian.Uint16(data[1:])), true
+	case 4: // 3 bytes
+		return uint64(data[1]) |
+			uint64(data[2])<<8 |
+			uint64(data[3])<<16, true
+	case 9: // 8 bytes
+		return binary.LittleEndian.Uint64(data[1:]), true
+	default:
+		return uint64(0), false
+	}
 }
 
 func readLenEncInt(data []byte, pos int) (uint64, int, bool) {
@@ -272,4 +309,84 @@ func readLenEncStringAsBytes(data []byte, pos int) ([]byte, int, bool) {
 		return nil, 0, false
 	}
 	return data[pos : pos+s], pos + s, true
+}
+
+func readLenEncStringAsBytesCopy(data []byte, pos int) ([]byte, int, bool) {
+	size, pos, ok := readLenEncInt(data, pos)
+	if !ok {
+		return nil, 0, false
+	}
+	s := int(size)
+	if pos+s-1 >= len(data) {
+		return nil, 0, false
+	}
+	result := make([]byte, size)
+	copy(result, data[pos:pos+s])
+	return result, pos + s, true
+}
+
+type coder struct {
+	data []byte
+	pos  int
+}
+
+func (d *coder) readLenEncInt() (uint64, bool) {
+	res, newPos, ok := readLenEncInt(d.data, d.pos)
+	d.pos = newPos
+	return res, ok
+}
+
+func (d *coder) readUint16() (uint16, bool) {
+	res, newPos, ok := readUint16(d.data, d.pos)
+	d.pos = newPos
+	return res, ok
+}
+
+func (d *coder) readByte() (byte, bool) {
+	res, newPos, ok := readByte(d.data, d.pos)
+	d.pos = newPos
+	return res, ok
+}
+
+func (d *coder) readLenEncString() (string, bool) {
+	res, newPos, ok := readLenEncString(d.data, d.pos)
+	d.pos = newPos
+	return res, ok
+}
+
+func (d *coder) readLenEncInfo() (string, bool) {
+	res, newPos, ok := readLenEncString(d.data, d.pos)
+	if ok {
+		d.pos = newPos
+	}
+	return res, ok
+}
+
+func (d *coder) writeByte(value byte) {
+	newPos := writeByte(d.data, d.pos, value)
+	d.pos = newPos
+}
+
+func (d *coder) writeLenEncInt(i uint64) {
+	newPos := writeLenEncInt(d.data, d.pos, i)
+	d.pos = newPos
+}
+
+func (d *coder) writeUint16(value uint16) {
+	newPos := writeUint16(d.data, d.pos, value)
+	d.pos = newPos
+}
+
+func (d *coder) writeUint32(value uint32) {
+	newPos := writeUint32(d.data, d.pos, value)
+	d.pos = newPos
+}
+
+func (d *coder) writeLenEncString(value string) {
+	newPos := writeLenEncString(d.data, d.pos, value)
+	d.pos = newPos
+}
+
+func (d *coder) writeEOFString(value string) {
+	d.pos += copy(d.data[d.pos:], value)
 }

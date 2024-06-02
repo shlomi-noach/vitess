@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -18,6 +18,7 @@ package endtoend
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"reflect"
 	"strings"
@@ -25,11 +26,15 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"vitess.io/vitess/go/mysql/replication"
+	"vitess.io/vitess/go/mysql/sqlerror"
 
 	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/mysql/binlog"
 	"vitess.io/vitess/go/sqltypes"
-
 	querypb "vitess.io/vitess/go/vt/proto/query"
 )
 
@@ -42,15 +47,6 @@ func connectForReplication(t *testing.T, rbr bool) (*mysql.Conn, mysql.BinlogFor
 		t.Fatal(err)
 	}
 
-	// We need to know if this is MariaDB, to set the right flag.
-	if conn.IsMariaDB() {
-		// This flag is required to get GTIDs from MariaDB.
-		t.Log("MariaDB: sensing SET @mariadb_slave_capability=4")
-		if _, err := conn.ExecuteFetch("SET @mariadb_slave_capability=4", 0, false); err != nil {
-			t.Fatalf("failed to set @mariadb_slave_capability=4: %v", err)
-		}
-	}
-
 	// Switch server to RBR if needed.
 	if rbr {
 		if _, err := conn.ExecuteFetch("SET GLOBAL binlog_format='ROW'", 0, false); err != nil {
@@ -59,28 +55,21 @@ func connectForReplication(t *testing.T, rbr bool) (*mysql.Conn, mysql.BinlogFor
 	}
 
 	// First we get the current binlog position.
-	result, err := conn.ExecuteFetch("SHOW MASTER STATUS", 1, true)
-	if err != nil {
-		t.Fatalf("SHOW MASTER STATUS failed: %v", err)
-	}
-	if len(result.Fields) < 2 || result.Fields[0].Name != "File" || result.Fields[1].Name != "Position" ||
-		len(result.Rows) != 1 {
-		t.Fatalf("SHOW MASTER STATUS returned unexpected result: %v", result)
-	}
-	file := result.Rows[0][0].ToString()
-	position, err := sqltypes.ToUint64(result.Rows[0][1])
-	if err != nil {
-		t.Fatalf("SHOW MASTER STATUS returned invalid position: %v", result.Rows[0][1])
-	}
+	status, err := conn.ShowPrimaryStatus()
+	require.NoError(t, err, "retrieving primary status failed: %v", err)
+
+	filePos := status.FilePosition.GTIDSet.(replication.FilePosGTID)
+	file := filePos.File
+	position := filePos.Pos
 
 	// Tell the server that we understand the format of events
 	// that will be used if binlog_checksum is enabled on the server.
-	if _, err := conn.ExecuteFetch("SET @master_binlog_checksum=@@global.binlog_checksum", 0, false); err != nil {
-		t.Fatalf("failed to set @master_binlog_checksum=@@global.binlog_checksum: %v", err)
+	if _, err := conn.ExecuteFetch("SET @source_binlog_checksum = @@global.binlog_checksum, @master_binlog_checksum=@@global.binlog_checksum", 0, false); err != nil {
+		t.Fatalf("failed to set @source_binlog_checksum=@@global.binlog_checksum: %v", err)
 	}
 
 	// Write ComBinlogDump packet with to start streaming events from here.
-	if err := conn.WriteComBinlogDump(1, file, uint32(position), 0); err != nil {
+	if err := conn.WriteComBinlogDump(1, file, position, 0); err != nil {
 		t.Fatalf("WriteComBinlogDump failed: %v", err)
 	}
 
@@ -88,28 +77,21 @@ func connectForReplication(t *testing.T, rbr bool) (*mysql.Conn, mysql.BinlogFor
 	var f mysql.BinlogFormat
 	for {
 		be, err := conn.ReadBinlogEvent()
-		if err != nil {
-			t.Fatalf("ReadPacket failed: %v", err)
-		}
-		if !be.IsValid() {
-			t.Fatalf("NewMysql56BinlogEvent has an invalid packet: %v", be)
-		}
+		require.NoError(t, err, "ReadPacket failed: %v", err)
+		require.True(t, be.IsValid(), "NewMysql56BinlogEvent has an invalid packet: %v", be)
 
 		// Skip rotate packets. These are normal as first packets.
 		if be.IsRotate() {
 			t.Logf("Got a rotate packet: %v", be)
 			continue
 		}
-
 		// And we want a FORMAT_DESCRIPTION_EVENT.
 		// Print a few things about the event for sanity checks.
-		if !be.IsFormatDescription() {
-			t.Fatalf("Unexpected packet: %v", be)
-		}
+		require.True(t, be.IsFormatDescription(), "Unexpected packet: %v", be)
+
 		f, err = be.Format()
-		if err != nil {
-			t.Fatalf("Format() returned error: %v", err)
-		}
+		require.NoError(t, err, "Format() returned error: %v", err)
+
 		t.Logf("Got a FORMAT_DESCRIPTION_EVENT packet: %v\nWith format: %v", be, f)
 		break
 	}
@@ -133,13 +115,10 @@ func TestReplicationConnectionClosing(t *testing.T) {
 		for {
 			data, err := conn.ReadPacket()
 			if err != nil {
-				serr, ok := err.(*mysql.SQLError)
-				if !ok {
-					t.Fatalf("Got a non mysql.SQLError error: %v", err)
-				}
-				if serr.Num != mysql.CRServerLost {
-					t.Fatalf("Got an unexpected mysql.SQLError error: %v", serr)
-				}
+				serr, ok := err.(*sqlerror.SQLError)
+				assert.True(t, ok, "Got a non sqlerror.SQLError error: %v", err)
+				assert.Equal(t, sqlerror.CRServerLost, serr.Num, "Got an unexpected sqlerror.SQLError error: %v", serr)
+
 				// we got the right error, all good.
 				return
 			}
@@ -150,10 +129,10 @@ func TestReplicationConnectionClosing(t *testing.T) {
 				// What we expect, keep going.
 			case mysql.ErrPacket:
 				err := mysql.ParseErrorPacket(data)
-				t.Fatalf("ReadPacket returned an error packet: %v", err)
+				t.Errorf("ReadPacket returned an error packet: %v", err)
 			default:
 				// Very unexpected.
-				t.Fatalf("ReadPacket returned a weird packet: %v", data)
+				t.Errorf("ReadPacket returned a weird packet: %v", data)
 			}
 		}
 	}()
@@ -170,9 +149,8 @@ func TestReplicationConnectionClosing(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err := dConn.ExecuteFetch("insert into replicationError(id, name) values(10, 'nice name')", 0, false)
-	if err != nil {
-		t.Fatalf("insert failed: %v", err)
-	}
+	require.NoError(t, err, "insert failed: %v", err)
+
 	if result.RowsAffected != 1 || len(result.Rows) != 0 {
 		t.Errorf("unexpected result for insert: %v", result)
 	}
@@ -191,93 +169,6 @@ func TestReplicationConnectionClosing(t *testing.T) {
 	wg.Wait()
 }
 
-func TestStatementReplicationWithRealDatabase(t *testing.T) {
-	conn, f := connectForReplication(t, false /* rbr */)
-	defer conn.Close()
-
-	// Create a table, insert some data in it.
-	ctx := context.Background()
-	dConn, err := mysql.Connect(ctx, &connParams)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer dConn.Close()
-	createTable := "create table replication(id int, name varchar(128), primary key(id))"
-	if _, err := dConn.ExecuteFetch(createTable, 0, false); err != nil {
-		t.Fatal(err)
-	}
-	insert := "insert into replication(id, name) values(10, 'nice name')"
-	result, err := dConn.ExecuteFetch(insert, 0, false)
-	if err != nil {
-		t.Fatalf("insert failed: %v", err)
-	}
-	if result.RowsAffected != 1 || len(result.Rows) != 0 {
-		t.Errorf("unexpected result for insert: %v", result)
-	}
-
-	// Get the new events from the binlogs.
-	// Make sure we get two GTIDs, the table creation event and the insert
-	// (with both a begin and a commit).
-	gtidCount := 0
-	gotCreateTable := false
-	gotBegin := false
-	gotInsert := false
-	gotCommit := false
-	for gtidCount < 2 || !gotCreateTable || !gotBegin || !gotInsert || !gotCommit {
-		be, err := conn.ReadBinlogEvent()
-		if err != nil {
-			t.Fatalf("ReadPacket failed: %v", err)
-		}
-		if !be.IsValid() {
-			t.Fatalf("read an invalid packet: %v", be)
-		}
-		be, _, err = be.StripChecksum(f)
-		if err != nil {
-			t.Fatalf("StripChecksum failed: %v", err)
-		}
-		switch {
-		case be.IsGTID():
-			// We expect one of these at least.
-			gtid, hasBegin, err := be.GTID(f)
-			if err != nil {
-				t.Fatalf("GTID event is broken: %v", err)
-			}
-			t.Logf("Got GTID event: %v %v", gtid, hasBegin)
-			gtidCount++
-			if hasBegin {
-				gotBegin = true
-			}
-		case be.IsQuery():
-			q, err := be.Query(f)
-			if err != nil {
-				t.Fatalf("Query event is broken: %v", err)
-			}
-			t.Logf("Got Query event: %v", q)
-			switch strings.ToLower(q.SQL) {
-			case createTable:
-				gotCreateTable = true
-			case insert:
-				gotInsert = true
-			case "begin":
-				gotBegin = true
-			case "commit":
-				gotCommit = true
-			}
-		case be.IsXID():
-			gotCommit = true
-			t.Logf("Got XID event")
-		default:
-			t.Logf("Got unrelated event: %v", be)
-		}
-	}
-
-	// Drop the table, we're done.
-	if _, err := dConn.ExecuteFetch("drop table replication", 0, false); err != nil {
-		t.Fatal(err)
-	}
-
-}
-
 func TestRowReplicationWithRealDatabase(t *testing.T) {
 	conn, f := connectForReplication(t, true /* rbr */)
 	defer conn.Close()
@@ -294,23 +185,20 @@ func TestRowReplicationWithRealDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err := dConn.ExecuteFetch("insert into replication(id, name) values(10, 'nice name')", 0, false)
-	if err != nil {
-		t.Fatalf("insert failed: %v", err)
-	}
+	require.NoError(t, err, "insert failed: %v", err)
+
 	if result.RowsAffected != 1 || len(result.Rows) != 0 {
 		t.Errorf("unexpected result for insert: %v", result)
 	}
 	result, err = dConn.ExecuteFetch("update replication set name='nicer name' where id=10", 0, false)
-	if err != nil {
-		t.Fatalf("update failed: %v", err)
-	}
+	require.NoError(t, err, "update failed: %v", err)
+
 	if result.RowsAffected != 1 || len(result.Rows) != 0 {
 		t.Errorf("unexpected result for update: %v", result)
 	}
 	result, err = dConn.ExecuteFetch("delete from replication where id=10", 0, false)
-	if err != nil {
-		t.Fatalf("delete failed: %v", err)
-	}
+	require.NoError(t, err, "delete failed: %v", err)
+
 	if result.RowsAffected != 1 || len(result.Rows) != 0 {
 		t.Errorf("unexpected result for delete: %v", result)
 	}
@@ -333,16 +221,12 @@ func TestRowReplicationWithRealDatabase(t *testing.T) {
 	//	for i := 0; i < 6 && (gtidCount < 2 || !gotCreateTable || !gotTableMapEvent || !gotBegin || !gotInsert || !gotCommit); i++ {
 	for gtidCount < 4 || !gotCreateTable || !gotTableMapEvent || !gotInsert || !gotUpdate || !gotDelete || beginCount != 3 || commitCount != 3 {
 		be, err := conn.ReadBinlogEvent()
-		if err != nil {
-			t.Fatalf("ReadPacket failed: %v", err)
-		}
-		if !be.IsValid() {
-			t.Fatalf("read an invalid packet: %v", be)
-		}
+		require.NoError(t, err, "ReadPacket failed: %v", err)
+		require.True(t, be.IsValid(), "read an invalid packet: %v", be)
+
 		be, _, err = be.StripChecksum(f)
-		if err != nil {
-			t.Fatalf("StripChecksum failed: %v", err)
-		}
+		require.NoError(t, err, "StripChecksum failed: %v", err)
+
 		switch {
 		case be.IsGTID():
 			// We expect one of these at least.
@@ -458,7 +342,7 @@ func TestRowReplicationWithRealDatabase(t *testing.T) {
 
 }
 
-// TestRowReplicationTypes creates a table wih all
+// TestRowReplicationTypes creates a table with all
 // supported data types. Then we insert a row in it. then we re-build
 // the SQL for the values, re-insert these. Then we select from the
 // database and make sure both rows are identical.
@@ -971,7 +855,7 @@ func TestRowReplicationTypes(t *testing.T) {
 		}, {
 			name:        "json24",
 			createType:  "JSON",
-			createValue: "CAST(CAST('2015-01-15 23:24:25' AS DATETIME) AS JSON)",
+			createValue: "CAST(CAST('2015-01-24 23:24:25' AS DATETIME) AS JSON)",
 		}, {
 			name:        "json25",
 			createType:  "JSON",
@@ -979,15 +863,15 @@ func TestRowReplicationTypes(t *testing.T) {
 		}, {
 			name:        "json26",
 			createType:  "JSON",
-			createValue: "CAST(CAST('23:24:25.12' AS TIME(3)) AS JSON)",
+			createValue: "CAST(CAST('23:24:26.12' AS TIME(3)) AS JSON)",
 		}, {
 			name:        "json27",
 			createType:  "JSON",
-			createValue: "CAST(CAST('2015-01-15' AS DATE) AS JSON)",
+			createValue: "CAST(CAST('2015-01-27' AS DATE) AS JSON)",
 		}, {
 			name:        "json28",
 			createType:  "JSON",
-			createValue: "CAST(TIMESTAMP'2015-01-15 23:24:25' AS JSON)",
+			createValue: "CAST(TIMESTAMP'2015-01-28 23:24:28' AS JSON)",
 		}, {
 			name:        "json29",
 			createType:  "JSON",
@@ -1012,6 +896,10 @@ func TestRowReplicationTypes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dConn.Close()
+	// We have tests for zero dates, so we need to allow that for this session.
+	if _, err := dConn.ExecuteFetch("SET @@session.sql_mode=REPLACE(REPLACE(@@session.sql_mode, 'NO_ZERO_DATE', ''), 'NO_ZERO_IN_DATE', '')", 0, false); err != nil {
+		t.Fatal(err)
+	}
 
 	// Set the connection time zone for execution of the
 	// statements to PST. That way we're sure to test the
@@ -1035,10 +923,10 @@ func TestRowReplicationTypes(t *testing.T) {
 	for _, tcase := range testcases {
 		insert += fmt.Sprintf(", %v=%v", tcase.name, tcase.createValue)
 	}
+
 	result, err := dConn.ExecuteFetch(insert, 0, false)
-	if err != nil {
-		t.Fatalf("insert failed: %v", err)
-	}
+	require.NoError(t, err, "insert failed: %v", err)
+
 	if result.RowsAffected != 1 || len(result.Rows) != 0 {
 		t.Errorf("unexpected result for insert: %v", result)
 	}
@@ -1051,16 +939,12 @@ func TestRowReplicationTypes(t *testing.T) {
 
 	for values == nil {
 		be, err := conn.ReadBinlogEvent()
-		if err != nil {
-			t.Fatalf("ReadPacket failed: %v", err)
-		}
-		if !be.IsValid() {
-			t.Fatalf("read an invalid packet: %v", be)
-		}
+		require.NoError(t, err, "ReadPacket failed: %v", err)
+		require.True(t, be.IsValid(), "read an invalid packet: %v", be)
+
 		be, _, err = be.StripChecksum(f)
-		if err != nil {
-			t.Fatalf("StripChecksum failed: %v", err)
-		}
+		require.NoError(t, err, "StripChecksum failed: %v", err)
+
 		switch {
 		case be.IsTableMap():
 			tableID = be.TableID(f) // This would be 0x00ffffff for an event to clear all table map entries.
@@ -1107,7 +991,12 @@ func TestRowReplicationTypes(t *testing.T) {
 		sql.WriteString(", ")
 		sql.WriteString(tcase.name)
 		sql.WriteString(" = ")
-		if values[i+1].Type() == querypb.Type_TIMESTAMP && !bytes.HasPrefix(values[i+1].ToBytes(), mysql.ZeroTimestamp) {
+		valueBytes, err := values[i+1].ToBytes()
+		// Expression values are not supported with ToBytes
+		if values[i+1].Type() != querypb.Type_EXPRESSION {
+			require.NoError(t, err)
+		}
+		if values[i+1].Type() == querypb.Type_TIMESTAMP && !bytes.HasPrefix(valueBytes, binlog.ZeroTimestamp) {
 			// Values in the binary log are UTC. Let's convert them
 			// to whatever timezone the connection is using,
 			// so MySQL properly converts them back to UTC.
@@ -1115,13 +1004,16 @@ func TestRowReplicationTypes(t *testing.T) {
 			values[i+1].EncodeSQL(&sql)
 			sql.WriteString(", '+00:00', @@session.time_zone)")
 		} else {
-			values[i+1].EncodeSQL(&sql)
+			if strings.Index(tcase.name, "json") == 0 {
+				sql.WriteString("'" + string(values[i+1].Raw()) + "'")
+			} else {
+				values[i+1].EncodeSQL(&sql)
+			}
 		}
 	}
 	result, err = dConn.ExecuteFetch(sql.String(), 0, false)
-	if err != nil {
-		t.Fatalf("insert '%v' failed: %v", sql.String(), err)
-	}
+	require.NoError(t, err, "insert '%v' failed: %v", sql.String(), err)
+
 	if result.RowsAffected != 1 || len(result.Rows) != 0 {
 		t.Errorf("unexpected result for insert: %v", result)
 	}
@@ -1134,16 +1026,12 @@ func TestRowReplicationTypes(t *testing.T) {
 	}
 	stmt += " from replicationtypes"
 	result, err = dConn.ExecuteFetch(stmt, 2, false)
-	if err != nil {
-		t.Fatalf("select failed: %v", err)
-	}
-	if len(result.Rows) != 2 {
-		t.Fatalf("unexpected result for select: %v", result)
-	}
+	require.NoError(t, err, "select failed: %v", err)
+	require.Equal(t, 2, len(result.Rows), "unexpected result for select: %v", result)
+
 	for i, tcase := range testcases {
-		if !reflect.DeepEqual(result.Rows[0][i+1], result.Rows[1][i+1]) {
-			t.Errorf("Field %v is not the same, got %v and %v", tcase.name, result.Rows[0][i+1], result.Rows[1][i+1])
-		}
+		assert.True(t, reflect.DeepEqual(result.Rows[0][i+1], result.Rows[1][i+1]), "Field %v is not the same, got %v and %v", tcase.name, result.Rows[0][i+1], result.Rows[1][i+1])
+
 	}
 
 	// Drop the table, we're done.
@@ -1176,7 +1064,7 @@ func valuesForTests(t *testing.T, rs *mysql.Rows, tm *mysql.TableMap, rowIndex i
 		}
 
 		// We have real data
-		value, l, err := mysql.CellValue(data, pos, tm.Types[c], tm.Metadata[c], querypb.Type_UINT64)
+		value, l, err := binlog.CellValue(data, pos, tm.Types[c], tm.Metadata[c], &querypb.Field{Type: querypb.Type_UINT64})
 		if err != nil {
 			return nil, err
 		}

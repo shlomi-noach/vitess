@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -17,7 +17,9 @@ limitations under the License.
 package mysql
 
 import (
+	"vitess.io/vitess/go/mysql/sqlerror"
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/sqlparser"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
 )
@@ -30,15 +32,15 @@ import (
 func (c *Conn) ExecuteStreamFetch(query string) (err error) {
 	defer func() {
 		if err != nil {
-			if sqlerr, ok := err.(*SQLError); ok {
-				sqlerr.Query = query
+			if sqlerr, ok := err.(*sqlerror.SQLError); ok {
+				sqlerr.Query = sqlparser.TruncateQuery(query, c.truncateErrLen)
 			}
 		}
 	}()
 
 	// Sanity check.
 	if c.fields != nil {
-		return NewSQLError(CRCommandsOutOfSync, SSUnknownSQLState, "streaming query already in progress")
+		return sqlerror.NewSQLError(sqlerror.CRCommandsOutOfSync, sqlerror.SSUnknownSQLState, "streaming query already in progress")
 	}
 
 	// Send the query as a COM_QUERY packet.
@@ -47,7 +49,8 @@ func (c *Conn) ExecuteStreamFetch(query string) (err error) {
 	}
 
 	// Get the result.
-	_, _, colNumber, _, err := c.readComQueryResponse()
+	var packetOk PacketOK
+	colNumber, err := c.readComQueryResponse(&packetOk)
 	if err != nil {
 		return err
 	}
@@ -75,17 +78,17 @@ func (c *Conn) ExecuteStreamFetch(query string) (err error) {
 		// EOF is only present here if it's not deprecated.
 		data, err := c.readEphemeralPacket()
 		if err != nil {
-			return NewSQLError(CRServerLost, SSUnknownSQLState, "%v", err)
+			return sqlerror.NewSQLError(sqlerror.CRServerLost, sqlerror.SSUnknownSQLState, "%v", err)
 		}
 		defer c.recycleReadPacket()
-		if isEOFPacket(data) {
+		if c.isEOFPacket(data) {
 			// This is what we expect.
 			// Warnings and status flags are ignored.
 			// goto: end
 		} else if isErrorPacket(data) {
 			return ParseErrorPacket(data)
 		} else {
-			return NewSQLError(CRCommandsOutOfSync, SSUnknownSQLState, "unexpected packet after fields: %v", data)
+			return sqlerror.NewSQLError(sqlerror.CRCommandsOutOfSync, sqlerror.SSUnknownSQLState, "unexpected packet after fields: %v", data)
 		}
 	}
 
@@ -96,7 +99,7 @@ func (c *Conn) ExecuteStreamFetch(query string) (err error) {
 // Fields returns the fields for an ongoing streaming query.
 func (c *Conn) Fields() ([]*querypb.Field, error) {
 	if c.fields == nil {
-		return nil, NewSQLError(CRCommandsOutOfSync, SSUnknownSQLState, "no streaming query in progress")
+		return nil, sqlerror.NewSQLError(sqlerror.CRCommandsOutOfSync, sqlerror.SSUnknownSQLState, "no streaming query in progress")
 	}
 	if len(c.fields) == 0 {
 		// The query returned an empty field list.
@@ -107,10 +110,10 @@ func (c *Conn) Fields() ([]*querypb.Field, error) {
 
 // FetchNext returns the next result for an ongoing streaming query.
 // It returns (nil, nil) if there is nothing more to read.
-func (c *Conn) FetchNext() ([]sqltypes.Value, error) {
+func (c *Conn) FetchNext(in []sqltypes.Value) ([]sqltypes.Value, error) {
 	if c.fields == nil {
 		// We are already done, and the result was closed.
-		return nil, NewSQLError(CRCommandsOutOfSync, SSUnknownSQLState, "no streaming query in progress")
+		return nil, sqlerror.NewSQLError(sqlerror.CRCommandsOutOfSync, sqlerror.SSUnknownSQLState, "no streaming query in progress")
 	}
 
 	if len(c.fields) == 0 {
@@ -123,7 +126,7 @@ func (c *Conn) FetchNext() ([]sqltypes.Value, error) {
 		return nil, err
 	}
 
-	if isEOFPacket(data) {
+	if c.isEOFPacket(data) {
 		// Warnings and status flags are ignored.
 		c.fields = nil
 		return nil, nil
@@ -133,14 +136,15 @@ func (c *Conn) FetchNext() ([]sqltypes.Value, error) {
 	}
 
 	// Regular row.
-	return c.parseRow(data, c.fields)
+	return c.parseRow(data, c.fields, readLenEncStringAsBytes, in)
 }
 
 // CloseResult can be used to terminate a streaming query
 // early. It just drains the remaining values.
 func (c *Conn) CloseResult() {
+	row := make([]sqltypes.Value, 0, len(c.fields))
 	for c.fields != nil {
-		rows, err := c.FetchNext()
+		rows, err := c.FetchNext(row[:0])
 		if err != nil || rows == nil {
 			// We either got an error, or got the last result.
 			c.fields = nil

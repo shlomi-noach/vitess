@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -205,9 +205,9 @@ func (m *managerImpl) throttlerNamesLocked() []string {
 	return names
 }
 
-// Log returns the most recent changes of the MaxReplicationLag module.
+// log returns the most recent changes of the MaxReplicationLag module.
 // There will be one result for each processed replication lag record.
-func (m *managerImpl) Log(throttlerName string) ([]result, error) {
+func (m *managerImpl) log(throttlerName string) ([]result, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -216,5 +216,5 @@ func (m *managerImpl) Log(throttlerName string) ([]result, error) {
 		return nil, fmt.Errorf("throttler: %v does not exist", throttlerName)
 	}
 
-	return t.Log(), nil
+	return t.log(), nil
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ limitations under the License.
 package sync2
 
 import (
+	"sync/atomic"
 	"time"
 )
 
@@ -30,8 +31,9 @@ import (
 type Batcher struct {
 	interval time.Duration
 	queue    chan int
-	waiters  AtomicInt32
-	nextID   AtomicInt32
+	waiters  atomic.Int32
+	nextID   atomic.Int32
+	after    func(time.Duration) <-chan time.Time
 }
 
 // NewBatcher returns a new Batcher
@@ -39,8 +41,17 @@ func NewBatcher(interval time.Duration) *Batcher {
 	return &Batcher{
 		interval: interval,
 		queue:    make(chan int),
-		waiters:  NewAtomicInt32(0),
-		nextID:   NewAtomicInt32(0),
+		after:    time.After,
+	}
+}
+
+// newBatcherForTest returns a Batcher for testing where time.After can
+// be replaced by a fake alternative.
+func newBatcherForTest(interval time.Duration, after func(time.Duration) <-chan time.Time) *Batcher {
+	return &Batcher{
+		interval: interval,
+		queue:    make(chan int),
+		after:    after,
 	}
 }
 
@@ -56,16 +67,16 @@ func (b *Batcher) Wait() int {
 // newBatch starts a new batch
 func (b *Batcher) newBatch() {
 	go func() {
-		time.Sleep(b.interval)
+		<-b.after(b.interval)
 
 		id := b.nextID.Add(1)
 
 		// Make sure to atomically reset the number of waiters to make
 		// sure that all incoming requests either make it into the
 		// current batch or the next one.
-		waiters := b.waiters.Get()
+		waiters := b.waiters.Load()
 		for !b.waiters.CompareAndSwap(waiters, 0) {
-			waiters = b.waiters.Get()
+			waiters = b.waiters.Load()
 		}
 
 		for i := int32(0); i < waiters; i++ {

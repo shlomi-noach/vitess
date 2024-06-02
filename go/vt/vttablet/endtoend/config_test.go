@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,120 +18,30 @@ package endtoend
 
 import (
 	"fmt"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+
+	"github.com/stretchr/testify/require"
+
 	"vitess.io/vitess/go/sqltypes"
 	querypb "vitess.io/vitess/go/vt/proto/query"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vttablet/endtoend/framework"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 )
 
-// compareIntDiff returns an error if end[tag] != start[tag]+diff.
-func compareIntDiff(end map[string]interface{}, tag string, start map[string]interface{}, diff int) error {
-	return verifyIntValue(end, tag, framework.FetchInt(start, tag)+diff)
-}
-
-// verifyIntValue retuns an error if values[tag] != want.
-func verifyIntValue(values map[string]interface{}, tag string, want int) error {
-	got := framework.FetchInt(values, tag)
-	if got != want {
-		return fmt.Errorf("%s: %d, want %d", tag, got, want)
-	}
-	return nil
-}
-
-func TestConfigVars(t *testing.T) {
-	vars := framework.DebugVars()
-	cases := []struct {
-		tag string
-		val int
-	}{{
-		tag: "BeginTimeout",
-		val: int(tabletenv.Config.TxPoolTimeout * 1e9),
-	}, {
-		tag: "ConnPoolAvailable",
-		val: tabletenv.Config.PoolSize,
-	}, {
-		tag: "ConnPoolCapacity",
-		val: tabletenv.Config.PoolSize,
-	}, {
-		tag: "ConnPoolIdleTimeout",
-		val: int(tabletenv.Config.IdleTimeout * 1e9),
-	}, {
-		tag: "ConnPoolMaxCap",
-		val: tabletenv.Config.PoolSize,
-	}, {
-		tag: "MaxDMLRows",
-		val: tabletenv.Config.MaxDMLRows,
-	}, {
-		tag: "MaxResultSize",
-		val: tabletenv.Config.MaxResultSize,
-	}, {
-		tag: "WarnResultSize",
-		val: tabletenv.Config.WarnResultSize,
-	}, {
-		tag: "QueryCacheCapacity",
-		val: tabletenv.Config.QueryPlanCacheSize,
-	}, {
-		tag: "QueryTimeout",
-		val: int(tabletenv.Config.QueryTimeout * 1e9),
-	}, {
-		tag: "QueryPoolTimeout",
-		val: int(tabletenv.Config.QueryPoolTimeout * 1e9),
-	}, {
-		tag: "SchemaReloadTime",
-		val: int(tabletenv.Config.SchemaReloadTime * 1e9),
-	}, {
-		tag: "StreamBufferSize",
-		val: tabletenv.Config.StreamBufferSize,
-	}, {
-		tag: "StreamConnPoolAvailable",
-		val: tabletenv.Config.StreamPoolSize,
-	}, {
-		tag: "StreamConnPoolCapacity",
-		val: tabletenv.Config.StreamPoolSize,
-	}, {
-		tag: "StreamConnPoolIdleTimeout",
-		val: int(tabletenv.Config.IdleTimeout * 1e9),
-	}, {
-		tag: "StreamConnPoolMaxCap",
-		val: tabletenv.Config.StreamPoolSize,
-	}, {
-		tag: "TransactionPoolAvailable",
-		val: tabletenv.Config.TransactionCap,
-	}, {
-		tag: "TransactionPoolCapacity",
-		val: tabletenv.Config.TransactionCap,
-	}, {
-		tag: "TransactionPoolIdleTimeout",
-		val: int(tabletenv.Config.IdleTimeout * 1e9),
-	}, {
-		tag: "TransactionPoolMaxCap",
-		val: tabletenv.Config.TransactionCap,
-	}, {
-		tag: "TransactionPoolTimeout",
-		val: int(tabletenv.Config.TransactionTimeout * 1e9),
-	}}
-	for _, tcase := range cases {
-		if err := verifyIntValue(vars, tcase.tag, tcase.val); err != nil {
-			t.Error(err)
-		}
-	}
-}
-
 func TestPoolSize(t *testing.T) {
-	defer framework.Server.SetPoolSize(framework.Server.PoolSize())
-	framework.Server.SetPoolSize(1)
+	revert := changeVar(t, "PoolSize", "1")
+	defer revert()
 
 	vstart := framework.DebugVars()
-	if err := verifyIntValue(vstart, "ConnPoolCapacity", 1); err != nil {
-		t.Error(err)
-	}
+	verifyIntValue(t, vstart, "ConnPoolCapacity", 1)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -152,13 +62,19 @@ func TestPoolSize(t *testing.T) {
 	tag := "ConnPoolWaitCount"
 	got := framework.FetchInt(framework.DebugVars(), tag)
 	want := framework.FetchInt(vstart, tag)
-	if got <= want {
-		t.Errorf("%s: %d, must be greater than %d", tag, got, want)
-	}
+	assert.LessOrEqual(t, want, got)
+}
+
+func TestStreamPoolSize(t *testing.T) {
+	revert := changeVar(t, "StreamPoolSize", "1")
+	defer revert()
+
+	vstart := framework.DebugVars()
+	verifyIntValue(t, vstart, "StreamConnPoolCapacity", 1)
 }
 
 func TestDisableConsolidator(t *testing.T) {
-	totalConsolidationsTag := "Waits/Histograms/Consolidations/inf"
+	totalConsolidationsTag := "Waits/Histograms/Consolidations/Count"
 	initial := framework.FetchInt(framework.DebugVars(), totalConsolidationsTag)
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -172,11 +88,10 @@ func TestDisableConsolidator(t *testing.T) {
 	}()
 	wg.Wait()
 	afterOne := framework.FetchInt(framework.DebugVars(), totalConsolidationsTag)
-	if initial+1 != afterOne {
-		t.Errorf("expected one consolidation, but got: before consolidation count: %v; after consolidation count: %v", initial, afterOne)
-	}
-	framework.Server.SetConsolidatorEnabled(false)
-	defer framework.Server.SetConsolidatorEnabled(true)
+	assert.Equal(t, initial+1, afterOne, "expected one consolidation")
+
+	revert := changeVar(t, "Consolidator", tabletenv.Disable)
+	defer revert()
 	var wg2 sync.WaitGroup
 	wg2.Add(2)
 	go func() {
@@ -189,79 +104,147 @@ func TestDisableConsolidator(t *testing.T) {
 	}()
 	wg2.Wait()
 	noNewConsolidations := framework.FetchInt(framework.DebugVars(), totalConsolidationsTag)
-	if afterOne != noNewConsolidations {
-		t.Errorf("expected no new consolidations, but got: before consolidation count: %v; after consolidation count: %v", afterOne, noNewConsolidations)
+	assert.Equal(t, afterOne, noNewConsolidations, "expected no new consolidations")
+}
+
+func TestConsolidatorReplicasOnly(t *testing.T) {
+	type executeFn func(
+		query string, bindvars map[string]*querypb.BindVariable,
+	) (*sqltypes.Result, error)
+
+	testCases := []struct {
+		name                   string
+		getExecuteFn           func(qc *framework.QueryClient) executeFn
+		totalConsolidationsTag string
+	}{
+		{
+			name:                   "Execute",
+			getExecuteFn:           func(qc *framework.QueryClient) executeFn { return qc.Execute },
+			totalConsolidationsTag: "Waits/Histograms/Consolidations/Count",
+		},
+		{
+			name:                   "StreamExecute",
+			getExecuteFn:           func(qc *framework.QueryClient) executeFn { return qc.StreamExecute },
+			totalConsolidationsTag: "Waits/Histograms/StreamConsolidations/Count",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			initial := framework.FetchInt(framework.DebugVars(), testCase.totalConsolidationsTag)
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				testCase.getExecuteFn(framework.NewClient())("select sleep(0.5) from dual", nil)
+				wg.Done()
+			}()
+			go func() {
+				testCase.getExecuteFn(framework.NewClient())("select sleep(0.5) from dual", nil)
+				wg.Done()
+			}()
+			wg.Wait()
+			afterOne := framework.FetchInt(framework.DebugVars(), testCase.totalConsolidationsTag)
+			assert.Equal(t, initial+1, afterOne, "expected one consolidation")
+
+			revert := changeVar(t, "Consolidator", tabletenv.NotOnPrimary)
+			defer revert()
+
+			// primary should not do query consolidation
+			var wg2 sync.WaitGroup
+			wg2.Add(2)
+			go func() {
+				testCase.getExecuteFn(framework.NewClient())("select sleep(0.5) from dual", nil)
+				wg2.Done()
+			}()
+			go func() {
+				testCase.getExecuteFn(framework.NewClient())("select sleep(0.5) from dual", nil)
+				wg2.Done()
+			}()
+			wg2.Wait()
+			noNewConsolidations := framework.FetchInt(framework.DebugVars(), testCase.totalConsolidationsTag)
+			assert.Equal(t, afterOne, noNewConsolidations, "expected no new consolidations")
+
+			// become a replica, where query consolidation should happen
+			client := framework.NewClientWithTabletType(topodatapb.TabletType_REPLICA)
+
+			err := client.SetServingType(topodatapb.TabletType_REPLICA)
+			require.NoError(t, err)
+			defer func() {
+				err = client.SetServingType(topodatapb.TabletType_PRIMARY)
+				require.NoError(t, err)
+			}()
+
+			initial = framework.FetchInt(framework.DebugVars(), testCase.totalConsolidationsTag)
+			var wg3 sync.WaitGroup
+			wg3.Add(2)
+			go func() {
+				testCase.getExecuteFn(client)("select sleep(0.5) from dual", nil)
+				wg3.Done()
+			}()
+			go func() {
+				testCase.getExecuteFn(client)("select sleep(0.5) from dual", nil)
+				wg3.Done()
+			}()
+			wg3.Wait()
+			afterOne = framework.FetchInt(framework.DebugVars(), testCase.totalConsolidationsTag)
+			assert.Equal(t, initial+1, afterOne, "expected another consolidation")
+		})
 	}
 }
 
 func TestQueryPlanCache(t *testing.T) {
-	defer framework.Server.SetQueryPlanCacheCap(framework.Server.QueryPlanCacheCap())
-	framework.Server.SetQueryPlanCacheCap(1)
+	var cachedPlanSize = int((&tabletserver.TabletPlan{}).CachedSize(true))
+
+	// sleep to avoid race between SchemaChanged event clearing out the plans cache which breaks this test
+	framework.Server.WaitForSchemaReset(2 * time.Second)
 
 	bindVars := map[string]*querypb.BindVariable{
 		"ival1": sqltypes.Int64BindVariable(1),
 		"ival2": sqltypes.Int64BindVariable(1),
 	}
+
+	framework.Server.ClearQueryPlanCache()
+
 	client := framework.NewClient()
 	_, _ = client.Execute("select * from vitess_test where intval=:ival1", bindVars)
-	_, _ = client.Execute("select * from vitess_test where intval=:ival2", bindVars)
-	vend := framework.DebugVars()
-	if err := verifyIntValue(vend, "QueryCacheLength", 1); err != nil {
-		t.Error(err)
-	}
-	if err := verifyIntValue(vend, "QueryCacheSize", 1); err != nil {
-		t.Error(err)
-	}
-	if err := verifyIntValue(vend, "QueryCacheCapacity", 1); err != nil {
-		t.Error(err)
-	}
-
-	framework.Server.SetQueryPlanCacheCap(10)
 	_, _ = client.Execute("select * from vitess_test where intval=:ival1", bindVars)
+	assert.Equal(t, 1, framework.Server.QueryPlanCacheLen())
+
+	vend := framework.DebugVars()
+	assert.GreaterOrEqual(t, framework.FetchInt(vend, "QueryCacheSize"), cachedPlanSize)
+
+	_, _ = client.Execute("select * from vitess_test where intval=:ival2", bindVars)
+	require.Equal(t, 2, framework.Server.QueryPlanCacheLen())
+
 	vend = framework.DebugVars()
-	if err := verifyIntValue(vend, "QueryCacheLength", 2); err != nil {
-		t.Error(err)
-	}
-	if err := verifyIntValue(vend, "QueryCacheSize", 2); err != nil {
-		t.Error(err)
-	}
+	assert.GreaterOrEqual(t, framework.FetchInt(vend, "QueryCacheSize"), 2*cachedPlanSize)
 
 	_, _ = client.Execute("select * from vitess_test where intval=1", bindVars)
+	require.Equal(t, 3, framework.Server.QueryPlanCacheLen())
+
 	vend = framework.DebugVars()
-	if err := verifyIntValue(vend, "QueryCacheLength", 3); err != nil {
-		t.Error(err)
-	}
-	if err := verifyIntValue(vend, "QueryCacheSize", 3); err != nil {
-		t.Error(err)
-	}
+	assert.GreaterOrEqual(t, framework.FetchInt(vend, "QueryCacheSize"), 3*cachedPlanSize)
 }
 
 func TestMaxResultSize(t *testing.T) {
-	defer framework.Server.SetMaxResultSize(framework.Server.MaxResultSize())
-	framework.Server.SetMaxResultSize(2)
+	revert := changeVar(t, "MaxResultSize", "2")
+	defer revert()
 
 	client := framework.NewClient()
 	query := "select * from vitess_test"
 	_, err := client.Execute(query, nil)
+	assert.Error(t, err)
 	want := "Row count exceeded"
-	if err == nil || !strings.HasPrefix(err.Error(), want) {
-		t.Errorf("Error: %v, must start with %s", err, want)
-	}
-	if err := verifyIntValue(framework.DebugVars(), "MaxResultSize", 2); err != nil {
-		t.Error(err)
-	}
-
+	assert.Contains(t, err.Error(), want, "Error: %v, must start with %s", err, want)
+	verifyIntValue(t, framework.DebugVars(), "MaxResultSize", 2)
 	framework.Server.SetMaxResultSize(10)
 	_, err = client.Execute(query, nil)
-	if err != nil {
-		t.Error(err)
-		return
-	}
+	require.NoError(t, err)
 }
 
 func TestWarnResultSize(t *testing.T) {
-	defer framework.Server.SetWarnResultSize(framework.Server.WarnResultSize())
-	framework.Server.SetWarnResultSize(2)
+	revert := changeVar(t, "WarnResultSize", "2")
+	defer revert()
 	client := framework.NewClient()
 
 	originalWarningsResultsExceededCount := framework.FetchInt(framework.DebugVars(), "Warnings/ResultsExceeded")
@@ -269,328 +252,70 @@ func TestWarnResultSize(t *testing.T) {
 	_, _ = client.Execute(query, nil)
 	newWarningsResultsExceededCount := framework.FetchInt(framework.DebugVars(), "Warnings/ResultsExceeded")
 	exceededCountDiff := newWarningsResultsExceededCount - originalWarningsResultsExceededCount
-	if exceededCountDiff != 1 {
-		t.Errorf("Warnings.ResultsExceeded counter should have increased by 1, instead got %v", exceededCountDiff)
-	}
+	assert.Equal(t, 1, exceededCountDiff, "Warnings.ResultsExceeded counter should have increased by 1")
 
-	if err := verifyIntValue(framework.DebugVars(), "WarnResultSize", 2); err != nil {
-		t.Error(err)
-	}
-
+	verifyIntValue(t, framework.DebugVars(), "WarnResultSize", 2)
 	framework.Server.SetWarnResultSize(10)
 	_, _ = client.Execute(query, nil)
 	newerWarningsResultsExceededCount := framework.FetchInt(framework.DebugVars(), "Warnings/ResultsExceeded")
 	exceededCountDiff = newerWarningsResultsExceededCount - newWarningsResultsExceededCount
-	if exceededCountDiff != 0 {
-		t.Errorf("Warnings.ResultsExceeded counter should not have increased, instead got %v", exceededCountDiff)
-	}
-}
-
-func TestMaxDMLRows(t *testing.T) {
-	client := framework.NewClient()
-	_, err := client.Execute(
-		"insert into vitess_a(eid, id, name, foo) values "+
-			"(3, 1, '', ''), (3, 2, '', ''), (3, 3, '', '')",
-		nil,
-	)
-	catcher := framework.NewQueryCatcher()
-	defer catcher.Close()
-
-	// Verify all three rows are updated in a single DML.
-	_, err = client.Execute("update vitess_a set foo='fghi' where eid = 3", nil)
-	if err != nil {
-		t.Error(err)
-		return
-	}
-	queryInfo, err := catcher.Next()
-	if err != nil {
-		t.Error(err)
-		return
-	}
-	want := "begin; " +
-		"select eid, id from vitess_a where eid = 3 limit 10001 for update; " +
-		"update vitess_a set foo = 'fghi' where " +
-		"(eid = 3 and id = 1) or (eid = 3 and id = 2) or (eid = 3 and id = 3) " +
-		"/* _stream vitess_a (eid id ) (3 1 ) (3 2 ) (3 3 ); */; " +
-		"commit"
-	if queryInfo.RewrittenSQL() != want {
-		t.Errorf("Query info: \n%s, want \n%s", queryInfo.RewrittenSQL(), want)
-	}
-
-	// Verify that rows get split, and if pk changes, those values are also
-	// split correctly.
-	defer framework.Server.SetMaxDMLRows(framework.Server.MaxDMLRows())
-	framework.Server.SetMaxDMLRows(2)
-	_, err = client.Execute("update vitess_a set eid=2 where eid = 3", nil)
-	if err != nil {
-		t.Error(err)
-		return
-	}
-	queryInfo, err = catcher.Next()
-	if err != nil {
-		t.Error(err)
-		return
-	}
-	want = "begin; " +
-		"select eid, id from vitess_a where eid = 3 limit 10001 for update; " +
-		"update vitess_a set eid = 2 where " +
-		"(eid = 3 and id = 1) or (eid = 3 and id = 2) " +
-		"/* _stream vitess_a (eid id ) (3 1 ) (3 2 ) (2 1 ) (2 2 ); */; " +
-		"update vitess_a set eid = 2 where (eid = 3 and id = 3) " +
-		"/* _stream vitess_a (eid id ) (3 3 ) (2 3 ); */; " +
-		"commit"
-	if queryInfo.RewrittenSQL() != want {
-		t.Errorf("Query info: \n%s, want \n%s", queryInfo.RewrittenSQL(), want)
-	}
-
-	// Verify that a normal update is split correctly.
-	_, err = client.Execute("update vitess_a set foo='fghi' where eid = 2", nil)
-	if err != nil {
-		t.Error(err)
-		return
-	}
-	queryInfo, err = catcher.Next()
-	if err != nil {
-		t.Error(err)
-		return
-	}
-	want = "begin; " +
-		"select eid, id from vitess_a where eid = 2 limit 10001 for update; " +
-		"update vitess_a set foo = 'fghi' where (eid = 2 and id = 1) or " +
-		"(eid = 2 and id = 2) /* _stream vitess_a (eid id ) (2 1 ) (2 2 ); */; " +
-		"update vitess_a set foo = 'fghi' where (eid = 2 and id = 3) " +
-		"/* _stream vitess_a (eid id ) (2 3 ); */; " +
-		"commit"
-	if queryInfo.RewrittenSQL() != want {
-		t.Errorf("Query info: \n%s, want \n%s", queryInfo.RewrittenSQL(), want)
-	}
-
-	// Verufy that a delete is split correctly.
-	_, err = client.Execute("delete from vitess_a where eid = 2", nil)
-	if err != nil {
-		t.Error(err)
-		return
-	}
-	queryInfo, err = catcher.Next()
-	if err != nil {
-		t.Error(err)
-		return
-	}
-	want = "begin; " +
-		"select eid, id from vitess_a where eid = 2 limit 10001 for update; " +
-		"delete from vitess_a where (eid = 2 and id = 1) or (eid = 2 and id = 2) " +
-		"/* _stream vitess_a (eid id ) (2 1 ) (2 2 ); */; " +
-		"delete from vitess_a where (eid = 2 and id = 3) " +
-		"/* _stream vitess_a (eid id ) (2 3 ); */; " +
-		"commit"
-	if queryInfo.RewrittenSQL() != want {
-		t.Errorf("Query info: \n%s, want \n%s", queryInfo.RewrittenSQL(), want)
-	}
+	assert.Equal(t, 0, exceededCountDiff, "Warnings.ResultsExceeded counter should not have increased")
 }
 
 func TestQueryTimeout(t *testing.T) {
 	vstart := framework.DebugVars()
-	defer framework.Server.QueryTimeout.Set(framework.Server.QueryTimeout.Get())
-	framework.Server.QueryTimeout.Set(100 * time.Millisecond)
+	defer framework.Server.QueryTimeout.Store(framework.Server.QueryTimeout.Load())
+	framework.Server.QueryTimeout.Store(100 * time.Millisecond.Nanoseconds())
 
 	client := framework.NewClient()
 	err := client.Begin(false)
-	if err != nil {
-		t.Error(err)
-		return
-	}
+	require.NoError(t, err)
 	_, err = client.Execute("select sleep(1) from vitess_test", nil)
-	if code := vterrors.Code(err); code != vtrpcpb.Code_DEADLINE_EXCEEDED {
-		t.Errorf("Error code: %v, want %v", code, vtrpcpb.Code_DEADLINE_EXCEEDED)
-	}
+	assert.Equal(t, vtrpcpb.Code_CANCELED, vterrors.Code(err))
 	_, err = client.Execute("select 1 from dual", nil)
-	if code := vterrors.Code(err); code != vtrpcpb.Code_ABORTED {
-		t.Errorf("Error code: %v, want %v", code, vtrpcpb.Code_ABORTED)
-	}
+	assert.Equal(t, vtrpcpb.Code_ABORTED, vterrors.Code(err))
 	vend := framework.DebugVars()
-	if err := verifyIntValue(vend, "QueryTimeout", int(100*time.Millisecond)); err != nil {
-		t.Error(err)
+	verifyIntValue(t, vend, "QueryTimeout", int(100*time.Millisecond))
+	compareIntDiff(t, vend, "Kills/Connections", vstart, 1)
+}
+
+func changeVar(t *testing.T, name, value string) (revert func()) {
+	t.Helper()
+
+	vals := framework.FetchJSON("/debug/env?format=json")
+	initial, ok := vals[name]
+	if !ok {
+		t.Fatalf("%s not found in: %v", name, vals)
 	}
-	if err := compareIntDiff(vend, "Kills/Queries", vstart, 1); err != nil {
-		t.Error(err)
+	vals = framework.PostJSON("/debug/env?format=json", map[string]string{
+		"varname": name,
+		"value":   value,
+	})
+	verifyMapValue(t, vals, name, value)
+	return func() {
+		vals = framework.PostJSON("/debug/env?format=json", map[string]string{
+			"varname": name,
+			"value":   fmt.Sprintf("%v", initial),
+		})
+		verifyMapValue(t, vals, name, initial)
 	}
 }
 
-func TestQueryPoolTimeout(t *testing.T) {
-	vstart := framework.DebugVars()
-
-	defer framework.Server.SetQueryPoolTimeout(framework.Server.GetQueryPoolTimeout())
-	framework.Server.SetQueryPoolTimeout(100 * time.Millisecond)
-	defer framework.Server.SetPoolSize(framework.Server.PoolSize())
-	framework.Server.SetPoolSize(1)
-
-	client := framework.NewClient()
-
-	ch := make(chan error)
-	go func() {
-		_, qerr := framework.NewClient().Execute("select sleep(0.5) from dual", nil)
-		ch <- qerr
-	}()
-	// The queries have to be different so consolidator doesn't kick in.
-	go func() {
-		_, qerr := framework.NewClient().Execute("select sleep(0.49) from dual", nil)
-		ch <- qerr
-	}()
-
-	err1 := <-ch
-	err2 := <-ch
-
-	if err1 == nil && err2 == nil {
-		t.Errorf("both queries unexpectedly succeeded")
+func verifyMapValue(t *testing.T, values map[string]any, tag string, want any) {
+	t.Helper()
+	val, ok := values[tag]
+	if !ok {
+		t.Fatalf("%s not found in: %v", tag, values)
 	}
-	if err1 != nil && err2 != nil {
-		t.Errorf("both queries unexpectedly failed")
-	}
-
-	var err error
-	if err1 != nil {
-		err = err1
-	} else {
-		err = err2
-	}
-
-	if code := vterrors.Code(err); code != vtrpcpb.Code_RESOURCE_EXHAUSTED {
-		t.Errorf("Error code: %v, want %v", code, vtrpcpb.Code_RESOURCE_EXHAUSTED)
-	}
-
-	// Test that this doesn't override the query timeout
-	defer framework.Server.QueryTimeout.Set(framework.Server.QueryTimeout.Get())
-	framework.Server.QueryTimeout.Set(100 * time.Millisecond)
-
-	_, err = client.Execute("select sleep(1) from vitess_test", nil)
-	if code := vterrors.Code(err); code != vtrpcpb.Code_DEADLINE_EXCEEDED {
-		t.Errorf("Error code: %v, want %v", code, vtrpcpb.Code_DEADLINE_EXCEEDED)
-	}
-
-	vend := framework.DebugVars()
-	if err := verifyIntValue(vend, "QueryPoolTimeout", int(100*time.Millisecond)); err != nil {
-		t.Error(err)
-	}
-	if err := verifyIntValue(vend, "QueryTimeout", int(100*time.Millisecond)); err != nil {
-		t.Error(err)
-	}
-	if err := compareIntDiff(vend, "Kills/Queries", vstart, 1); err != nil {
-		t.Error(err)
-	}
+	assert.Equal(t, want, val)
 }
 
-func TestConnPoolWaitCap(t *testing.T) {
-	vstart := framework.DebugVars()
+func compareIntDiff(t *testing.T, end map[string]any, tag string, start map[string]any, diff int) {
+	t.Helper()
+	verifyIntValue(t, end, tag, framework.FetchInt(start, tag)+diff)
+}
 
-	defer framework.Server.SetPoolSize(framework.Server.PoolSize())
-	framework.Server.SetPoolSize(1)
-
-	defer framework.Server.SetQueryPoolWaiterCap(framework.Server.GetQueryPoolWaiterCap())
-	framework.Server.SetQueryPoolWaiterCap(1)
-
-	defer framework.Server.SetTxPoolWaiterCap(framework.Server.GetTxPoolWaiterCap())
-	framework.Server.SetTxPoolWaiterCap(1)
-
-	ch := make(chan error)
-	go func() {
-		_, qerr := framework.NewClient().Execute("select sleep(0.5) from dual", nil)
-		ch <- qerr
-	}()
-	// The queries have to be different so consolidator doesn't kick in.
-	go func() {
-		_, qerr := framework.NewClient().Execute("select sleep(0.49) from dual", nil)
-		ch <- qerr
-	}()
-	go func() {
-		_, qerr := framework.NewClient().Execute("select sleep(0.48) from dual", nil)
-		ch <- qerr
-	}()
-
-	err1 := <-ch
-	err2 := <-ch
-	err3 := <-ch
-
-	if err1 == nil && err2 == nil && err3 == nil {
-		t.Errorf("all queries unexpectedly succeeded")
-	}
-	if err1 != nil && err2 != nil && err3 != nil {
-		t.Errorf("all queries unexpectedly failed")
-	}
-
-	// At least one of the queries should have failed
-	var err error
-	if err1 != nil {
-		err = err1
-	}
-	if err2 != nil {
-		err = err2
-	}
-	if err3 != nil {
-		err = err3
-	}
-
-	if code := vterrors.Code(err); code != vtrpcpb.Code_RESOURCE_EXHAUSTED {
-		t.Errorf("Error code: %v, want %v", code, vtrpcpb.Code_RESOURCE_EXHAUSTED)
-	}
-
-	wantErr := "query pool waiter count exceeded"
-	if err == nil || !strings.Contains(err.Error(), wantErr) {
-		t.Errorf("Error: %v, want %v", err, wantErr)
-	}
-
-	// Test the same thing with transactions
-	go func() {
-		client := framework.NewClient()
-		beginErr := client.Begin(false)
-		if beginErr != nil {
-			ch <- beginErr
-			return
-		}
-
-		_, qerr := client.Execute("update vitess_a set foo='bar' where eid = 123", nil)
-		client.Rollback()
-		ch <- qerr
-	}()
-	go func() {
-		client := framework.NewClient()
-		beginErr := client.Begin(false)
-		if beginErr != nil {
-			ch <- beginErr
-			return
-		}
-
-		_, qerr := client.Execute("update vitess_a set foo='bar' where eid = 456", nil)
-		client.Rollback()
-		ch <- qerr
-	}()
-
-	err1 = <-ch
-	err2 = <-ch
-
-	if err1 == nil && err2 == nil {
-		t.Errorf("both queries unexpectedly succeeded")
-	}
-	if err1 != nil && err2 != nil {
-		t.Errorf("both queries unexpectedly failed")
-	}
-
-	if err1 != nil {
-		err = err1
-	} else {
-		err = err2
-	}
-
-	if code := vterrors.Code(err); code != vtrpcpb.Code_RESOURCE_EXHAUSTED {
-		t.Errorf("Error code: %v, want %v", code, vtrpcpb.Code_RESOURCE_EXHAUSTED)
-	}
-
-	wantErr = "transaction pool waiter count exceeded"
-	if err == nil || !strings.Contains(err.Error(), wantErr) {
-		t.Errorf("Error: %v, want %v", err, wantErr)
-	}
-
-	vend := framework.DebugVars()
-	if err := compareIntDiff(vend, "Kills/Queries", vstart, 0); err != nil {
-		t.Error(err)
-	}
+func verifyIntValue(t *testing.T, values map[string]any, tag string, want int) {
+	t.Helper()
+	require.Equal(t, want, framework.FetchInt(values, tag), tag)
 }

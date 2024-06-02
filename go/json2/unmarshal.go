@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,8 +22,8 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/golang/protobuf/jsonpb"
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 var carriageReturn = []byte("\n")
@@ -31,9 +31,10 @@ var carriageReturn = []byte("\n")
 // Unmarshal wraps json.Unmarshal, but returns errors that
 // also mention the line number. This function is not very
 // efficient and should not be used for high QPS operations.
-func Unmarshal(data []byte, v interface{}) error {
+func Unmarshal(data []byte, v any) error {
 	if pb, ok := v.(proto.Message); ok {
-		return annotate(data, jsonpb.Unmarshal(bytes.NewBuffer(data), pb))
+		opts := protojson.UnmarshalOptions{DiscardUnknown: true}
+		return annotate(data, opts.Unmarshal(data, pb))
 	}
 	return annotate(data, json.Unmarshal(data, v))
 }

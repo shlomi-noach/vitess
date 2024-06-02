@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -28,6 +28,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 
 	"vitess.io/vitess/go/sqltypes"
@@ -35,9 +38,7 @@ import (
 	"vitess.io/vitess/go/vt/vtgate/grpcvtgateservice"
 )
 
-var (
-	testAddress string
-)
+var testAddress string
 
 // TestMain tests the Vitess Go SQL driver.
 //
@@ -48,7 +49,7 @@ func TestMain(m *testing.M) {
 	service := CreateFakeServer()
 
 	// listen on a random port.
-	listener, err := net.Listen("tcp", ":0")
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		panic(fmt.Sprintf("Cannot listen: %v", err))
 	}
@@ -68,7 +69,7 @@ func TestOpen(t *testing.T) {
 		panic(err)
 	}
 
-	var testcases = []struct {
+	testcases := []struct {
 		desc    string
 		connStr string
 		conn    *conn
@@ -77,8 +78,10 @@ func TestOpen(t *testing.T) {
 			desc:    "Open()",
 			connStr: fmt.Sprintf(`{"address": "%s", "target": "@replica", "timeout": %d}`, testAddress, int64(30*time.Second)),
 			conn: &conn{
-				Configuration: Configuration{
-					Target: "@replica",
+				cfg: Configuration{
+					Protocol:   "grpc",
+					DriverName: "vitess",
+					Target:     "@replica",
 				},
 				convert: &converter{
 					location: time.UTC,
@@ -89,7 +92,10 @@ func TestOpen(t *testing.T) {
 			desc:    "Open() (defaults omitted)",
 			connStr: fmt.Sprintf(`{"address": "%s", "timeout": %d}`, testAddress, int64(30*time.Second)),
 			conn: &conn{
-				Configuration: Configuration{},
+				cfg: Configuration{
+					Protocol:   "grpc",
+					DriverName: "vitess",
+				},
 				convert: &converter{
 					location: time.UTC,
 				},
@@ -99,9 +105,10 @@ func TestOpen(t *testing.T) {
 			desc:    "Open() with keyspace",
 			connStr: fmt.Sprintf(`{"protocol": "grpc", "address": "%s", "target": "ks:0@replica", "timeout": %d}`, testAddress, int64(30*time.Second)),
 			conn: &conn{
-				Configuration: Configuration{
-					Protocol: "grpc",
-					Target:   "ks:0@replica",
+				cfg: Configuration{
+					Protocol:   "grpc",
+					DriverName: "vitess",
+					Target:     "ks:0@replica",
 				},
 				convert: &converter{
 					location: time.UTC,
@@ -114,7 +121,9 @@ func TestOpen(t *testing.T) {
 				`{"address": "%s", "timeout": %d, "defaultlocation": "America/Los_Angeles"}`,
 				testAddress, int64(30*time.Second)),
 			conn: &conn{
-				Configuration: Configuration{
+				cfg: Configuration{
+					Protocol:        "grpc",
+					DriverName:      "vitess",
 					DefaultLocation: "America/Los_Angeles",
 				},
 				convert: &converter{
@@ -133,7 +142,7 @@ func TestOpen(t *testing.T) {
 
 		wantc := tc.conn
 		newc := *(c.(*conn))
-		newc.Address = ""
+		newc.cfg.Address = ""
 		newc.conn = nil
 		newc.session = nil
 		if !reflect.DeepEqual(&newc, wantc) {
@@ -159,10 +168,8 @@ func TestOpen_InvalidJson(t *testing.T) {
 }
 
 func TestBeginIsolation(t *testing.T) {
-	db, err := Open(testAddress, "@master")
-	if err != nil {
-		t.Error(err)
-	}
+	db, err := Open(testAddress, "@primary")
+	require.NoError(t, err)
 	defer db.Close()
 	_, err = db.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
 	want := errIsolationUnsupported.Error()
@@ -215,7 +222,7 @@ func TestConfigurationToJSON(t *testing.T) {
 		Streaming:       true,
 		DefaultLocation: "Local",
 	}
-	want := `{"Protocol":"some-invalid-protocol","Address":"","Target":"ks2","Streaming":true,"DefaultLocation":"Local"}`
+	want := `{"Protocol":"some-invalid-protocol","Address":"","Target":"ks2","Streaming":true,"DefaultLocation":"Local","SessionToken":""}`
 
 	json, err := config.toJSON()
 	if err != nil {
@@ -246,7 +253,7 @@ func TestExecStreamingNotAllowed(t *testing.T) {
 }
 
 func TestQuery(t *testing.T) {
-	var testcases = []struct {
+	testcases := []struct {
 		desc        string
 		config      Configuration
 		requestName string
@@ -348,7 +355,7 @@ func TestQuery(t *testing.T) {
 }
 
 func TestBindVars(t *testing.T) {
-	var testcases = []struct {
+	testcases := []struct {
 		desc   string
 		in     []driver.NamedValue
 		out    map[string]*querypb.BindVariable
@@ -417,21 +424,21 @@ func TestBindVars(t *testing.T) {
 	converter := &converter{}
 
 	for _, tc := range testcases {
-		bv, err := converter.bindVarsFromNamedValues(tc.in)
-		if bv != nil {
-			if !reflect.DeepEqual(bv, tc.out) {
-				t.Errorf("%s: %v, want %v", tc.desc, bv, tc.out)
+		t.Run(tc.desc, func(t *testing.T) {
+			bv, err := converter.bindVarsFromNamedValues(tc.in)
+			if tc.outErr != "" {
+				assert.EqualError(t, err, tc.outErr)
+			} else {
+				if !reflect.DeepEqual(bv, tc.out) {
+					t.Errorf("%s: %v, want %v", tc.desc, bv, tc.out)
+				}
 			}
-		} else {
-			if err == nil || err.Error() != tc.outErr {
-				t.Errorf("%s: %v, want %v", tc.desc, err, tc.outErr)
-			}
-		}
+		})
 	}
 }
 
 func TestDatetimeQuery(t *testing.T) {
-	var testcases = []struct {
+	testcases := []struct {
 		desc        string
 		config      Configuration
 		requestName string
@@ -544,7 +551,7 @@ func TestTx(t *testing.T) {
 	c := Configuration{
 		Protocol: "grpc",
 		Address:  testAddress,
-		Target:   "@master",
+		Target:   "@primary",
 	}
 
 	db, err := OpenWithConfiguration(c)
@@ -615,4 +622,242 @@ func TestTxExecStreamingNotAllowed(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), want) {
 		t.Errorf("err: %v, does not contain %s", err, want)
 	}
+}
+
+func TestSessionToken(t *testing.T) {
+	c := Configuration{
+		Protocol: "grpc",
+		Address:  testAddress,
+		Target:   "@primary",
+	}
+
+	ctx := context.Background()
+
+	db, err := OpenWithConfiguration(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := tx.Prepare("txRequest")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = s.Exec(int64(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sessionToken, err := SessionTokenFromTx(ctx, tx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	distributedTxConfig := Configuration{
+		Address:      testAddress,
+		Target:       "@primary",
+		SessionToken: sessionToken,
+	}
+
+	sameTx, sameValidationFunc, err := DistributedTxFromSessionToken(ctx, distributedTxConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	newS, err := sameTx.Prepare("distributedTxRequest")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = newS.Exec(int64(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = sameValidationFunc()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// enforce that Rollback can't be called on the distributed tx
+	noRollbackTx, noRollbackValidationFunc, err := DistributedTxFromSessionToken(ctx, distributedTxConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = noRollbackValidationFunc()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = noRollbackTx.Rollback()
+	if err == nil || err.Error() != "calling Rollback from a distributed tx is not allowed" {
+		t.Fatal(err)
+	}
+
+	// enforce that Commit can't be called on the distributed tx
+	noCommitTx, noCommitValidationFunc, err := DistributedTxFromSessionToken(ctx, distributedTxConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = noCommitValidationFunc()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = noCommitTx.Commit()
+	if err == nil || err.Error() != "calling Commit from a distributed tx is not allowed" {
+		t.Fatal(err)
+	}
+
+	// finally commit the original tx
+	err = tx.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestStreamExec tests that different kinds of query present in `execMap` can run through streaming api
+func TestStreamExec(t *testing.T) {
+	db, err := OpenForStreaming(testAddress, "@rdonly")
+	require.NoError(t, err)
+	defer db.Close()
+
+	for k, v := range execMap {
+		t.Run(k, func(t *testing.T) {
+			s, err := db.Prepare(k)
+			require.NoError(t, err)
+			defer s.Close()
+
+			r, err := s.Query(0)
+			require.NoError(t, err)
+			defer r.Close()
+
+			fields, err := r.Columns()
+			require.NoError(t, err)
+			require.Equal(t, colList(v.result.Fields), fields)
+
+			for r.Next() {
+				require.NoError(t, r.Err())
+			}
+		})
+	}
+}
+
+func colList(fields []*querypb.Field) []string {
+	if fields == nil {
+		return nil
+	}
+	cols := make([]string, 0, len(fields))
+	for _, field := range fields {
+		cols = append(cols, field.Name)
+	}
+	return cols
+}
+
+func TestConnSeparateSessions(t *testing.T) {
+	c := Configuration{
+		Protocol: "grpc",
+		Address:  testAddress,
+		Target:   "@primary",
+	}
+
+	db, err := OpenWithConfiguration(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Each new connection starts a fresh session pointed at @primary. When the
+	// USE statement is executed, we simulate a change to that individual
+	// connection's target string.
+	//
+	// No connections are returned to the pool during this test and therefore
+	// the connection state should not be shared.
+	var conns []*sql.Conn
+	for i := 0; i < 3; i++ {
+		sconn, err := db.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conns = append(conns, sconn)
+
+		targets := []string{targetString(t, sconn)}
+
+		_, err = sconn.ExecContext(ctx, "use @rdonly")
+		require.NoError(t, err)
+
+		targets = append(targets, targetString(t, sconn))
+
+		require.Equal(t, []string{"@primary", "@rdonly"}, targets)
+	}
+
+	for _, c := range conns {
+		require.NoError(t, c.Close())
+	}
+}
+
+func TestConnReuseSessions(t *testing.T) {
+	c := Configuration{
+		Protocol: "grpc",
+		Address:  testAddress,
+		Target:   "@primary",
+	}
+
+	db, err := OpenWithConfiguration(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Pull an individual connection from the pool and execute a USE, resulting
+	// in changing the target string. We return the connection to the pool
+	// continuously in this test and verify that we keep pulling the same
+	// connection with its target string altered.
+	sconn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = sconn.ExecContext(ctx, "use @rdonly")
+	require.NoError(t, err)
+	require.NoError(t, sconn.Close())
+
+	var targets []string
+	for i := 0; i < 3; i++ {
+		sconn, err := db.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		targets = append(targets, targetString(t, sconn))
+		require.NoError(t, sconn.Close())
+	}
+
+	require.Equal(t, []string{"@rdonly", "@rdonly", "@rdonly"}, targets)
+}
+
+func targetString(t *testing.T, c *sql.Conn) string {
+	t.Helper()
+
+	var target string
+	require.NoError(t, c.Raw(func(driverConn any) error {
+		target = driverConn.(*conn).session.SessionPb().TargetString
+		return nil
+	}))
+
+	return target
 }

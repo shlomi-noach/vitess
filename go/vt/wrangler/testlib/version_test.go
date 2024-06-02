@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,15 +17,21 @@ limitations under the License.
 package testlib
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
+
+	"vitess.io/vitess/go/vt/discovery"
+	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/vtenv"
+	"vitess.io/vitess/go/vt/vttablet/tmclient"
 
 	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
-	"vitess.io/vitess/go/vt/vttablet/tmclient"
 	"vitess.io/vitess/go/vt/wrangler"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -55,44 +61,58 @@ func expvarHandler(gitRev *string) func(http.ResponseWriter, *http.Request) {
 }
 
 func TestVersion(t *testing.T) {
-	// We need to run this test with the /debug/vars version of the
-	// plugin.
-	wrangler.ResetDebugVarsGetVersion()
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
 
 	// Initialize our environment
-	ts := memorytopo.NewServer("cell1", "cell2")
-	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
-	vp := NewVtctlPipe(t, ts)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ts := memorytopo.NewServer(ctx, "cell1", "cell2")
+	wr := wrangler.New(vtenv.NewTestEnv(), logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
+	vp := NewVtctlPipe(ctx, t, ts)
 	defer vp.Close()
 
 	// couple tablets is enough
-	sourceMaster := NewFakeTablet(t, wr, "cell1", 10, topodatapb.TabletType_MASTER, nil,
+	sourcePrimary := NewFakeTablet(t, wr, "cell1", 10, topodatapb.TabletType_PRIMARY, nil,
 		TabletKeyspaceShard(t, "source", "0"),
 		StartHTTPServer())
 	sourceReplica := NewFakeTablet(t, wr, "cell1", 11, topodatapb.TabletType_REPLICA, nil,
 		TabletKeyspaceShard(t, "source", "0"),
 		StartHTTPServer())
 
-	// sourceMaster loop
-	sourceMasterGitRev := "fake git rev"
-	sourceMaster.StartActionLoop(t, wr)
-	sourceMaster.HTTPServer.Handler.(*http.ServeMux).HandleFunc("/debug/vars", expvarHandler(&sourceMasterGitRev))
-	defer sourceMaster.StopActionLoop(t)
+	// sourcePrimary loop
+	sourcePrimaryGitRev := "fake git rev"
+	sourcePrimary.StartActionLoop(t, wr)
+	sourcePrimary.HTTPServer.Handler.(*http.ServeMux).HandleFunc("/debug/vars", expvarHandler(&sourcePrimaryGitRev))
+	defer sourcePrimary.StopActionLoop(t)
 
 	// sourceReplica loop
 	sourceReplicaGitRev := "fake git rev"
+	sourceReplica.FakeMysqlDaemon.SetReplicationSourceInputs = append(sourceReplica.FakeMysqlDaemon.SetReplicationSourceInputs, topoproto.MysqlAddr(sourcePrimary.Tablet))
+	sourceReplica.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
+		// These 3 statements come from tablet startup
+		"STOP REPLICA",
+		"FAKE SET SOURCE",
+		"START REPLICA",
+	}
 	sourceReplica.StartActionLoop(t, wr)
 	sourceReplica.HTTPServer.Handler.(*http.ServeMux).HandleFunc("/debug/vars", expvarHandler(&sourceReplicaGitRev))
 	defer sourceReplica.StopActionLoop(t)
 
 	// test when versions are the same
-	if err := vp.Run([]string{"ValidateVersionKeyspace", sourceMaster.Tablet.Keyspace}); err != nil {
+	sourceReplicaGitRev = "fake git rev"
+	if err := vp.Run([]string{"ValidateVersionKeyspace", sourcePrimary.Tablet.Keyspace}); err != nil {
 		t.Fatalf("ValidateVersionKeyspace(same) failed: %v", err)
 	}
 
 	// test when versions are different
 	sourceReplicaGitRev = "different fake git rev"
-	if err := vp.Run([]string{"ValidateVersionKeyspace", sourceMaster.Tablet.Keyspace}); err == nil || !strings.Contains(err.Error(), "is different than slave") {
+	err := vp.Run([]string{"ValidateVersionKeyspace", sourcePrimary.Tablet.Keyspace})
+	fmt.Printf("ERROR %v", err)
+	if err == nil || !strings.Contains(err.Error(), "is different than replica") {
 		t.Fatalf("ValidateVersionKeyspace(different) returned an unexpected error: %v", err)
 	}
 }

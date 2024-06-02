@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,6 +25,8 @@ import (
 
 	"google.golang.org/grpc"
 
+	"vitess.io/vitess/go/vt/vtenv"
+
 	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/servenv"
 	"vitess.io/vitess/go/vt/topo"
@@ -39,12 +41,14 @@ import (
 
 // VtctlServer is our RPC server
 type VtctlServer struct {
-	ts *topo.Server
+	vtctlservicepb.UnimplementedVtctlServer
+	ts  *topo.Server
+	env *vtenv.Environment
 }
 
 // NewVtctlServer returns a new Vtctl Server for the topo server.
-func NewVtctlServer(ts *topo.Server) *VtctlServer {
-	return &VtctlServer{ts}
+func NewVtctlServer(env *vtenv.Environment, ts *topo.Server) *VtctlServer {
+	return &VtctlServer{env: env, ts: ts}
 }
 
 // ExecuteVtctlCommand is part of the vtctldatapb.VtctlServer interface
@@ -71,13 +75,13 @@ func (s *VtctlServer) ExecuteVtctlCommand(args *vtctldatapb.ExecuteVtctlCommandR
 	// create the wrangler
 	tmc := tmclient.NewTabletManagerClient()
 	defer tmc.Close()
-	wr := wrangler.New(logger, s.ts, tmc)
+	wr := wrangler.New(s.env, logger, s.ts, tmc)
 
 	// execute the command
 	return vtctl.RunCommand(stream.Context(), wr, args.Args)
 }
 
 // StartServer registers the VtctlServer for RPCs
-func StartServer(s *grpc.Server, ts *topo.Server) {
-	vtctlservicepb.RegisterVtctlServer(s, NewVtctlServer(ts))
+func StartServer(s *grpc.Server, env *vtenv.Environment, ts *topo.Server) {
+	vtctlservicepb.RegisterVtctlServer(s, NewVtctlServer(env, ts))
 }

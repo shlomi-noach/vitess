@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,6 +21,9 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"time"
+
+	"vitess.io/vitess/go/vt/vterrors"
 
 	"vitess.io/vitess/go/sqltypes"
 	querypb "vitess.io/vitess/go/vt/proto/query"
@@ -30,6 +33,7 @@ import (
 // a test case.
 type Testable interface {
 	Test(name string, client *QueryClient) error
+	Benchmark(client *QueryClient) error
 }
 
 var (
@@ -52,9 +56,15 @@ func (tq TestQuery) Test(name string, client *QueryClient) error {
 		if name == "" {
 			return err
 		}
-		return fmt.Errorf("%s: Execute failed: %v", name, err)
+		return vterrors.Wrapf(err, "%s: Execute failed", name)
 	}
 	return nil
+}
+
+// Benchmark executes the query and discards the results
+func (tq TestQuery) Benchmark(client *QueryClient) error {
+	_, err := exec(client, string(tq), nil)
+	return err
 }
 
 // TestCase represents one test case. It will execute the
@@ -75,8 +85,11 @@ type TestCase struct {
 	// query. The check is skipped if Result is nil.
 	Result [][]string
 
-	// Rows affected can be nil or an int.
-	RowsAffected interface{}
+	// RowsAffected affected can be nil or an int.
+	RowsAffected any
+
+	// 	RowsReturned affected can be nil or an int.
+	RowsReturned any
 
 	// Rewritten specifies how the query should have be rewritten.
 	Rewritten []string
@@ -89,10 +102,16 @@ type TestCase struct {
 	// cache stats for that table. If the stat values are nil, then
 	// the check is skipped.
 	Table         string
-	Hits          interface{}
-	Misses        interface{}
-	Absent        interface{}
-	Invalidations interface{}
+	Hits          any
+	Misses        any
+	Absent        any
+	Invalidations any
+}
+
+// Benchmark executes the test case and discards the results without verifying them
+func (tc *TestCase) Benchmark(client *QueryClient) error {
+	_, err := exec(client, tc.Query, tc.BindVars)
+	return err
 }
 
 // Test executes the test case and returns an error if it failed.
@@ -103,12 +122,15 @@ func (tc *TestCase) Test(name string, client *QueryClient) error {
 		name = tc.Name
 	}
 
+	// wait for all previous test cases to have been settled in cache
+	time.Sleep(100 * time.Millisecond)
+
 	catcher := NewQueryCatcher()
 	defer catcher.Close()
 
 	qr, err := exec(client, tc.Query, tc.BindVars)
 	if err != nil {
-		return fmt.Errorf("%s: Execute failed: %v", name, err)
+		return vterrors.Wrapf(err, "%s: Execute failed", name)
 	}
 
 	if tc.Result != nil {
@@ -122,6 +144,13 @@ func (tc *TestCase) Test(name string, client *QueryClient) error {
 		want := tc.RowsAffected.(int)
 		if int(qr.RowsAffected) != want {
 			errs = append(errs, fmt.Sprintf("RowsAffected mismatch: %d, want %d", int(qr.RowsAffected), want))
+		}
+	}
+
+	if tc.RowsReturned != nil {
+		want := tc.RowsReturned.(int)
+		if len(qr.Rows) != want {
+			errs = append(errs, fmt.Sprintf("RowsReturned mismatch: %d, want %d", len(qr.Rows), want))
 		}
 	}
 
@@ -200,6 +229,18 @@ func (mc *MultiCase) Test(name string, client *QueryClient) error {
 	}
 	for _, tcase := range mc.Cases {
 		if err := tcase.Test(name, client); err != nil {
+			client.Rollback()
+			return err
+		}
+	}
+	return nil
+}
+
+// Benchmark executes the test cases in MultiCase and discards the
+// results without validating them.
+func (mc *MultiCase) Benchmark(client *QueryClient) error {
+	for _, tcase := range mc.Cases {
+		if err := tcase.Benchmark(client); err != nil {
 			client.Rollback()
 			return err
 		}

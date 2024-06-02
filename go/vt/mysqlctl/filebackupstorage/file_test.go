@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,12 +17,11 @@ limitations under the License.
 package filebackupstorage
 
 import (
+	"context"
 	"io"
-	"io/ioutil"
-	"os"
 	"testing"
 
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/mysqlctl/backupstorage"
 )
 
 // This file tests the file BackupStorage engine.
@@ -34,23 +33,13 @@ import (
 
 // setupFileBackupStorage creates a temporary directory, and
 // returns a FileBackupStorage based on it
-func setupFileBackupStorage(t *testing.T) *FileBackupStorage {
-	root, err := ioutil.TempDir("", "fbstest")
-	if err != nil {
-		t.Fatalf("os.TempDir failed: %v", err)
-	}
-	*FileBackupStorageRoot = root
-	return &FileBackupStorage{}
-}
-
-// cleanupFileBackupStorage removes the entire directory
-func cleanupFileBackupStorage(fbs *FileBackupStorage) {
-	os.RemoveAll(*FileBackupStorageRoot)
+func setupFileBackupStorage(t *testing.T) backupstorage.BackupStorage {
+	FileBackupStorageRoot = t.TempDir()
+	return newFileBackupStorage(backupstorage.NoParams())
 }
 
 func TestListBackups(t *testing.T) {
 	fbs := setupFileBackupStorage(t)
-	defer cleanupFileBackupStorage(fbs)
 	ctx := context.Background()
 
 	// verify we have no entry now
@@ -153,7 +142,6 @@ func TestListBackups(t *testing.T) {
 
 func TestFileContents(t *testing.T) {
 	fbs := setupFileBackupStorage(t)
-	defer cleanupFileBackupStorage(fbs)
 	ctx := context.Background()
 
 	dir := "keyspace/shard"

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@ limitations under the License.
 
 package dbconfigs
 
-// This file contains logic for a plugable credentials system.
+// This file contains logic for a pluggable credentials system.
 // The default implementation is file based.
 // The flags are global, but only programs that need to access the database
 // link with this library, so we should be safe.
@@ -24,24 +24,45 @@ package dbconfigs
 import (
 	"encoding/json"
 	"errors"
-	"flag"
-	"io/ioutil"
+	"os"
+	"os/signal"
+	"strings"
 	"sync"
+	"syscall"
+	"time"
+
+	vaultapi "github.com/aquarapid/vaultlib"
+	"github.com/spf13/pflag"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/servenv"
 )
 
 var (
-	// generic flags
-	dbCredentialsServer = flag.String("db-credentials-server", "file", "db credentials server type (use 'file' for the file implementation)")
-
-	// 'file' implementation flags
-	dbCredentialsFile = flag.String("db-credentials-file", "", "db credentials file")
+	dbCredentialsServer   = "file"
+	dbCredentialsFile     string
+	vaultAddr             string
+	vaultTimeout          = 10 * time.Second
+	vaultCACert           string
+	vaultPath             string
+	vaultCacheTTL         = 30 * time.Minute
+	vaultTokenFile        string
+	vaultRoleID           string
+	vaultRoleSecretIDFile string
+	vaultRoleMountPoint   = "approle"
 
 	// ErrUnknownUser is returned by credential server when the
 	// user doesn't exist
 	ErrUnknownUser = errors.New("unknown user")
+
+	cmdsWithDBCredentials = []string{
+		"mysqlctl",
+		"mysqlctld",
+		"vtbackup",
+		"vtcombo",
+		"vttablet",
+	}
 )
 
 // CredentialsServer is the interface for a credential server
@@ -59,12 +80,55 @@ type CredentialsServer interface {
 // been parsed.
 var AllCredentialsServers = make(map[string]CredentialsServer)
 
+func init() {
+	AllCredentialsServers["file"] = &FileCredentialsServer{}
+	AllCredentialsServers["vault"] = &VaultCredentialsServer{}
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGHUP)
+	go func() {
+		for range sigChan {
+			if fcs, ok := AllCredentialsServers["file"].(*FileCredentialsServer); ok {
+				fcs.mu.Lock()
+				fcs.dbCredentials = nil
+				fcs.mu.Unlock()
+			}
+			if vcs, ok := AllCredentialsServers["vault"].(*VaultCredentialsServer); ok {
+				vcs.mu.Lock()
+				vcs.dbCredsCache = nil
+				vcs.mu.Unlock()
+			}
+		}
+	}()
+
+	for _, cmd := range cmdsWithDBCredentials {
+		servenv.OnParseFor(cmd, func(fs *pflag.FlagSet) {
+			// generic flags
+			fs.StringVar(&dbCredentialsServer, "db-credentials-server", dbCredentialsServer, "db credentials server type ('file' - file implementation; 'vault' - HashiCorp Vault implementation)")
+
+			// 'file' implementation flags
+			fs.StringVar(&dbCredentialsFile, "db-credentials-file", dbCredentialsFile, "db credentials file; send SIGHUP to reload this file")
+
+			// 'vault' implementation flags
+			fs.StringVar(&vaultAddr, "db-credentials-vault-addr", vaultAddr, "URL to Vault server")
+			fs.DurationVar(&vaultTimeout, "db-credentials-vault-timeout", vaultTimeout, "Timeout for vault API operations")
+			fs.StringVar(&vaultCACert, "db-credentials-vault-tls-ca", vaultCACert, "Path to CA PEM for validating Vault server certificate")
+			fs.StringVar(&vaultPath, "db-credentials-vault-path", vaultPath, "Vault path to credentials JSON blob, e.g.: secret/data/prod/dbcreds")
+			fs.DurationVar(&vaultCacheTTL, "db-credentials-vault-ttl", vaultCacheTTL, "How long to cache DB credentials from the Vault server")
+			fs.StringVar(&vaultTokenFile, "db-credentials-vault-tokenfile", vaultTokenFile, "Path to file containing Vault auth token; token can also be passed using VAULT_TOKEN environment variable")
+			fs.StringVar(&vaultRoleID, "db-credentials-vault-roleid", vaultRoleID, "Vault AppRole id; can also be passed using VAULT_ROLEID environment variable")
+			fs.StringVar(&vaultRoleSecretIDFile, "db-credentials-vault-role-secretidfile", vaultRoleSecretIDFile, "Path to file containing Vault AppRole secret_id; can also be passed using VAULT_SECRETID environment variable")
+			fs.StringVar(&vaultRoleMountPoint, "db-credentials-vault-role-mountpoint", vaultRoleMountPoint, "Vault AppRole mountpoint; can also be passed using VAULT_MOUNTPOINT environment variable")
+		})
+	}
+}
+
 // GetCredentialsServer returns the current CredentialsServer. Only valid
 // after flag.Init was called.
 func GetCredentialsServer() CredentialsServer {
-	cs, ok := AllCredentialsServers[*dbCredentialsServer]
+	cs, ok := AllCredentialsServers[dbCredentialsServer]
 	if !ok {
-		log.Exitf("Invalid credential server: %v", *dbCredentialsServer)
+		log.Exitf("Invalid credential server: %v", dbCredentialsServer)
 	}
 	return cs
 }
@@ -76,12 +140,24 @@ type FileCredentialsServer struct {
 	dbCredentials map[string][]string
 }
 
+// VaultCredentialsServer implements CredentialsServer using
+// a Vault backend from HashiCorp.
+type VaultCredentialsServer struct {
+	mu                     sync.Mutex
+	dbCredsCache           map[string][]string
+	vaultCacheExpireTicker *time.Ticker
+	vaultClient            *vaultapi.Client
+	// We use a separate valid flag to allow invalidating the cache
+	// without destroying it, in case Vault is temp down.
+	cacheValid bool
+}
+
 // GetUserAndPassword is part of the CredentialsServer interface
 func (fcs *FileCredentialsServer) GetUserAndPassword(user string) (string, string, error) {
 	fcs.mu.Lock()
 	defer fcs.mu.Unlock()
 
-	if *dbCredentialsFile == "" {
+	if dbCredentialsFile == "" {
 		return "", "", ErrUnknownUser
 	}
 
@@ -89,14 +165,14 @@ func (fcs *FileCredentialsServer) GetUserAndPassword(user string) (string, strin
 	if fcs.dbCredentials == nil {
 		fcs.dbCredentials = make(map[string][]string)
 
-		data, err := ioutil.ReadFile(*dbCredentialsFile)
+		data, err := os.ReadFile(dbCredentialsFile)
 		if err != nil {
-			log.Warningf("Failed to read dbCredentials file: %v", *dbCredentialsFile)
+			log.Warningf("Failed to read dbCredentials file: %v", dbCredentialsFile)
 			return "", "", err
 		}
 
 		if err = json.Unmarshal(data, &fcs.dbCredentials); err != nil {
-			log.Warningf("Failed to parse dbCredentials file: %v", *dbCredentialsFile)
+			log.Warningf("Failed to parse dbCredentials file: %v", dbCredentialsFile)
 			return "", "", err
 		}
 	}
@@ -108,9 +184,127 @@ func (fcs *FileCredentialsServer) GetUserAndPassword(user string) (string, strin
 	return user, passwd[0], nil
 }
 
+// GetUserAndPassword for Vault implementation
+func (vcs *VaultCredentialsServer) GetUserAndPassword(user string) (string, string, error) {
+	vcs.mu.Lock()
+	defer vcs.mu.Unlock()
+
+	if vcs.vaultCacheExpireTicker == nil {
+		vcs.vaultCacheExpireTicker = time.NewTicker(vaultCacheTTL)
+		go func() {
+			for range vcs.vaultCacheExpireTicker.C {
+				if vcs, ok := AllCredentialsServers["vault"].(*VaultCredentialsServer); ok {
+					vcs.cacheValid = false
+				}
+			}
+		}()
+	}
+
+	if vcs.cacheValid && vcs.dbCredsCache != nil {
+		if vcs.dbCredsCache[user] == nil {
+			log.Errorf("Vault cache is valid, but user %s unknown in cache, will retry", user)
+			return "", "", ErrUnknownUser
+		}
+		return user, vcs.dbCredsCache[user][0], nil
+	}
+
+	if vaultAddr == "" {
+		return "", "", errors.New("No Vault server specified")
+	}
+
+	token, err := readFromFile(vaultTokenFile)
+	if err != nil {
+		return "", "", errors.New("No Vault token in provided filename")
+	}
+	secretID, err := readFromFile(vaultRoleSecretIDFile)
+	if err != nil {
+		return "", "", errors.New("No Vault secret_id in provided filename")
+	}
+
+	// From here on, errors might be transient, so we use ErrUnknownUser
+	// for everything, so we get retries
+	if vcs.vaultClient == nil {
+		config := vaultapi.NewConfig()
+
+		// All these can be overriden by environment
+		//   so we need to check if they have been set by NewConfig
+		if config.Address == "" {
+			config.Address = vaultAddr
+		}
+		if config.Timeout == (0 * time.Second) {
+			config.Timeout = vaultTimeout
+		}
+		if config.CACert == "" {
+			config.CACert = vaultCACert
+		}
+		if config.Token == "" {
+			config.Token = token
+		}
+		if config.AppRoleCredentials.RoleID == "" {
+			config.AppRoleCredentials.RoleID = vaultRoleID
+		}
+		if config.AppRoleCredentials.SecretID == "" {
+			config.AppRoleCredentials.SecretID = secretID
+		}
+		if config.AppRoleCredentials.MountPoint == "" {
+			config.AppRoleCredentials.MountPoint = vaultRoleMountPoint
+		}
+
+		if config.CACert != "" {
+			// If we provide a CA, ensure we actually use it
+			config.InsecureSSL = false
+		}
+
+		var err error
+		vcs.vaultClient, err = vaultapi.NewClient(config)
+		if err != nil || vcs.vaultClient == nil {
+			log.Errorf("Error in vault client initialization, will retry: %v", err)
+			vcs.vaultClient = nil
+			return "", "", ErrUnknownUser
+		}
+	}
+
+	secret, err := vcs.vaultClient.GetSecret(vaultPath)
+	if err != nil {
+		log.Errorf("Error in Vault server params: %v", err)
+		return "", "", ErrUnknownUser
+	}
+
+	if secret.JSONSecret == nil {
+		log.Errorf("Empty DB credentials retrieved from Vault server")
+		return "", "", ErrUnknownUser
+	}
+
+	dbCreds := make(map[string][]string)
+	if err = json.Unmarshal(secret.JSONSecret, &dbCreds); err != nil {
+		log.Errorf("Error unmarshaling DB credentials from Vault server")
+		return "", "", ErrUnknownUser
+	}
+	if dbCreds[user] == nil {
+		log.Warningf("Vault lookup for user not found: %v\n", user)
+		return "", "", ErrUnknownUser
+	}
+	log.Infof("Vault client status: %s", vcs.vaultClient.GetStatus())
+
+	vcs.dbCredsCache = dbCreds
+	vcs.cacheValid = true
+	return user, dbCreds[user][0], nil
+}
+
+func readFromFile(filePath string) (string, error) {
+	if filePath == "" {
+		return "", nil
+	}
+	fileBytes, err := os.ReadFile(filePath)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(fileBytes)), nil
+}
+
 // WithCredentials returns a copy of the provided ConnParams that we can use
 // to connect, after going through the CredentialsServer.
-func WithCredentials(cp *mysql.ConnParams) (*mysql.ConnParams, error) {
+func withCredentials(cp *mysql.ConnParams) (*mysql.ConnParams, error) {
 	result := *cp
 	user, passwd, err := GetCredentialsServer().GetUserAndPassword(cp.Uname)
 	switch err {
@@ -119,11 +313,9 @@ func WithCredentials(cp *mysql.ConnParams) (*mysql.ConnParams, error) {
 		result.Pass = passwd
 	case ErrUnknownUser:
 		// we just use what we have, and will fail later anyway
+		// except if the actual password is empty, in which case
+		// things will just "work"
 		err = nil
 	}
 	return &result, err
-}
-
-func init() {
-	AllCredentialsServers["file"] = &FileCredentialsServer{}
 }

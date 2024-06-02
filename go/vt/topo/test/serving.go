@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -17,10 +17,11 @@ limitations under the License.
 package test
 
 import (
+	"context"
 	"testing"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	"google.golang.org/protobuf/proto"
+
 	"vitess.io/vitess/go/vt/topo"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -28,9 +29,7 @@ import (
 )
 
 // checkSrvKeyspace tests the SrvKeyspace methods (other than watch).
-func checkSrvKeyspace(t *testing.T, ts *topo.Server) {
-	ctx := context.Background()
-
+func checkSrvKeyspace(t *testing.T, ctx context.Context, ts *topo.Server) {
 	// Test GetSrvKeyspaceNames returns an empty list correctly.
 	if names, err := ts.GetSrvKeyspaceNames(ctx, LocalCellName); err != nil || len(names) != 0 {
 		t.Errorf("GetSrvKeyspace(not there): %v %v", names, err)
@@ -40,7 +39,7 @@ func checkSrvKeyspace(t *testing.T, ts *topo.Server) {
 	srvKeyspace := &topodatapb.SrvKeyspace{
 		Partitions: []*topodatapb.SrvKeyspace_KeyspacePartition{
 			{
-				ServedType: topodatapb.TabletType_MASTER,
+				ServedType: topodatapb.TabletType_PRIMARY,
 				ShardReferences: []*topodatapb.ShardReference{
 					{
 						Name: "-80",
@@ -49,14 +48,6 @@ func checkSrvKeyspace(t *testing.T, ts *topo.Server) {
 						},
 					},
 				},
-			},
-		},
-		ShardingColumnName: "video_id",
-		ShardingColumnType: topodatapb.KeyspaceIdType_UINT64,
-		ServedFrom: []*topodatapb.SrvKeyspace_ServedFrom{
-			{
-				TabletType: topodatapb.TabletType_REPLICA,
-				Keyspace:   "other_keyspace",
 			},
 		},
 	}
@@ -78,7 +69,7 @@ func checkSrvKeyspace(t *testing.T, ts *topo.Server) {
 		t.Fatalf("UpdateSrvKeyspace(2): %v", err)
 	}
 	if k, err := ts.GetSrvKeyspace(ctx, LocalCellName, "unknown_keyspace_so_far"); err != nil || !proto.Equal(srvKeyspace, k) {
-		t.Errorf("GetSrvKeyspace(out of the blue): %v %v", err, *k)
+		t.Errorf("GetSrvKeyspace(out of the blue): %v %v", err, k)
 	}
 
 	// Delete the SrvKeyspace.
@@ -91,9 +82,7 @@ func checkSrvKeyspace(t *testing.T, ts *topo.Server) {
 }
 
 // checkSrvVSchema tests the SrvVSchema methods (other than watch).
-func checkSrvVSchema(t *testing.T, ts *topo.Server) {
-	ctx := context.Background()
-
+func checkSrvVSchema(t *testing.T, ctx context.Context, ts *topo.Server) {
 	// check GetSrvVSchema returns topo.ErrNoNode if no SrvVSchema
 	if _, err := ts.GetSrvVSchema(ctx, LocalCellName); !topo.IsErrType(err, topo.NoNode) {
 		t.Errorf("GetSrvVSchema(not set): %v", err)

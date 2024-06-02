@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -21,8 +21,9 @@ import (
 	"fmt"
 	"path"
 
-	"github.com/samuel/go-zookeeper/zk"
-	"golang.org/x/net/context"
+	"context"
+
+	"github.com/z-division/go-zookeeper/zk"
 
 	"vitess.io/vitess/go/vt/topo"
 )
@@ -44,7 +45,7 @@ func (zs *Server) Create(ctx context.Context, filePath string, contents []byte) 
 	if err != nil {
 		return nil, convertError(err, zkPath)
 	}
-	if bytes.Compare(data, contents) != 0 {
+	if !bytes.Equal(data, contents) {
 		return nil, fmt.Errorf("file contents changed between zk.Create and zk.Get")
 	}
 
@@ -85,6 +86,16 @@ func (zs *Server) Get(ctx context.Context, filePath string) ([]byte, topo.Versio
 		return nil, nil, convertError(err, zkPath)
 	}
 	return contents, ZKVersion(stat.Version), nil
+}
+
+// GetVersion is part of topo.Conn interface.
+func (zs *Server) GetVersion(ctx context.Context, filePath string, version int64) ([]byte, error) {
+	return nil, topo.NewError(topo.NoImplementation, "GetVersion not supported in ZK2 topo")
+}
+
+// List is part of the topo.Conn interface.
+func (zs *Server) List(ctx context.Context, filePathPrefix string) ([]topo.KVInfo, error) {
+	return nil, topo.NewError(topo.NoImplementation, "List not supported in ZK2 topo")
 }
 
 // Delete is part of the topo.Conn interface.

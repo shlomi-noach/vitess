@@ -1,15 +1,31 @@
+/*
+Copyright 2019 The Vitess Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package prometheusbackend
 
 import (
 	"expvar"
-	"net/http"
 	"strings"
-	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"vitess.io/vitess/go/stats"
-	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/servenv"
 )
 
 // PromBackend implements PullBackend using Prometheus as the backing metrics storage.
@@ -18,19 +34,17 @@ type PromBackend struct {
 }
 
 var (
-	be             PromBackend
-	logUnsupported *logutil.ThrottledLogger
+	be PromBackend
 )
 
 // Init initializes the Prometheus be with the given namespace.
 func Init(namespace string) {
-	http.Handle("/metrics", promhttp.Handler())
+	servenv.HTTPHandle("/metrics", promhttp.Handler())
 	be.namespace = namespace
-	logUnsupported = logutil.NewThrottledLogger("PrometheusUnsupportedMetricType", 1*time.Minute)
 	stats.Register(be.publishPrometheusMetric)
 }
 
-// PublishPromMetric is used to publish the metric to Prometheus.
+// publishPrometheusMetric is used to publish the metric to Prometheus.
 func (be PromBackend) publishPrometheusMetric(name string, v expvar.Var) {
 	switch st := v.(type) {
 	case *stats.Counter:
@@ -39,8 +53,12 @@ func (be PromBackend) publishPrometheusMetric(name string, v expvar.Var) {
 		newMetricFuncCollector(st, be.buildPromName(name), prometheus.CounterValue, func() float64 { return float64(st.F()) })
 	case *stats.Gauge:
 		newMetricFuncCollector(st, be.buildPromName(name), prometheus.GaugeValue, func() float64 { return float64(st.Get()) })
+	case *stats.GaugeFloat64:
+		newMetricFuncCollector(st, be.buildPromName(name), prometheus.GaugeValue, func() float64 { return st.Get() })
 	case *stats.GaugeFunc:
 		newMetricFuncCollector(st, be.buildPromName(name), prometheus.GaugeValue, func() float64 { return float64(st.F()) })
+	case stats.FloatFunc:
+		newMetricFuncCollector(st, be.buildPromName(name), prometheus.GaugeValue, func() float64 { return (st)() })
 	case *stats.CountersWithSingleLabel:
 		newCountersWithSingleLabelCollector(st, be.buildPromName(name), st.Label(), prometheus.CounterValue)
 	case *stats.CountersWithMultiLabels:
@@ -67,8 +85,13 @@ func (be PromBackend) publishPrometheusMetric(name string, v expvar.Var) {
 		newMultiTimingsCollector(st, be.buildPromName(name))
 	case *stats.Histogram:
 		newHistogramCollector(st, be.buildPromName(name))
+	case *stats.StringMapFuncWithMultiLabels:
+		newStringMapFuncWithMultiLabelsCollector(st, be.buildPromName(name))
+	case *stats.String, stats.StringFunc, stats.StringMapFunc, *stats.Rates, *stats.RatesFunc:
+		// Silently ignore these types since they don't make sense to
+		// export to Prometheus' data model.
 	default:
-		logUnsupported.Infof("Not exporting to Prometheus an unsupported metric type of %T: %s", st, name)
+		log.Fatalf("prometheus: Metric type %T (seen for variable: %s) is not covered by type switch. Add it there and to all other plugins which register a NewVarHook.", st, name)
 	}
 }
 
@@ -86,7 +109,7 @@ func labelsToSnake(labels []string) []string {
 	return output
 }
 
-// normalizeMetricForPrometheus produces a compliant name by applying
+// normalizeMetric produces a compliant name by applying
 // special case conversions and then applying a camel case to snake case converter.
 func normalizeMetric(name string) string {
 	// Special cases

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -17,9 +17,8 @@ limitations under the License.
 package topo
 
 import (
+	"context"
 	"sort"
-
-	"golang.org/x/net/context"
 )
 
 // Conn defines the interface that must be implemented by topology
@@ -73,6 +72,19 @@ type Conn interface {
 	// Can return ErrNoNode if the file doesn't exist.
 	Get(ctx context.Context, filePath string) ([]byte, Version, error)
 
+	// GetVersion returns the content of a file at the given version.
+	// filePath is a path relative to the root directory of the cell.
+	// Can return ErrNoNode if the file doesn't exist at the given
+	// version or ErrNoImplementation if the topo server does not
+	// support storing multiple versions and retrieving a specific one.
+	GetVersion(ctx context.Context, filePath string, version int64) ([]byte, error)
+
+	// List returns KV pairs, along with metadata like the version, for
+	// entries where the key contains the specified prefix.
+	// filePathPrefix is a path relative to the root directory of the cell.
+	// Can return ErrNoNode if there are no matches.
+	List(ctx context.Context, filePathPrefix string) ([]KVInfo, error)
+
 	// Delete deletes the provided file.
 	// If version is nil, it is an unconditional delete.
 	// If the last entry of a directory is deleted, using ListDir
@@ -108,23 +120,31 @@ type Conn interface {
 	// Returns ErrInterrupted if ctx is canceled.
 	Lock(ctx context.Context, dirPath, contents string) (LockDescriptor, error)
 
+	// TryLock takes lock on the given directory with a fail-fast approach.
+	// It is similar to `Lock` but the difference is it attempts to acquire the lock
+	// if it is likely to succeed. If there is already a lock on given path, then unlike `Lock`
+	// instead of waiting and blocking the client it returns with `Lock already exists` error.
+	// With current implementation it may not be able to fail-fast for some scenarios.
+	// For example there is a possibility that a thread checks for lock for a given path
+	// but by the time it acquires the lock, some other thread has already acquired it,
+	// in this case the client will block until the other caller releases the lock or the
+	// client call times out (just like standard `Lock' implementation). In short the lock checking
+	// and acquiring is not under the same mutex in current implementation of `TryLock`.
+	TryLock(ctx context.Context, dirPath, contents string) (LockDescriptor, error)
+
 	//
 	// Watches
 	//
 
 	// Watch starts watching a file in the provided cell.  It
 	// returns the current value, a 'changes' channel to read the
-	// changes from, and a 'cancel' function to call to stop the
-	// watch.  If the initial read fails, or the file doesn't
-	// exist, current.Err is set, and 'changes'/'cancel' are nil.
-	// Otherwise current.Err is nil, and current.Contents /
-	// current.Version are accurate. The provided context is only
-	// used to setup the current watch, and not after Watch()
-	// returns.
+	// changes from, and an error.
+	// If the initial read fails, or the file doesn't
+	// exist, an error is returned.
 	//
-	// To stop the watch, just call the returned 'cancel' function.
+	// To stop the watch, cancel the provided context.
 	// This will eventually result in a final WatchData result with Err =
-	// ErrInterrupted. It should be safe to call the 'cancel' function
+	// ErrInterrupted. It should be safe to cancel the context
 	// multiple times, or after the Watch already errored out.
 	//
 	// The 'changes' channel may return a record with Err != nil.
@@ -152,24 +172,62 @@ type Conn interface {
 	// being correct quickly, as long as it eventually gets there.
 	//
 	// filePath is a path relative to the root directory of the cell.
-	Watch(ctx context.Context, filePath string) (current *WatchData, changes <-chan *WatchData, cancel CancelFunc)
+	Watch(ctx context.Context, filePath string) (current *WatchData, changes <-chan *WatchData, err error)
+
+	// WatchRecursive starts watching a file prefix in the provided cell. It
+	// returns all the current values for existing files with the given
+	// prefix, a 'changes' channel  to read the changes from and an error.
+	//
+	// The provided context should be canceled when stopping WatchRecursive().
+	// This API is different from Watch() and Watch() will be changed
+	// to match this API as well in the future.
+	//
+	// Canceling will eventually result in a final WatchDataRecursive result with Err =
+	// ErrInterrupted.
+	//
+	// The 'changes' channel may return a record with Err != nil.
+	// In that case, the channel will also be closed right after
+	// that record.  In any case, 'changes' has to be drained of
+	// all events, even when 'stop' is closed.
+	//
+	// Note the 'changes' channel can return twice the same
+	// Version/Contents (for instance, if the watch is interrupted
+	// and restarted within the Conn implementation).
+	// Similarly, the 'changes' channel may skip versions / changes
+	// (that is, if value goes [A, B, C, D, E, F], the watch may only
+	// receive [A, B, F]). This should only happen for rapidly
+	// changing values though. Usually, the initial value will come
+	// back right away. And a stable value (that hasn't changed for
+	// a while) should be seen shortly.
+	//
+	// The WatchRecursive call is not guaranteed to return exactly up to
+	// date data right away. For instance, if a file is created
+	// and saved, and then a watch is set on that file, it may
+	// return ErrNoNode (as the underlying configuration service
+	// may use asynchronous caches that are not up to date
+	// yet). The only guarantee is that the watch data will
+	// eventually converge. Vitess doesn't explicitly depend on the data
+	// being correct quickly, as long as it eventually gets there.
+	//
+	// path is a path relative to the root directory of the cell.
+	WatchRecursive(ctx context.Context, path string) ([]*WatchDataRecursive, <-chan *WatchDataRecursive, error)
 
 	//
-	// Master election methods. This is meant to have a small
-	// number of processes elect a master within a group. The
+	// Leader election methods. This is meant to have a small
+	// number of processes elect a primary within a group. The
 	// backend storage for this can either be the global topo
 	// server, or a resilient quorum of individual cells, to
 	// reduce the load / dependency on the global topo server.
 	//
 
-	// NewMasterParticipation creates a MasterParticipation
-	// object, used to become the Master in an election for the
+	// NewLeaderParticipation creates a LeaderParticipation
+	// object, used to become the Leader in an election for the
 	// provided group name.  Id is the name of the local process,
 	// passing in the hostname:port of the current process as id
 	// is the common usage. Id must be unique for each process
 	// calling this, for a given name. Calling this function does
 	// not make the current process a candidate for the election.
-	NewMasterParticipation(name, id string) (MasterParticipation, error)
+	NewLeaderParticipation(name, id string) (LeaderParticipation, error)
 
 	// Close closes the connection to the server.
 	Close()
@@ -198,7 +256,7 @@ type DirEntry struct {
 
 	// Ephemeral is set if the directory / file only contains
 	// data that was not set by the file API, like lock files
-	// or master-election related files.
+	// or primary-election related files.
 	// Only filled in if full is true.
 	Ephemeral bool
 }
@@ -270,58 +328,92 @@ type WatchData struct {
 	Err error
 }
 
-// MasterParticipation is the object returned by NewMasterParticipation.
+// WatchDataRecursive is the structure returned by the WatchRecursive() API.
+// It contains the same data as WatchData, but additionally also the specific
+// path of the entry that the recursive watch applies to, since an entire
+// file prefix can be watched.
+type WatchDataRecursive struct {
+	// Path is the path that has changed
+	Path string
+
+	WatchData
+}
+
+// KVInfo is a structure that contains a generic key/value pair from
+// the topo server, along with important metadata about it.
+// This should be used to provide multiple entries in List like calls
+// that return N KVs based on a key prefix, so that you don't lose
+// information or context you would otherwise have when using Get for
+// a single key.
+type KVInfo struct {
+	Key     []byte
+	Value   []byte
+	Version Version // version - used to prevent stomping concurrent writes
+}
+
+// LeaderParticipation is the object returned by NewLeaderParticipation.
 // Sample usage:
 //
-// mp := server.NewMasterParticipation("vtctld", "hostname:8080")
+// mp := server.NewLeaderParticipation("vtctld", "hostname:8080")
 // job := NewJob()
-// go func() {
-//   for {
-//     ctx, err := mp.WaitForMastership()
-//     switch err {
-//     case nil:
-//       job.RunUntilContextDone(ctx)
-//     case topo.ErrInterrupted:
-//       return
-//     default:
-//       log.Errorf("Got error while waiting for master, will retry in 5s: %v", err)
-//       time.Sleep(5 * time.Second)
-//     }
-//   }
-// }()
 //
-// http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-//   if job.Running() {
-//     job.WriteStatus(w, r)
-//   } else {
-//     http.Redirect(w, r, mp.GetCurrentMasterID(context.Background()), http.StatusFound)
-//   }
-// })
+//	go func() {
+//	  for {
+//	    ctx, err := mp.WaitForLeadership()
+//	    switch err {
+//	    case nil:
+//	      job.RunUntilContextDone(ctx)
+//	    case topo.ErrInterrupted:
+//	      return
+//	    default:
+//	      log.Errorf("Got error while waiting for primary, will retry in 5s: %v", err)
+//	      time.Sleep(5 * time.Second)
+//	    }
+//	  }
+//	}()
 //
-// servenv.OnTermSync(func() {
-//   mp.Stop()
-// })
-type MasterParticipation interface {
-	// WaitForMastership makes the current process a candidate
-	// for election, and waits until this process is the master.
-	// After we become the master, we may lose mastership. In that case,
+//	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+//	  if job.Running() {
+//	    job.WriteStatus(w, r)
+//	  } else {
+//	    http.Redirect(w, r, mp.GetCurrentLeaderID(context.Background()), http.StatusFound)
+//	  }
+//	})
+//
+//	servenv.OnTermSync(func() {
+//	  mp.Stop()
+//	})
+type LeaderParticipation interface {
+	// WaitForLeadership makes the current process a candidate
+	// for election, and waits until this process is the primary.
+	// After we become the primary, we may lose primaryship. In that case,
 	// the returned context will be canceled. If Stop was called,
-	// WaitForMastership will return nil, ErrInterrupted.
-	WaitForMastership() (context.Context, error)
+	// WaitForLeadership will return nil, ErrInterrupted.
+	WaitForLeadership() (context.Context, error)
 
 	// Stop is called when we don't want to participate in the
-	// master election any more. Typically, that is when the
+	// primary election any more. Typically, that is when the
 	// hosting process is terminating.  We will relinquish
-	// mastership at that point, if we had it. Stop should
+	// primaryship at that point, if we had it. Stop should
 	// not return until everything has been done.
-	// The MasterParticipation object should be discarded
-	// after Stop has been called. Any call to WaitForMastership
+	// The LeaderParticipation object should be discarded
+	// after Stop has been called. Any call to WaitForLeadership
 	// after Stop() will return nil, ErrInterrupted.
-	// If WaitForMastership() was running, it will return
+	// If WaitForLeadership() was running, it will return
 	// nil, ErrInterrupted as soon as possible.
 	Stop()
 
-	// GetCurrentMasterID returns the current master id.
+	// GetCurrentLeaderID returns the current primary id.
 	// This may not work after Stop has been called.
-	GetCurrentMasterID(ctx context.Context) (string, error)
+	GetCurrentLeaderID(ctx context.Context) (string, error)
+
+	// WaitForNewLeader allows for nodes to wait until a leadership
+	// election cycle completes and to get subsequent updates of
+	// leadership changes. This way logic that needs to know if leadership
+	// changes also if we're not the leader ourselves doesn't need to
+	// poll for leadership status.
+	//
+	// For topo implementation that have this, it can be used more
+	// efficiently than needing a busy wait loop.
+	WaitForNewLeader(ctx context.Context) (<-chan string, error)
 }

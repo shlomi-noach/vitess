@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright 2017 Google Inc.
+# Copyright 2020 The Vitess Authors.
 # 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,110 +15,88 @@
 # limitations under the License.
 
 # This test runs through the scripts in examples/local to make sure they work.
+# It should be kept in sync with the steps in https://vitess.io/docs/get-started/local/
+# So we can detect if a regression affecting a tutorial is introduced.
 
-# timeout in seconds (for each step, not overall)
-timeout=30
-
-cd $VTTOP/examples/local
-
-exitcode=1
-
-# Use a minimal number of tablets for the test.
-# This helps with staying under CI resource limits.
-num_tablets=2
-uid_base=100
-cell=test
-TABLETS_UIDS="$(seq 0 $((num_tablets - 1)))"
-export TABLETS_UIDS
-
-teardown() {
-  ./vtgate-down.sh &
-  ./vttablet-down.sh "$TABLETS_UIDS" &
-  ./vtctld-down.sh &
-  ./zk-down.sh &
-  wait
-  exit $exitcode
+killall_vtdataroot() {
+  pkill -9 -e -f '(vtdataroot|VTDATAROOT)' # kill Vitess processes
 }
-trap teardown SIGTERM SIGINT EXIT
 
-# Set up servers.
-timeout $timeout ./zk-up.sh || teardown
-timeout $timeout ./vtctld-up.sh || teardown
-timeout $timeout ./vttablet-up.sh || teardown
+source build.env
 
-# Retry loop function
-retry_with_timeout() {
-  if [ `date +%s` -gt $[$start + $timeout] ]; then
-    echo "Timeout ($timeout) exceeded"
-    teardown
+set -xeo pipefail
+
+cd "$VTROOT/examples/local"
+unset VTROOT # ensure that the examples can run without VTROOT now.
+
+source ../common/env.sh # Required so that "mysql" works from alias
+
+./101_initial_cluster.sh
+sleep 5 # Give vtgate time to really start.
+
+killall_vtdataroot
+# verify local example is able to start on an existing setup
+
+./101_initial_cluster.sh
+sleep 5 # Give vtgate time to really start.
+
+mysql < ../common/insert_commerce_data.sql
+mysql --table < ../common/select_commerce_data.sql
+
+./201_customer_tablets.sh
+
+for shard in "customer/0"; do
+ while true; do
+  if (mysql "$shard" -e 'show tables' &>/dev/null); then
+    break
   fi
-
-  echo "Waiting 2 seconds to try again..."
-  sleep 2
-}
-
-# Wait for vttablets to show up in topology.
-# If we don't do this, then vtgate might take up to a minute
-# to notice the new tablets, which is normally fine, but not
-# when we're trying to get through the test ASAP.
-echo "Waiting for $num_tablets tablets to appear in topology..."
-start=`date +%s`
-until [[ $(./lvtctl.sh ListAllTablets test | wc -l) -eq $num_tablets ]]; do
-  retry_with_timeout
+  echo -e "waiting for shard: $shard ..."
+  sleep 1
+ done
 done
 
-timeout $timeout ./vtgate-up.sh || teardown
+./202_move_tables.sh
 
-echo "Initialize shard..."
-start=`date +%s`
-until ./lvtctl.sh InitShardMaster -force test_keyspace/0 test-100; do
-  retry_with_timeout
+./203_switch_reads.sh
+
+./204_switch_writes.sh
+
+mysql --table < ../common/select_customer0_data.sql
+
+# We expect this to fail due to the denied tables
+# rules in place.
+# For some reason this succeeds...
+$(mysql --table < ../common/select_commerce_data.sql &>/dev/null || true)
+
+./205_clean_commerce.sh
+# We expect this to fail as the keyspace is now gone.
+(mysql --table < ../common/select_commerce_data.sql &>/dev/null || true)
+
+./301_customer_sharded.sh
+./302_new_shards.sh
+
+# Wait for the schema to be targetable before proceeding
+# TODO: Eliminate this race in the examples' scripts
+for shard in "customer/-80" "customer/80-"; do
+ while true; do
+  if (mysql "$shard" -e 'show tables' &>/dev/null); then
+    break
+  fi
+  echo -e "waiting for shard: $shard ..."
+  sleep 1
+ done
 done
 
-# Run manual health check on each tablet.
-# This is not necessary, but it helps make this test more representative of
-# what a human would do. It simulates the case where a periodic health check
-# occurs before the user gets around to running the next command. For example,
-# in that case the health check will make the tablet begin serving prior to the
-# ApplySchema command below. Otherwise, ApplySchema races with the periodic
-# health check.
-echo "Running health check on tablets..."
-start=`date +%s`
-for uid_index in $TABLETS_UIDS; do
-  uid=$[$uid_base + $uid_index]
-  printf -v alias '%s-%010d' $cell $uid
-  ./lvtctl.sh RunHealthCheck $alias
-done
+./303_reshard.sh
+sleep 3 # TODO: Required for now!
 
-echo "Create table..."
-start=`date +%s`
-until ./lvtctl.sh ApplySchema -sql "$(cat create_test_table.sql)" test_keyspace; do
-  retry_with_timeout
-done
+./304_switch_reads.sh
+./305_switch_writes.sh
 
-echo "Rebuild vschema..."
-start=`date +%s`
-until ./lvtctl.sh RebuildVSchemaGraph; do
-  retry_with_timeout
-done
+mysql --table < ../common/select_customer-80_data.sql
+mysql --table < ../common/select_customer80-_data.sql
 
-echo "Run Python client script..."
-# Retry until vtgate is ready.
-start=`date +%s`
-# Test that the client.sh script works with no --server arg,
-# because that's how the tutorial says to run it.
-until ./client.sh ; do
-  retry_with_timeout
-done
+./306_down_shard_0.sh
 
-echo "Run Go client script..."
-go run client.go -server=localhost:15991 || teardown
+./401_teardown.sh
 
-echo "Run Java client script..."
-./client_java.sh || teardown
-
-echo "Run JDBC client script..."
-./client_jdbc.sh || teardown
-
-exitcode=0
-teardown

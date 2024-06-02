@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,46 +21,20 @@ limitations under the License.
 package dbconfigs
 
 import (
+	"context"
 	"encoding/json"
-	"flag"
-	"fmt"
+
+	"github.com/spf13/pflag"
 
 	"vitess.io/vitess/go/mysql"
-	"vitess.io/vitess/go/sync2"
+	"vitess.io/vitess/go/mysql/collations"
 	"vitess.io/vitess/go/vt/log"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vttls"
+	"vitess.io/vitess/go/yaml2"
 )
-
-var (
-	dbConfigs  = DBConfigs{userConfigs: make(map[string]*userConfig)}
-	baseConfig = mysql.ConnParams{}
-)
-
-// DBConfigs stores all the data needed to build various connection
-// parameters for the db. It stores credentials for app, appdebug,
-// allprivs, dba, filtered and repl users.
-// It contains other connection parameters like socket, charset, etc.
-// It also stores the default db name, which it can combine with the
-// rest of the data to build db-sepcific connection parameters.
-// It also supplies the SidecarDBName. This is currently hardcoded
-// to "_vt", but will soon become customizable.
-// The life-cycle of this package is as follows:
-// App must call RegisterFlags to request the types of connections
-// it wants support for. This must be done before involing flags.Parse.
-// After flag parsing, app invokes the Init function, which will return
-// a DBConfigs object.
-// The app must store the DBConfigs object internally, and use it to
-// build connection parameters as needed.
-// The DBName is initially empty and may later be set or changed by the app.
-type DBConfigs struct {
-	userConfigs   map[string]*userConfig
-	DBName        sync2.AtomicString
-	SidecarDBName sync2.AtomicString
-}
-
-type userConfig struct {
-	useSSL bool
-	param  mysql.ConnParams
-}
 
 // config flags
 const (
@@ -69,213 +43,384 @@ const (
 	// AllPrivs user should have more privileges than App (should include possibility to do
 	// schema changes and write to internal Vitess tables), but it shouldn't have SUPER
 	// privilege like Dba has.
-	AllPrivs = "allprivs"
-	Dba      = "dba"
-	Filtered = "filtered"
-	Repl     = "repl"
+	AllPrivs     = "allprivs"
+	Dba          = "dba"
+	Filtered     = "filtered"
+	Repl         = "repl"
+	ExternalRepl = "erepl"
 )
 
-// All can be used to register all flags: RegisterFlags(All...)
-var All = []string{App, AppDebug, AllPrivs, Dba, Filtered, Repl}
+var (
+	// GlobalDBConfigs contains the initial values of dbconfigs from flags.
+	GlobalDBConfigs DBConfigs
 
-// RegisterFlags registers the flags for the given DBConfigFlag.
-// For instance, vttablet will register client, dba and repl.
-// Returns all registered flags.
-func RegisterFlags(userKeys ...string) {
-	registerBaseFlags()
-	for _, userKey := range userKeys {
-		uc := &userConfig{}
-		dbConfigs.userConfigs[userKey] = uc
-		registerPerUserFlags(uc, userKey)
-	}
+	// All can be used to register all flags: RegisterFlags(All...)
+	All = []string{App, AppDebug, AllPrivs, Dba, Filtered, Repl, ExternalRepl}
+)
+
+// DBConfigs stores all the data needed to build various connection
+// parameters for the db. It stores credentials for app, appdebug,
+// allprivs, dba, filtered and repl users.
+// It contains other connection parameters like socket, charset, etc.
+// It also stores the default db name, which it can combine with the
+// rest of the data to build db-sepcific connection parameters.
+//
+// The legacy way of initializing is as follows:
+// App must call RegisterFlags to request the types of connections
+// it wants support for. This must be done before invoking flags.Parse.
+// After flag parsing, app invokes the Init function, which will return
+// a DBConfigs object.
+// The app must store the DBConfigs object internally, and use it to
+// build connection parameters as needed.
+type DBConfigs struct {
+	Socket                     string        `json:"socket,omitempty"`
+	Host                       string        `json:"host,omitempty"`
+	Port                       int           `json:"port,omitempty"`
+	Charset                    string        `json:"charset,omitempty"`
+	Flags                      uint64        `json:"flags,omitempty"`
+	Flavor                     string        `json:"flavor,omitempty"`
+	SslMode                    vttls.SslMode `json:"sslMode,omitempty"`
+	SslCa                      string        `json:"sslCa,omitempty"`
+	SslCaPath                  string        `json:"sslCaPath,omitempty"`
+	SslCert                    string        `json:"sslCert,omitempty"`
+	SslKey                     string        `json:"sslKey,omitempty"`
+	TLSMinVersion              string        `json:"tlsMinVersion,omitempty"`
+	ServerName                 string        `json:"serverName,omitempty"`
+	ConnectTimeoutMilliseconds int           `json:"connectTimeoutMilliseconds,omitempty"`
+	DBName                     string        `json:"dbName,omitempty"`
+	EnableQueryInfo            bool          `json:"enableQueryInfo,omitempty"`
+
+	App          UserConfig `json:"app,omitempty"`
+	Dba          UserConfig `json:"dba,omitempty"`
+	Filtered     UserConfig `json:"filtered,omitempty"`
+	Repl         UserConfig `json:"repl,omitempty"`
+	Appdebug     UserConfig `json:"appdebug,omitempty"`
+	Allprivs     UserConfig `json:"allprivs,omitempty"`
+	externalRepl UserConfig
+
+	appParams          mysql.ConnParams
+	dbaParams          mysql.ConnParams
+	filteredParams     mysql.ConnParams
+	replParams         mysql.ConnParams
+	appdebugParams     mysql.ConnParams
+	allprivsParams     mysql.ConnParams
+	externalReplParams mysql.ConnParams
 }
 
-func registerBaseFlags() {
-	flag.StringVar(&baseConfig.UnixSocket, "db_socket", "", "The unix socket to connect on. If this is specifed, host and port will not be used.")
-	flag.StringVar(&baseConfig.Host, "db_host", "", "The host name for the tcp connection.")
-	flag.IntVar(&baseConfig.Port, "db_port", 0, "tcp port")
-	flag.StringVar(&baseConfig.Charset, "db_charset", "utf8", "Character set. Only utf8 or latin1 based character sets are supported.")
-	flag.Uint64Var(&baseConfig.Flags, "db_flags", 0, "Flag values as defined by MySQL.")
-	flag.StringVar(&baseConfig.SslCa, "db_ssl_ca", "", "connection ssl ca")
-	flag.StringVar(&baseConfig.SslCaPath, "db_ssl_ca_path", "", "connection ssl ca path")
-	flag.StringVar(&baseConfig.SslCert, "db_ssl_cert", "", "connection ssl certificate")
-	flag.StringVar(&baseConfig.SslKey, "db_ssl_key", "", "connection ssl key")
+// UserConfig contains user-specific configs.
+type UserConfig struct {
+	User     string `json:"user,omitempty"`
+	Password string `json:"password,omitempty"`
+	UseSSL   bool   `json:"useSsl,omitempty"`
+	UseTCP   bool   `json:"useTcp,omitempty"`
+}
+
+// RegisterFlags registers the base DBFlags, credentials flags, and the user
+// specific ones for the specified system users for the requesting command.
+// For instance, the vttablet command will register flags for all users
+// as defined in the dbconfigs.All variable.
+func RegisterFlags(userKeys ...string) {
+	servenv.OnParse(func(fs *pflag.FlagSet) {
+		registerBaseFlags(fs)
+		for _, userKey := range userKeys {
+			uc, cp := GlobalDBConfigs.getParams(userKey)
+			registerPerUserFlags(fs, userKey, uc, cp)
+		}
+	})
+}
+
+func registerBaseFlags(fs *pflag.FlagSet) {
+	fs.StringVar(&GlobalDBConfigs.Socket, "db_socket", "", "The unix socket to connect on. If this is specified, host and port will not be used.")
+	fs.StringVar(&GlobalDBConfigs.Host, "db_host", "", "The host name for the tcp connection.")
+	fs.IntVar(&GlobalDBConfigs.Port, "db_port", 0, "tcp port")
+	fs.StringVar(&GlobalDBConfigs.Charset, "db_charset", "utf8mb4", "Character set used for this tablet.")
+	fs.Uint64Var(&GlobalDBConfigs.Flags, "db_flags", 0, "Flag values as defined by MySQL.")
+	fs.StringVar(&GlobalDBConfigs.Flavor, "db_flavor", "", "Flavor overrid. Valid value is FilePos.")
+	fs.Var(&GlobalDBConfigs.SslMode, "db_ssl_mode", "SSL mode to connect with. One of disabled, preferred, required, verify_ca & verify_identity.")
+	fs.StringVar(&GlobalDBConfigs.SslCa, "db_ssl_ca", "", "connection ssl ca")
+	fs.StringVar(&GlobalDBConfigs.SslCaPath, "db_ssl_ca_path", "", "connection ssl ca path")
+	fs.StringVar(&GlobalDBConfigs.SslCert, "db_ssl_cert", "", "connection ssl certificate")
+	fs.StringVar(&GlobalDBConfigs.SslKey, "db_ssl_key", "", "connection ssl key")
+	fs.StringVar(&GlobalDBConfigs.TLSMinVersion, "db_tls_min_version", "", "Configures the minimal TLS version negotiated when SSL is enabled. Defaults to TLSv1.2. Options: TLSv1.0, TLSv1.1, TLSv1.2, TLSv1.3.")
+	fs.StringVar(&GlobalDBConfigs.ServerName, "db_server_name", "", "server name of the DB we are connecting to.")
+	fs.IntVar(&GlobalDBConfigs.ConnectTimeoutMilliseconds, "db_connect_timeout_ms", 0, "connection timeout to mysqld in milliseconds (0 for no timeout)")
+	fs.BoolVar(&GlobalDBConfigs.EnableQueryInfo, "db_conn_query_info", false, "enable parsing and processing of QUERY_OK info fields")
 }
 
 // The flags will change the global singleton
-// TODO(sougou): deprecate the legacy flags.
-func registerPerUserFlags(dbc *userConfig, userKey string) {
+func registerPerUserFlags(fs *pflag.FlagSet, userKey string, uc *UserConfig, cp *mysql.ConnParams) {
 	newUserFlag := "db_" + userKey + "_user"
-	flag.StringVar(&dbc.param.Uname, "db-config-"+userKey+"-uname", "vt_"+userKey, "deprecated: use "+newUserFlag)
-	flag.StringVar(&dbc.param.Uname, newUserFlag, "vt_"+userKey, "db "+userKey+" user userKey")
+	fs.StringVar(&uc.User, newUserFlag, "vt_"+userKey, "db "+userKey+" user userKey")
 
 	newPasswordFlag := "db_" + userKey + "_password"
-	flag.StringVar(&dbc.param.Pass, "db-config-"+userKey+"-pass", "", "db "+userKey+" deprecated: use "+newPasswordFlag)
-	flag.StringVar(&dbc.param.Pass, newPasswordFlag, "", "db "+userKey+" password")
+	fs.StringVar(&uc.Password, newPasswordFlag, "", "db "+userKey+" password")
 
-	flag.BoolVar(&dbc.useSSL, "db_"+userKey+"_use_ssl", true, "Set this flag to false to make the "+userKey+" connection to not use ssl")
+	fs.BoolVar(&uc.UseSSL, "db_"+userKey+"_use_ssl", true, "Set this flag to false to make the "+userKey+" connection to not use ssl")
+}
 
-	flag.StringVar(&dbc.param.Host, "db-config-"+userKey+"-host", "", "deprecated: use db_host")
-	flag.IntVar(&dbc.param.Port, "db-config-"+userKey+"-port", 0, "deprecated: use db_port")
-	flag.StringVar(&dbc.param.UnixSocket, "db-config-"+userKey+"-unixsocket", "", "deprecated: use db_socket")
-	flag.StringVar(&dbc.param.Charset, "db-config-"+userKey+"-charset", "utf8", "deprecated: use db_charset")
-	flag.Uint64Var(&dbc.param.Flags, "db-config-"+userKey+"-flags", 0, "deprecated: use db_flags")
-	flag.StringVar(&dbc.param.SslCa, "db-config-"+userKey+"-ssl-ca", "", "deprecated: use db_ssl_ca")
-	flag.StringVar(&dbc.param.SslCaPath, "db-config-"+userKey+"-ssl-ca-path", "", "deprecated: use db_ssl_ca_path")
-	flag.StringVar(&dbc.param.SslCert, "db-config-"+userKey+"-ssl-cert", "", "deprecated: use db_ssl_cert")
-	flag.StringVar(&dbc.param.SslKey, "db-config-"+userKey+"-ssl-key", "", "deprecated: use db_ssl_key")
+// Connector contains Connection Parameters for mysql connection
+type Connector struct {
+	connParams *mysql.ConnParams
+}
+
+// New initializes a ConnParams from mysql connection parameters
+func New(mcp *mysql.ConnParams) Connector {
+	return Connector{
+		connParams: mcp,
+	}
+}
+
+// Connect will invoke the mysql.connect method and return a connection
+func (c *Connector) Connect(ctx context.Context) (*mysql.Conn, error) {
+	params, err := c.MysqlParams()
+	if err != nil {
+		return nil, err
+	}
+	conn, err := mysql.Connect(ctx, params)
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
+}
+
+// MysqlParams returns the connections params
+func (c Connector) MysqlParams() (*mysql.ConnParams, error) {
+	if c.connParams == nil {
+		// This is only possible during tests.
+		return nil, vterrors.New(vtrpcpb.Code_INVALID_ARGUMENT, "parameters are empty")
+	}
+	params, err := withCredentials(c.connParams)
+	if err != nil {
+		return nil, err
+	}
+	return params, nil
+}
+
+// DBName gets the dbname from mysql.ConnParams
+func (c Connector) DBName() string {
+	return c.connParams.DbName
+}
+
+// Host gets the host from mysql.ConnParams
+func (c Connector) Host() string {
+	return c.connParams.Host
 }
 
 // AppWithDB returns connection parameters for app with dbname set.
-func (dbcfgs *DBConfigs) AppWithDB() *mysql.ConnParams {
-	return dbcfgs.makeParams(App, true)
+func (dbcfgs *DBConfigs) AppWithDB() Connector {
+	return dbcfgs.makeParams(&dbcfgs.appParams, true)
 }
 
 // AppDebugWithDB returns connection parameters for appdebug with dbname set.
-func (dbcfgs *DBConfigs) AppDebugWithDB() *mysql.ConnParams {
-	return dbcfgs.makeParams(AppDebug, true)
+func (dbcfgs *DBConfigs) AppDebugWithDB() Connector {
+	return dbcfgs.makeParams(&dbcfgs.appdebugParams, true)
 }
 
-// AllPrivsWithDB returns connection parameters for appdebug with dbname set.
-func (dbcfgs *DBConfigs) AllPrivsWithDB() *mysql.ConnParams {
-	return dbcfgs.makeParams(AllPrivs, true)
+// AllPrivsConnector returns connection parameters for allprivs with no dbname set.
+func (dbcfgs *DBConfigs) AllPrivsConnector() Connector {
+	return dbcfgs.makeParams(&dbcfgs.allprivsParams, false)
 }
 
-// Dba returns connection parameters for dba with no dbname set.
-func (dbcfgs *DBConfigs) Dba() *mysql.ConnParams {
-	return dbcfgs.makeParams(Dba, false)
+// AllPrivsWithDB returns connection parameters for allprivs with dbname set.
+func (dbcfgs *DBConfigs) AllPrivsWithDB() Connector {
+	return dbcfgs.makeParams(&dbcfgs.allprivsParams, true)
+}
+
+// DbaConnector returns connection parameters for dba with no dbname set.
+func (dbcfgs *DBConfigs) DbaConnector() Connector {
+	return dbcfgs.makeParams(&dbcfgs.dbaParams, false)
 }
 
 // DbaWithDB returns connection parameters for appdebug with dbname set.
-func (dbcfgs *DBConfigs) DbaWithDB() *mysql.ConnParams {
-	return dbcfgs.makeParams(Dba, true)
+func (dbcfgs *DBConfigs) DbaWithDB() Connector {
+	return dbcfgs.makeParams(&dbcfgs.dbaParams, true)
 }
 
-// FilteredWithDB returns connection parameters for appdebug with dbname set.
-func (dbcfgs *DBConfigs) FilteredWithDB() *mysql.ConnParams {
-	return dbcfgs.makeParams(Filtered, true)
+// FilteredWithDB returns connection parameters for filtered with dbname set.
+func (dbcfgs *DBConfigs) FilteredWithDB() Connector {
+	return dbcfgs.makeParams(&dbcfgs.filteredParams, true)
 }
 
-// Repl returns connection parameters for appdebug with no dbname set.
-func (dbcfgs *DBConfigs) Repl() *mysql.ConnParams {
-	return dbcfgs.makeParams(Repl, false)
+// ReplConnector returns connection parameters for repl with no dbname set.
+func (dbcfgs *DBConfigs) ReplConnector() Connector {
+	return dbcfgs.makeParams(&dbcfgs.replParams, false)
+}
+
+// ExternalRepl returns connection parameters for repl with no dbname set.
+func (dbcfgs *DBConfigs) ExternalRepl() Connector {
+	return dbcfgs.makeParams(&dbcfgs.externalReplParams, true)
+}
+
+// ExternalReplWithDB returns connection parameters for repl with dbname set.
+func (dbcfgs *DBConfigs) ExternalReplWithDB() Connector {
+	params := dbcfgs.makeParams(&dbcfgs.externalReplParams, true)
+	return params
 }
 
 // AppWithDB returns connection parameters for app with dbname set.
-func (dbcfgs *DBConfigs) makeParams(userKey string, withDB bool) *mysql.ConnParams {
-	orig := dbcfgs.userConfigs[userKey]
-	if orig == nil {
-		return &mysql.ConnParams{}
-	}
-	result := orig.param
+func (dbcfgs *DBConfigs) makeParams(cp *mysql.ConnParams, withDB bool) Connector {
+	result := *cp
 	if withDB {
-		result.DbName = dbcfgs.DBName.Get()
+		result.DbName = dbcfgs.DBName
 	}
-	return &result
+	return Connector{
+		connParams: &result,
+	}
 }
 
 // IsZero returns true if DBConfigs was uninitialized.
 func (dbcfgs *DBConfigs) IsZero() bool {
-	return len(dbcfgs.userConfigs) == 0
+	return *dbcfgs == DBConfigs{}
+}
+
+// HasGlobalSettings returns true if DBConfigs contains values
+// for global configs.
+func (dbcfgs *DBConfigs) HasGlobalSettings() bool {
+	return dbcfgs.Host != "" || dbcfgs.Socket != ""
 }
 
 func (dbcfgs *DBConfigs) String() string {
-	out := struct {
-		Conn  mysql.ConnParams
-		Users map[string]string
-	}{
-		Users: make(map[string]string),
-	}
-	if conn := dbcfgs.userConfigs[App]; conn != nil {
-		out.Conn = conn.param
-	} else if conn := dbcfgs.userConfigs[Dba]; conn != nil {
-		out.Conn = conn.param
-	}
-	out.Conn.Pass = "****"
-	for k, uc := range dbcfgs.userConfigs {
-		out.Users[k] = uc.param.Uname
-	}
-	data, err := json.MarshalIndent(out, "", "  ")
+	out, err := yaml2.Marshal(dbcfgs.Redacted())
 	if err != nil {
 		return err.Error()
 	}
-	return string(data)
+	return string(out)
 }
 
-// Copy returns a copy of the DBConfig.
-func (dbcfgs *DBConfigs) Copy() *DBConfigs {
-	result := &DBConfigs{userConfigs: make(map[string]*userConfig)}
-	for k, u := range dbcfgs.userConfigs {
-		newu := *u
-		result.userConfigs[k] = &newu
-	}
-	result.DBName.Set(dbcfgs.DBName.Get())
-	result.SidecarDBName.Set(dbcfgs.SidecarDBName.Get())
-	return result
+// MarshalJSON marshals after redacting passwords.
+func (dbcfgs *DBConfigs) MarshalJSON() ([]byte, error) {
+	type nonCustom DBConfigs
+	return json.Marshal((*nonCustom)(dbcfgs.Redacted()))
 }
 
-// Init will initialize all the necessary connection parameters.
-// Precedence is as follows: if baseConfig command line options are
-// set, they supersede all other settings.
-// If baseConfig is not set, the next priority is with per-user connection
+// Redacted redacts passwords from DBConfigs.
+func (dbcfgs *DBConfigs) Redacted() *DBConfigs {
+	dbcfgs = dbcfgs.Clone()
+	dbcfgs.App.Password = "****"
+	dbcfgs.Dba.Password = "****"
+	dbcfgs.Filtered.Password = "****"
+	dbcfgs.Repl.Password = "****"
+	dbcfgs.Appdebug.Password = "****"
+	dbcfgs.Allprivs.Password = "****"
+	return dbcfgs
+}
+
+// Clone returns a clone of the DBConfig.
+func (dbcfgs *DBConfigs) Clone() *DBConfigs {
+	result := *dbcfgs
+	return &result
+}
+
+// InitWithSocket will initialize all the necessary connection parameters.
+// Precedence is as follows: if UserConfig settings are set,
+// they supersede all other settings.
+// The next priority is with per-user connection
 // parameters. This is only for legacy support.
 // If no per-user parameters are supplied, then the defaultSocketFile
 // is used to initialize the per-user conn params.
-func Init(defaultSocketFile string) (*DBConfigs, error) {
-	// This is to support legacy behavior: use supplied socket value
-	// if conn parameters are not specified.
-	// TODO(sougou): deprecate.
-	for _, uc := range dbConfigs.userConfigs {
-		if uc.param.UnixSocket == "" && uc.param.Host == "" {
-			uc.param.UnixSocket = defaultSocketFile
-		}
-	}
-
-	// The new base configs, if set, supersede legacy settings.
-	if baseConfig.Host != "" || baseConfig.UnixSocket != "" {
-		for _, uc := range dbConfigs.userConfigs {
-			uc.param.Host = baseConfig.Host
-			uc.param.Port = baseConfig.Port
-			uc.param.UnixSocket = baseConfig.UnixSocket
-			uc.param.Charset = baseConfig.Charset
-			uc.param.Flags = baseConfig.Flags
-			if uc.useSSL {
-				uc.param.SslCa = baseConfig.SslCa
-				uc.param.SslCaPath = baseConfig.SslCaPath
-				uc.param.SslCert = baseConfig.SslCert
-				uc.param.SslKey = baseConfig.SslKey
+func (dbcfgs *DBConfigs) InitWithSocket(defaultSocketFile string, collationEnv *collations.Environment) {
+	for _, userKey := range All {
+		uc, cp := dbcfgs.getParams(userKey)
+		// TODO @rafael: For ExternalRepl we need to respect the provided host / port
+		// At the moment this is an snowflake user connection type that it used by
+		// vreplication to connect to external mysql hosts that are not part of a vitess
+		// cluster. In the future we need to refactor all dbconfig to support custom users
+		// in a more flexible way.
+		if dbcfgs.HasGlobalSettings() && userKey != ExternalRepl {
+			cp.Host = dbcfgs.Host
+			cp.Port = dbcfgs.Port
+			if !uc.UseTCP {
+				cp.UnixSocket = dbcfgs.Socket
 			}
+		} else if cp.UnixSocket == "" && cp.Host == "" {
+			cp.UnixSocket = defaultSocketFile
+		}
+
+		// If the connection params has a charset defined, it will not be overridden by the
+		// global configuration.
+		if dbcfgs.Charset != "" && cp.Charset == collations.Unknown {
+			ch, err := collationEnv.ParseConnectionCharset(dbcfgs.Charset)
+			if err != nil {
+				log.Warningf("Error parsing charset %s: %v", dbcfgs.Charset, err)
+				ch = collationEnv.DefaultConnectionCharset()
+			}
+			cp.Charset = ch
+		}
+
+		if dbcfgs.Flags != 0 {
+			cp.Flags = dbcfgs.Flags
+		}
+		if userKey != ExternalRepl {
+			cp.Flavor = dbcfgs.Flavor
+		}
+		cp.ConnectTimeoutMs = uint64(dbcfgs.ConnectTimeoutMilliseconds)
+		cp.EnableQueryInfo = dbcfgs.EnableQueryInfo
+
+		cp.Uname = uc.User
+		cp.Pass = uc.Password
+		if uc.UseSSL {
+			cp.SslMode = dbcfgs.SslMode
+			cp.SslCa = dbcfgs.SslCa
+			cp.SslCaPath = dbcfgs.SslCaPath
+			cp.SslCert = dbcfgs.SslCert
+			cp.SslKey = dbcfgs.SslKey
+			cp.TLSMinVersion = dbcfgs.TLSMinVersion
+			cp.ServerName = dbcfgs.ServerName
 		}
 	}
 
-	// See if the CredentialsServer is working. We do not use the
-	// result for anything, this is just a check.
-	for _, uc := range dbConfigs.userConfigs {
-		if _, err := WithCredentials(&uc.param); err != nil {
-			return nil, fmt.Errorf("dbconfig cannot be initialized: %v", err)
-		}
-		// Check for only one.
-		break
-	}
-	dbConfigs.SidecarDBName.Set("_vt")
+	log.Infof("DBConfigs: %v\n", dbcfgs.String())
+}
 
-	log.Infof("DBConfigs: %v\n", dbConfigs.String())
-	return &dbConfigs, nil
+func (dbcfgs *DBConfigs) getParams(userKey string) (*UserConfig, *mysql.ConnParams) {
+	var uc *UserConfig
+	var cp *mysql.ConnParams
+	switch userKey {
+	case App:
+		uc = &dbcfgs.App
+		cp = &dbcfgs.appParams
+	case AppDebug:
+		uc = &dbcfgs.Appdebug
+		cp = &dbcfgs.appdebugParams
+	case AllPrivs:
+		uc = &dbcfgs.Allprivs
+		cp = &dbcfgs.allprivsParams
+	case Dba:
+		uc = &dbcfgs.Dba
+		cp = &dbcfgs.dbaParams
+	case Filtered:
+		uc = &dbcfgs.Filtered
+		cp = &dbcfgs.filteredParams
+	case Repl:
+		uc = &dbcfgs.Repl
+		cp = &dbcfgs.replParams
+	case ExternalRepl:
+		uc = &dbcfgs.externalRepl
+		cp = &dbcfgs.externalReplParams
+	default:
+		log.Exitf("Invalid db user key requested: %s", userKey)
+	}
+	return uc, cp
+}
+
+// SetDbParams sets the dba and app params
+func (dbcfgs *DBConfigs) SetDbParams(dbaParams, appParams, filteredParams mysql.ConnParams) {
+	dbcfgs.dbaParams = dbaParams
+	dbcfgs.appParams = appParams
+	dbcfgs.filteredParams = filteredParams
 }
 
 // NewTestDBConfigs returns a DBConfigs meant for testing.
-func NewTestDBConfigs(genParams, appDebugParams mysql.ConnParams, dbName string) *DBConfigs {
-	dbcfgs := &DBConfigs{
-		userConfigs: map[string]*userConfig{
-			App:      {param: genParams},
-			AppDebug: {param: appDebugParams},
-			AllPrivs: {param: genParams},
-			Dba:      {param: genParams},
-			Filtered: {param: genParams},
-			Repl:     {param: genParams},
-		},
+func NewTestDBConfigs(genParams, appDebugParams mysql.ConnParams, dbname string) *DBConfigs {
+	return &DBConfigs{
+		appParams:          genParams,
+		appdebugParams:     appDebugParams,
+		allprivsParams:     genParams,
+		dbaParams:          genParams,
+		filteredParams:     genParams,
+		replParams:         genParams,
+		externalReplParams: genParams,
+		DBName:             dbname,
+		Charset:            "",
 	}
-	dbcfgs.DBName.Set(dbName)
-	dbcfgs.SidecarDBName.Set("_vt")
-	return dbcfgs
 }

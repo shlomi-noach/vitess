@@ -1,5 +1,5 @@
 /*
-Copyright 2018 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -35,7 +35,7 @@ func TestVschemaAcl(t *testing.T) {
 	}
 
 	// Test wildcard
-	*AuthorizedDDLUsers = "%"
+	AuthorizedDDLUsers = "%"
 	Init()
 
 	if !Authorized(&redUser) {
@@ -46,7 +46,7 @@ func TestVschemaAcl(t *testing.T) {
 	}
 
 	// Test user list
-	*AuthorizedDDLUsers = "oneUser, twoUser, redUser, blueUser"
+	AuthorizedDDLUsers = "oneUser, twoUser, redUser, blueUser"
 	Init()
 
 	if !Authorized(&redUser) {
@@ -57,7 +57,7 @@ func TestVschemaAcl(t *testing.T) {
 	}
 
 	// Revert to baseline state for other tests
-	*AuthorizedDDLUsers = ""
+	AuthorizedDDLUsers = ""
 	Init()
 
 	// By default no users are allowed in

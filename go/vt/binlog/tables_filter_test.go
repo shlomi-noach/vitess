@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ limitations under the License.
 package binlog
 
 import (
+	"fmt"
 	"testing"
 
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
@@ -53,11 +54,11 @@ func TestTablesFilterPass(t *testing.T) {
 		Position: "MariaDB/0-41983-1",
 	}
 	var got string
-	f := TablesFilterFunc(testTables, func(reply *binlogdatapb.BinlogTransaction) error {
+	f := tablesFilterFunc(testTables, func(reply *binlogdatapb.BinlogTransaction) error {
 		got = bltToString(reply)
 		return nil
 	})
-	f(eventToken, statements)
+	_ = f(eventToken, statements)
 	want := `statement: <6, "set1"> statement: <7, "dml1 /* _stream included1 (id ) (500 ); */"> statement: <7, "dml2 /* _stream included2 (id ) (500 ); */"> position: "MariaDB/0-41983-1" `
 	if want != got {
 		t.Errorf("want\n%s, got\n%s", want, got)
@@ -83,11 +84,11 @@ func TestTablesFilterSkip(t *testing.T) {
 		Position: "MariaDB/0-41983-1",
 	}
 	var got string
-	f := TablesFilterFunc(testTables, func(reply *binlogdatapb.BinlogTransaction) error {
+	f := tablesFilterFunc(testTables, func(reply *binlogdatapb.BinlogTransaction) error {
 		got = bltToString(reply)
 		return nil
 	})
-	f(eventToken, statements)
+	_ = f(eventToken, statements)
 	want := `position: "MariaDB/0-41983-1" `
 	if want != got {
 		t.Errorf("want %s, got %s", want, got)
@@ -113,11 +114,11 @@ func TestTablesFilterDDL(t *testing.T) {
 		Position: "MariaDB/0-41983-1",
 	}
 	var got string
-	f := TablesFilterFunc(testTables, func(reply *binlogdatapb.BinlogTransaction) error {
+	f := tablesFilterFunc(testTables, func(reply *binlogdatapb.BinlogTransaction) error {
 		got = bltToString(reply)
 		return nil
 	})
-	f(eventToken, statements)
+	_ = f(eventToken, statements)
 	want := `position: "MariaDB/0-41983-1" `
 	if want != got {
 		t.Errorf("want %s, got %s", want, got)
@@ -149,13 +150,22 @@ func TestTablesFilterMalformed(t *testing.T) {
 		Position: "MariaDB/0-41983-1",
 	}
 	var got string
-	f := TablesFilterFunc(testTables, func(reply *binlogdatapb.BinlogTransaction) error {
+	f := tablesFilterFunc(testTables, func(reply *binlogdatapb.BinlogTransaction) error {
 		got = bltToString(reply)
 		return nil
 	})
-	f(eventToken, statements)
+	_ = f(eventToken, statements)
 	want := `position: "MariaDB/0-41983-1" `
 	if want != got {
 		t.Errorf("want %s, got %s", want, got)
 	}
+}
+
+func bltToString(tx *binlogdatapb.BinlogTransaction) string {
+	result := ""
+	for _, statement := range tx.Statements {
+		result += fmt.Sprintf("statement: <%d, \"%s\"> ", statement.Category, string(statement.Sql))
+	}
+	result += fmt.Sprintf("position: \"%v\" ", tx.EventToken.Position)
+	return result
 }

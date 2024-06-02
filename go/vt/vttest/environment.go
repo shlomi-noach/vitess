@@ -1,6 +1,5 @@
 /*
-Copyright 2017 Google Inc.
-Copyright 2017 GitHub Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,12 +18,12 @@ package vttest
 
 import (
 	"fmt"
-	"io/ioutil"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"path"
 	"strings"
-	"time"
+
+	"vitess.io/vitess/go/vt/proto/vttest"
 
 	// we use gRPC everywhere, so import the vtgate client.
 	_ "vitess.io/vitess/go/vt/vtgate/grpcvtgateconn"
@@ -46,6 +45,12 @@ type Environment interface {
 	// and destructing the MySQL instance(s) that will be used by the cluster.
 	// See: vttest.MySQLManager for the interface the manager must implement
 	MySQLManager(mycnf []string, snapshot string) (MySQLManager, error)
+
+	// TopoManager is the constructor for the Topology manager that will
+	// be used by the cluster. It's only used when we run the local cluster with
+	// a remote topo server instead of in-memory topo server within vtcombo process
+	// See: vttest.TopoManager for the interface of topo manager
+	TopoManager(topoImplementation, topoServerAddress, topoRoot string, topology *vttest.VTTestTopology) TopoManager
 
 	// Directory is the path where the local cluster will store all its
 	// data and metadata. For local testing, this should probably be an
@@ -91,50 +96,28 @@ type Environment interface {
 // LocalTestEnv is an Environment implementation for local testing
 // See: NewLocalTestEnv()
 type LocalTestEnv struct {
-	BasePort     int
-	TmpPath      string
-	DefaultMyCnf []string
-	Env          []string
+	BasePort        int
+	TmpPath         string
+	DefaultMyCnf    []string
+	InitDBFile      string
+	Env             []string
+	EnableToxiproxy bool
 }
 
-// DefaultMySQLFlavor is the MySQL flavor used by vttest when MYSQL_FLAVOR is not
-// set in the environment
+// DefaultMySQLFlavor is the MySQL flavor used by vttest when no explicit
+// flavor is given.
 const DefaultMySQLFlavor = "MySQL56"
 
-// GetMySQLOptions returns the default option set for the given MySQL
-// flavor. If flavor is not set, the value from the `MYSQL_FLAVOR` env
-// variable is used, and if this is not set, DefaultMySQLFlavor will
-// be used.
-// Returns the name of the MySQL flavor being used, the set of MySQL CNF
-// files specific to this flavor, and any errors.
-func GetMySQLOptions(flavor string) (string, []string, error) {
-	if flavor == "" {
-		flavor = os.Getenv("MYSQL_FLAVOR")
-	}
-
-	if flavor == "" {
-		flavor = DefaultMySQLFlavor
-	}
-
-	mycnf := []string{"config/mycnf/vtcombo.cnf"}
-	switch flavor {
-	case "MariaDB":
-		mycnf = append(mycnf, "config/mycnf/default-fast.cnf")
-		mycnf = append(mycnf, "config/mycnf/master_mariadb.cnf")
-
-	case "MySQL56":
-		mycnf = append(mycnf, "config/mycnf/default-fast.cnf")
-		mycnf = append(mycnf, "config/mycnf/master_mysql56.cnf")
-
-	default:
-		return "", nil, fmt.Errorf("unknown mysql flavor: %s", flavor)
-	}
+// GetMySQLOptions returns the set of MySQL CNF files and any errors.
+func GetMySQLOptions() ([]string, error) {
+	mycnf := []string{}
+	mycnf = append(mycnf, "config/mycnf/test-suite.cnf")
 
 	for i, cnf := range mycnf {
-		mycnf[i] = path.Join(os.Getenv("VTTOP"), cnf)
+		mycnf[i] = path.Join(os.Getenv("VTROOT"), cnf)
 	}
 
-	return flavor, mycnf, nil
+	return mycnf, nil
 }
 
 // EnvVars implements EnvVars for LocalTestEnv
@@ -149,14 +132,36 @@ func (env *LocalTestEnv) BinaryPath(binary string) string {
 
 // MySQLManager implements MySQLManager for LocalTestEnv
 func (env *LocalTestEnv) MySQLManager(mycnf []string, snapshot string) (MySQLManager, error) {
-	return &Mysqlctl{
+	mysqlctl := &Mysqlctl{
 		Binary:    env.BinaryPath("mysqlctl"),
-		InitFile:  path.Join(os.Getenv("VTTOP"), "config/init_db.sql"),
+		InitFile:  env.InitDBFile,
 		Directory: env.TmpPath,
 		Port:      env.PortForProtocol("mysql", ""),
 		MyCnf:     append(env.DefaultMyCnf, mycnf...),
 		Env:       env.EnvVars(),
-	}, nil
+		UID:       1,
+	}
+	if !env.EnableToxiproxy {
+		return mysqlctl, nil
+	}
+
+	return NewToxiproxyctl(
+		env.BinaryPath("toxiproxy-server"),
+		env.PortForProtocol("toxiproxy", ""),
+		env.PortForProtocol("mysql_behind_toxiproxy", ""),
+		mysqlctl,
+		path.Join(env.LogDirectory(), "toxiproxy.log"),
+	)
+}
+
+// TopoManager implements TopoManager for LocalTestEnv
+func (env *LocalTestEnv) TopoManager(topoImplementation, topoServerAddress, topoRoot string, topology *vttest.VTTestTopology) TopoManager {
+	return &Topoctl{
+		TopoImplementation:      topoImplementation,
+		TopoGlobalServerAddress: topoServerAddress,
+		TopoGlobalRoot:          topoRoot,
+		Topology:                topology,
+	}
 }
 
 // DefaultProtocol implements DefaultProtocol for LocalTestEnv.
@@ -180,6 +185,12 @@ func (env *LocalTestEnv) PortForProtocol(name, proto string) int {
 	case "vtcombo_mysql_port":
 		return env.BasePort + 3
 
+	case "toxiproxy":
+		return env.BasePort + 4
+
+	case "mysql_behind_toxiproxy":
+		return env.BasePort + 5
+
 	default:
 		panic("unknown service name: " + name)
 	}
@@ -194,9 +205,10 @@ func (env *LocalTestEnv) ProcessHealthCheck(name string) HealthChecker {
 // VtcomboArguments implements VtcomboArguments for LocalTestEnv.
 func (env *LocalTestEnv) VtcomboArguments() []string {
 	return []string{
-		"-service_map", strings.Join(
-			[]string{"grpc-vtgateservice", "grpc-vtctl"}, ",",
-		)}
+		"--service_map", strings.Join(
+			[]string{"grpc-vtgateservice", "grpc-vtctl", "grpc-vtctld"}, ",",
+		),
+	}
 }
 
 // LogDirectory implements LogDirectory for LocalTestEnv.
@@ -215,15 +227,12 @@ func (env *LocalTestEnv) TearDown() error {
 }
 
 func tmpdir(dataroot string) (dir string, err error) {
-	dir, err = ioutil.TempDir(dataroot, "vttest")
-	if err == nil {
-		err = os.Mkdir(path.Join(dir, "logs"), 0700)
-	}
+	dir, err = os.MkdirTemp(dataroot, "vttest")
 	return
 }
 
 func randomPort() int {
-	v := rand.Int31n(20000)
+	v := rand.Int32N(20000)
 	return int(v + 10000)
 }
 
@@ -233,8 +242,7 @@ func randomPort() int {
 // up when closing the Environment.
 // - LogDirectory() is the `logs` subdir inside Directory()
 // - The MySQL flavor is set to `flavor`. If the argument is not set, it will
-// default to the value of MYSQL_FLAVOR, and if this variable is not set, to
-// DefaultMySQLFlavor
+// default DefaultMySQLFlavor
 // - PortForProtocol() will return ports based off the given basePort. If basePort
 // is zero, a random port between 10000 and 20000 will be chosen.
 // - DefaultProtocol() is always "grpc"
@@ -243,13 +251,25 @@ func randomPort() int {
 // - MySQLManager() will return a vttest.Mysqlctl instance, configured with the
 // given MySQL flavor. This will use the `mysqlctl` command to initialize and
 // teardown a single mysqld instance.
-func NewLocalTestEnv(flavor string, basePort int) (*LocalTestEnv, error) {
-	flavor, mycnf, err := GetMySQLOptions(flavor)
+func NewLocalTestEnv(basePort int) (*LocalTestEnv, error) {
+	directory, err := tmpdir(os.Getenv("VTDATAROOT"))
 	if err != nil {
 		return nil, err
 	}
+	return NewLocalTestEnvWithDirectory(basePort, directory)
+}
 
-	directory, err := tmpdir(os.Getenv("VTDATAROOT"))
+// NewLocalTestEnvWithDirectory returns a new instance of the default test
+// environment with a directory explicitly specified.
+func NewLocalTestEnvWithDirectory(basePort int, directory string) (*LocalTestEnv, error) {
+	if _, err := os.Stat(path.Join(directory, "logs")); os.IsNotExist(err) {
+		err := os.Mkdir(path.Join(directory, "logs"), 0700)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	mycnf, err := GetMySQLOptions()
 	if err != nil {
 		return nil, err
 	}
@@ -262,19 +282,16 @@ func NewLocalTestEnv(flavor string, basePort int) (*LocalTestEnv, error) {
 		BasePort:     basePort,
 		TmpPath:      directory,
 		DefaultMyCnf: mycnf,
+		InitDBFile:   path.Join(os.Getenv("VTROOT"), "config/init_db.sql"),
 		Env: []string{
 			fmt.Sprintf("VTDATAROOT=%s", directory),
-			fmt.Sprintf("MYSQL_FLAVOR=%s", flavor),
+			"VTTEST=endtoend",
 		},
 	}, nil
 }
 
 func defaultEnvFactory() (Environment, error) {
-	return NewLocalTestEnv("", 0)
-}
-
-func init() {
-	rand.Seed(time.Now().UnixNano())
+	return NewLocalTestEnv(0)
 }
 
 // NewDefaultEnv is an user-configurable callback that returns a new Environment

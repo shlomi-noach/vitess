@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,13 +17,13 @@ limitations under the License.
 package binlogplayertest
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	"google.golang.org/protobuf/proto"
 
 	"vitess.io/vitess/go/vt/binlog/binlogplayer"
 	"vitess.io/vitess/go/vt/key"
@@ -96,7 +96,7 @@ var testBinlogTransaction = &binlogdatapb.BinlogTransaction{
 	},
 }
 
-// StreamKeyRange is part of the the UpdateStream interface
+// StreamKeyRange is part of the UpdateStream interface
 func (fake *FakeBinlogStreamer) StreamKeyRange(ctx context.Context, position string, keyRange *topodatapb.KeyRange, charset *binlogdatapb.Charset, callback func(reply *binlogdatapb.BinlogTransaction) error) error {
 	if fake.panics {
 		panic(fmt.Errorf("test-triggered panic"))
@@ -111,7 +111,9 @@ func (fake *FakeBinlogStreamer) StreamKeyRange(ctx context.Context, position str
 		!proto.Equal(charset, testKeyRangeRequest.Charset) {
 		fake.t.Errorf("wrong StreamKeyRange parameter, got %+v want %+v", req, testKeyRangeRequest)
 	}
-	callback(testBinlogTransaction)
+	if err := callback(testBinlogTransaction); err != nil {
+		fake.t.Logf("StreamKeyRange callback failed: %v", err)
+	}
 	return nil
 }
 
@@ -125,7 +127,7 @@ func testStreamKeyRange(t *testing.T, bpc binlogplayer.Client) {
 		t.Fatalf("got error: %v", err)
 	} else {
 		if !proto.Equal(se, testBinlogTransaction) {
-			t.Errorf("got wrong result, got %v expected %v", *se, *testBinlogTransaction)
+			t.Errorf("got wrong result, got %v expected %v", se, testBinlogTransaction)
 		}
 	}
 	if se, err := stream.Recv(); err == nil {
@@ -162,7 +164,7 @@ var testTablesRequest = &tablesRequest{
 	},
 }
 
-// StreamTables is part of the the UpdateStream interface
+// StreamTables is part of the UpdateStream interface
 func (fake *FakeBinlogStreamer) StreamTables(ctx context.Context, position string, tables []string, charset *binlogdatapb.Charset, callback func(reply *binlogdatapb.BinlogTransaction) error) error {
 	if fake.panics {
 		panic(fmt.Errorf("test-triggered panic"))
@@ -177,7 +179,9 @@ func (fake *FakeBinlogStreamer) StreamTables(ctx context.Context, position strin
 		!proto.Equal(charset, testTablesRequest.Charset) {
 		fake.t.Errorf("wrong StreamTables parameter, got %+v want %+v", req, testTablesRequest)
 	}
-	callback(testBinlogTransaction)
+	if err := callback(testBinlogTransaction); err != nil {
+		fake.t.Logf("StreamTables callback failed: %v", err)
+	}
 	return nil
 }
 
@@ -191,7 +195,7 @@ func testStreamTables(t *testing.T, bpc binlogplayer.Client) {
 		t.Fatalf("got error: %v", err)
 	} else {
 		if !proto.Equal(se, testBinlogTransaction) {
-			t.Errorf("got wrong result, got %v expected %v", *se, *testBinlogTransaction)
+			t.Errorf("got wrong result, got %v expected %v", se, testBinlogTransaction)
 		}
 	}
 	if se, err := stream.Recv(); err == nil {
@@ -214,16 +218,16 @@ func testStreamTablesPanics(t *testing.T, bpc binlogplayer.Client) {
 	}
 }
 
-// HandlePanic is part of the the UpdateStream interface
+// HandlePanic is part of the UpdateStream interface
 func (fake *FakeBinlogStreamer) HandlePanic(err *error) {
 	if x := recover(); x != nil {
-		*err = fmt.Errorf("Caught panic: %v", x)
+		*err = fmt.Errorf("caught panic: %v", x)
 	}
 }
 
 // Run runs the test suite
-func Run(t *testing.T, bpc binlogplayer.Client, tablet *topodatapb.Tablet, fake *FakeBinlogStreamer) {
-	if err := bpc.Dial(tablet); err != nil {
+func Run(ctx context.Context, t *testing.T, bpc binlogplayer.Client, tablet *topodatapb.Tablet, fake *FakeBinlogStreamer) {
+	if err := bpc.Dial(ctx, tablet); err != nil {
 		t.Fatalf("Dial failed: %v", err)
 	}
 

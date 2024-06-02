@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,18 +17,18 @@ limitations under the License.
 package etcd2topo
 
 import (
+	"context"
 	"path"
 
-	"github.com/coreos/etcd/clientv3"
-	"golang.org/x/net/context"
+	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/topo"
 )
 
-// NewMasterParticipation is part of the topo.Server interface
-func (s *Server) NewMasterParticipation(name, id string) (topo.MasterParticipation, error) {
-	return &etcdMasterParticipation{
+// NewLeaderParticipation is part of the topo.Server interface
+func (s *Server) NewLeaderParticipation(name, id string) (topo.LeaderParticipation, error) {
+	return &etcdLeaderParticipation{
 		s:    s,
 		name: name,
 		id:   id,
@@ -37,16 +37,16 @@ func (s *Server) NewMasterParticipation(name, id string) (topo.MasterParticipati
 	}, nil
 }
 
-// etcdMasterParticipation implements topo.MasterParticipation.
+// etcdLeaderParticipation implements topo.LeaderParticipation.
 //
 // We use a directory (in global election path, with the name) with
 // ephemeral files in it, that contains the id.  The oldest revision
 // wins the election.
-type etcdMasterParticipation struct {
+type etcdLeaderParticipation struct {
 	// s is our parent etcd topo Server
 	s *Server
 
-	// name is the name of this MasterParticipation
+	// name is the name of this LeaderParticipation
 	name string
 
 	// id is the process's current id.
@@ -59,12 +59,12 @@ type etcdMasterParticipation struct {
 	done chan struct{}
 }
 
-// WaitForMastership is part of the topo.MasterParticipation interface.
-func (mp *etcdMasterParticipation) WaitForMastership() (context.Context, error) {
+// WaitForLeadership is part of the topo.LeaderParticipation interface.
+func (mp *etcdLeaderParticipation) WaitForLeadership() (context.Context, error) {
 	// If Stop was already called, mp.done is closed, so we are interrupted.
 	select {
 	case <-mp.done:
-		return nil, topo.NewError(topo.Interrupted, "mastership")
+		return nil, topo.NewError(topo.Interrupted, "Leadership")
 	default:
 	}
 
@@ -76,18 +76,20 @@ func (mp *etcdMasterParticipation) WaitForMastership() (context.Context, error) 
 	lockCtx, lockCancel := context.WithCancel(context.Background())
 	go func() {
 		select {
+		case <-mp.s.running:
+			return
 		case <-mp.stop:
-			if ld != nil {
-				if err := ld.Unlock(context.Background()); err != nil {
-					log.Errorf("failed to unlock electionPath %v: %v", electionPath, err)
-				}
-			}
-			lockCancel()
-			close(mp.done)
 		}
+		if ld != nil {
+			if err := ld.Unlock(context.Background()); err != nil {
+				log.Errorf("failed to unlock electionPath %v: %v", electionPath, err)
+			}
+		}
+		lockCancel()
+		close(mp.done)
 	}()
 
-	// Try to get the mastership, by getting a lock.
+	// Try to get the primaryship, by getting a lock.
 	var err error
 	ld, err = mp.s.lock(lockCtx, electionPath, mp.id)
 	if err != nil {
@@ -100,14 +102,14 @@ func (mp *etcdMasterParticipation) WaitForMastership() (context.Context, error) 
 	return lockCtx, nil
 }
 
-// Stop is part of the topo.MasterParticipation interface
-func (mp *etcdMasterParticipation) Stop() {
+// Stop is part of the topo.LeaderParticipation interface
+func (mp *etcdLeaderParticipation) Stop() {
 	close(mp.stop)
 	<-mp.done
 }
 
-// GetCurrentMasterID is part of the topo.MasterParticipation interface
-func (mp *etcdMasterParticipation) GetCurrentMasterID(ctx context.Context) (string, error) {
+// GetCurrentLeaderID is part of the topo.LeaderParticipation interface
+func (mp *etcdLeaderParticipation) GetCurrentLeaderID(ctx context.Context) (string, error) {
 	electionPath := path.Join(mp.s.root, electionsPath, mp.name)
 
 	// Get the keys in the directory, older first.
@@ -119,8 +121,72 @@ func (mp *etcdMasterParticipation) GetCurrentMasterID(ctx context.Context) (stri
 		return "", convertError(err, electionPath)
 	}
 	if len(resp.Kvs) == 0 {
-		// No key starts with this prefix, means nobody is the master.
+		// No key starts with this prefix, means nobody is the primary.
 		return "", nil
 	}
 	return string(resp.Kvs[0].Value), nil
+}
+
+func (mp *etcdLeaderParticipation) WaitForNewLeader(ctx context.Context) (<-chan string, error) {
+	electionPath := path.Join(mp.s.root, electionsPath, mp.name)
+
+	notifications := make(chan string, 8)
+	ctx, cancel := context.WithCancel(ctx)
+
+	// Get the current leader
+	initial, err := mp.s.cli.Get(ctx, electionPath+"/",
+		clientv3.WithPrefix(),
+		clientv3.WithSort(clientv3.SortByModRevision, clientv3.SortAscend),
+		clientv3.WithLimit(1))
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+
+	if len(initial.Kvs) == 1 {
+		leader := initial.Kvs[0].Value
+		notifications <- string(leader)
+	}
+
+	// Create the Watcher.  We start watching from the response we
+	// got, not from the file original version, as the server may
+	// not have that much history.
+	watcher := mp.s.cli.Watch(ctx, electionPath, clientv3.WithPrefix(), clientv3.WithRev(initial.Header.Revision))
+	if watcher == nil {
+		cancel()
+		return nil, convertError(err, electionPath)
+	}
+
+	go func() {
+		defer cancel()
+		defer close(notifications)
+		for {
+			select {
+			case <-mp.s.running:
+				return
+			case <-mp.done:
+				return
+			case <-ctx.Done():
+				return
+			case wresp, ok := <-watcher:
+				if !ok || wresp.Canceled {
+					return
+				}
+
+				currentLeader, err := mp.s.cli.Get(ctx, electionPath+"/",
+					clientv3.WithPrefix(),
+					clientv3.WithSort(clientv3.SortByModRevision, clientv3.SortAscend),
+					clientv3.WithLimit(1))
+				if err != nil {
+					continue
+				}
+				if len(currentLeader.Kvs) != 1 {
+					continue
+				}
+				notifications <- string(currentLeader.Kvs[0].Value)
+			}
+		}
+	}()
+
+	return notifications, nil
 }

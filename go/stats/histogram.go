@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,14 +19,14 @@ package stats
 import (
 	"bytes"
 	"fmt"
-
-	"vitess.io/vitess/go/sync2"
+	"sync/atomic"
 )
 
 // Histogram tracks counts and totals while
 // splitting the counts under different buckets
 // using specified cutoffs.
 type Histogram struct {
+	name       string
 	help       string
 	cutoffs    []int64
 	labels     []string
@@ -34,8 +34,8 @@ type Histogram struct {
 	totalLabel string
 	hook       func(int64)
 
-	buckets []sync2.AtomicInt64
-	total   sync2.AtomicInt64
+	buckets []atomic.Int64
+	total   atomic.Int64
 }
 
 // NewHistogram creates a histogram with auto-generated labels
@@ -60,17 +60,23 @@ func NewGenericHistogram(name, help string, cutoffs []int64, labels []string, co
 		panic("mismatched cutoff and label lengths")
 	}
 	h := &Histogram{
+		name:       name,
 		help:       help,
 		cutoffs:    cutoffs,
 		labels:     labels,
 		countLabel: countLabel,
 		totalLabel: totalLabel,
-		buckets:    make([]sync2.AtomicInt64, len(labels)),
+		buckets:    make([]atomic.Int64, len(labels)),
 	}
 	if name != "" {
 		publish(name, h)
 	}
 	return h
+}
+
+// Adds a hook that will be called every time a new value is added to the histogram
+func (h *Histogram) AddHook(hook func(int64)) {
+	h.hook = hook
 }
 
 // Add adds a new measurement to the Histogram.
@@ -84,6 +90,9 @@ func (h *Histogram) Add(value int64) {
 	}
 	if h.hook != nil {
 		h.hook(value)
+	}
+	if defaultStatsdHook.histogramHook != nil && h.name != "" {
+		defaultStatsdHook.histogramHook(h.name, value)
 	}
 }
 
@@ -103,11 +112,12 @@ func (h *Histogram) MarshalJSON() ([]byte, error) {
 	fmt.Fprintf(b, "{")
 	totalCount := int64(0)
 	for i, label := range h.labels {
-		totalCount += h.buckets[i].Get()
-		fmt.Fprintf(b, "\"%v\": %v, ", label, totalCount)
+		count := h.buckets[i].Load()
+		totalCount += count
+		fmt.Fprintf(b, "\"%v\": %v, ", label, count)
 	}
 	fmt.Fprintf(b, "\"%s\": %v, ", h.countLabel, totalCount)
-	fmt.Fprintf(b, "\"%s\": %v", h.totalLabel, h.total.Get())
+	fmt.Fprintf(b, "\"%s\": %v", h.totalLabel, h.total.Load())
 	fmt.Fprintf(b, "}")
 	return b.Bytes(), nil
 }
@@ -116,7 +126,7 @@ func (h *Histogram) MarshalJSON() ([]byte, error) {
 func (h *Histogram) Counts() map[string]int64 {
 	counts := make(map[string]int64, len(h.labels))
 	for i, label := range h.labels {
-		counts[label] = h.buckets[i].Get()
+		counts[label] = h.buckets[i].Load()
 	}
 	return counts
 }
@@ -129,7 +139,7 @@ func (h *Histogram) CountLabel() string {
 // Count returns the number of times Add has been called.
 func (h *Histogram) Count() (count int64) {
 	for i := range h.buckets {
-		count += h.buckets[i].Get()
+		count += h.buckets[i].Load()
 	}
 	return
 }
@@ -141,7 +151,7 @@ func (h *Histogram) TotalLabel() string {
 
 // Total returns the sum of all values that have been added to this Histogram.
 func (h *Histogram) Total() (total int64) {
-	return h.total.Get()
+	return h.total.Load()
 }
 
 // Labels returns the labels that were set when this Histogram was created.
@@ -158,7 +168,7 @@ func (h *Histogram) Cutoffs() []int64 {
 func (h *Histogram) Buckets() []int64 {
 	buckets := make([]int64, len(h.buckets))
 	for i := range h.buckets {
-		buckets[i] = h.buckets[i].Get()
+		buckets[i] = h.buckets[i].Load()
 	}
 	return buckets
 }

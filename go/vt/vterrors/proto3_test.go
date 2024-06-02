@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,10 +17,9 @@ limitations under the License.
 package vterrors
 
 import (
-	"reflect"
 	"testing"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
@@ -34,15 +33,14 @@ func TestFromVtRPCError(t *testing.T) {
 		want: nil,
 	}, {
 		in: &vtrpcpb.RPCError{
-			LegacyCode: vtrpcpb.LegacyErrorCode_BAD_INPUT_LEGACY,
-			Message:    "bad input",
+			Code:    vtrpcpb.Code_INVALID_ARGUMENT,
+			Message: "bad input",
 		},
 		want: New(vtrpcpb.Code_INVALID_ARGUMENT, "bad input"),
 	}, {
 		in: &vtrpcpb.RPCError{
-			LegacyCode: vtrpcpb.LegacyErrorCode_BAD_INPUT_LEGACY,
-			Message:    "bad input",
-			Code:       vtrpcpb.Code_INVALID_ARGUMENT,
+			Message: "bad input",
+			Code:    vtrpcpb.Code_INVALID_ARGUMENT,
 		},
 		want: New(vtrpcpb.Code_INVALID_ARGUMENT, "bad input"),
 	}, {
@@ -54,8 +52,8 @@ func TestFromVtRPCError(t *testing.T) {
 	}}
 	for _, tcase := range testcases {
 		got := FromVTRPC(tcase.in)
-		if !reflect.DeepEqual(got, tcase.want) {
-			t.Errorf("FromVtRPCError(%v): %v, want %v", tcase.in, got, tcase.want)
+		if !Equals(got, tcase.want) {
+			t.Errorf("FromVtRPCError(%v): [%v], want [%v]", tcase.in, got, tcase.want)
 		}
 	}
 }
@@ -70,9 +68,8 @@ func TestVtRPCErrorFromVtError(t *testing.T) {
 	}, {
 		in: New(vtrpcpb.Code_INVALID_ARGUMENT, "bad input"),
 		want: &vtrpcpb.RPCError{
-			LegacyCode: vtrpcpb.LegacyErrorCode_BAD_INPUT_LEGACY,
-			Message:    "bad input",
-			Code:       vtrpcpb.Code_INVALID_ARGUMENT,
+			Message: "bad input",
+			Code:    vtrpcpb.Code_INVALID_ARGUMENT,
 		},
 	}}
 	for _, tcase := range testcases {

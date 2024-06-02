@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -54,6 +54,18 @@ func TestFireOnTermSyncHooksTimeout(t *testing.T) {
 	})
 
 	if finished, want := fireOnTermSyncHooks(1*time.Nanosecond), false; finished != want {
+		t.Errorf("finished = %v, want %v", finished, want)
+	}
+}
+
+func TestFireOnCloseHooksTimeout(t *testing.T) {
+	onCloseHooks = event.Hooks{}
+
+	OnClose(func() {
+		time.Sleep(1 * time.Second)
+	})
+
+	if finished, want := fireOnCloseHooks(1*time.Nanosecond), false; finished != want {
 		t.Errorf("finished = %v, want %v", finished, want)
 	}
 }

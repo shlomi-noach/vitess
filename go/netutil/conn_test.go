@@ -1,5 +1,5 @@
 /*
-Copyright 2018 The Vitess Authors.
+Copyright 2019 The Vitess Authors.
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -15,18 +15,17 @@ package netutil
 
 import (
 	"net"
-	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func createSocketPair(t *testing.T) (net.Listener, net.Conn, net.Conn) {
 	// Create a listener.
-	listener, err := net.Listen("tcp", ":0")
-	if err != nil {
-		t.Fatalf("Listen failed: %v", err)
-	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	assert.NoError(t, err)
 	addr := listener.Addr().String()
 
 	// Dial a client, Accept a server.
@@ -38,9 +37,7 @@ func createSocketPair(t *testing.T) (net.Listener, net.Conn, net.Conn) {
 		defer wg.Done()
 		var err error
 		clientConn, err = net.Dial("tcp", addr)
-		if err != nil {
-			t.Fatalf("Dial failed: %v", err)
-		}
+		assert.NoError(t, err)
 	}()
 
 	var serverConn net.Conn
@@ -49,9 +46,7 @@ func createSocketPair(t *testing.T) (net.Listener, net.Conn, net.Conn) {
 		defer wg.Done()
 		var err error
 		serverConn, err = listener.Accept()
-		if err != nil {
-			t.Fatalf("Accept failed: %v", err)
-		}
+		assert.NoError(t, err)
 	}()
 
 	wg.Wait()
@@ -77,13 +72,7 @@ func TestReadTimeout(t *testing.T) {
 
 	select {
 	case err := <-c:
-		if err == nil {
-			t.Fatalf("Expected error, got nil")
-		}
-
-		if !strings.HasSuffix(err.Error(), "i/o timeout") {
-			t.Errorf("Expected error timeout, got %s", err)
-		}
+		assert.ErrorContains(t, err, "i/o timeout", "Expected error timeout")
 	case <-time.After(10 * time.Second):
 		t.Errorf("Timeout did not happen")
 	}
@@ -113,13 +102,7 @@ func TestWriteTimeout(t *testing.T) {
 
 	select {
 	case err := <-c:
-		if err == nil {
-			t.Fatalf("Expected error, got nil")
-		}
-
-		if !strings.HasSuffix(err.Error(), "i/o timeout") {
-			t.Errorf("Expected error timeout, got %s", err)
-		}
+		assert.ErrorContains(t, err, "i/o timeout", "Expected error timeout")
 	case <-time.After(10 * time.Second):
 		t.Errorf("Timeout did not happen")
 	}
@@ -166,4 +149,43 @@ func TestNoTimeouts(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 		// NOOP
 	}
+}
+
+func TestSetDeadline(t *testing.T) {
+	listener, sConn, cConn := createSocketPair(t)
+	defer func() {
+		listener.Close()
+		sConn.Close()
+		cConn.Close()
+	}()
+
+	cConnWithTimeout := NewConnWithTimeouts(cConn, 0, 24*time.Hour)
+
+	assert.Panics(t, func() { _ = cConnWithTimeout.SetDeadline(time.Now()) })
+}
+
+func TestSetReadDeadline(t *testing.T) {
+	listener, sConn, cConn := createSocketPair(t)
+	defer func() {
+		listener.Close()
+		sConn.Close()
+		cConn.Close()
+	}()
+
+	cConnWithTimeout := NewConnWithTimeouts(cConn, 0, 24*time.Hour)
+
+	assert.Panics(t, func() { _ = cConnWithTimeout.SetReadDeadline(time.Now()) })
+}
+
+func TestSetWriteDeadline(t *testing.T) {
+	listener, sConn, cConn := createSocketPair(t)
+	defer func() {
+		listener.Close()
+		sConn.Close()
+		cConn.Close()
+	}()
+
+	cConnWithTimeout := NewConnWithTimeouts(cConn, 0, 24*time.Hour)
+
+	assert.Panics(t, func() { _ = cConnWithTimeout.SetWriteDeadline(time.Now()) })
 }

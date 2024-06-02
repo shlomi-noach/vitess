@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,39 +18,41 @@ package schemamanager
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 	"strings"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
+
 	"vitess.io/vitess/go/vt/log"
 )
 
 // LocalController listens to the specified schema change dir and applies schema changes.
 // schema change dir lay out
-//            |
-//            |----keyspace_01
-//                 |----input
-//                      |---- create_test_table.sql
-//                      |---- alter_test_table_02.sql
-//                      |---- ...
-//                 |----complete // contains completed schema changes in yyyy/MM/dd
-//                      |----2015
-//                           |----01
-//                                |----01
-//                                     |--- create_table_table_02.sql
-//                 |----log // contains detailed execution information about schema changes
-//                      |----2015
-//                           |----01
-//                                |----01
-//                                     |--- create_table_table_02.sql
-//                 |----error // contains failed schema changes
-//                      |----2015
-//                           |----01
-//                                |----01
-//                                     |--- create_table_table_03.sql
+//
+//	|
+//	|----keyspace_01
+//	     |----input
+//	          |---- create_test_table.sql
+//	          |---- alter_test_table_02.sql
+//	          |---- ...
+//	     |----complete // contains completed schema changes in yyyy/MM/dd
+//	          |----2015
+//	               |----01
+//	                    |----01
+//	                         |--- create_table_table_02.sql
+//	     |----log // contains detailed execution information about schema changes
+//	          |----2015
+//	               |----01
+//	                    |----01
+//	                         |--- create_table_table_02.sql
+//	     |----error // contains failed schema changes
+//	          |----2015
+//	               |----01
+//	                    |----01
+//	                         |--- create_table_table_03.sql
+//
 // Schema Change Files: ${keyspace}/input/*.sql
 // Error Files:         ${keyspace}/error/${YYYY}/${MM}/${DD}/*.sql
 // Log Files:           ${keyspace}/log/${YYYY}/${MM}/${DD}/*.sql
@@ -76,7 +78,7 @@ func NewLocalController(schemaChangeDir string) *LocalController {
 // schema change.
 func (controller *LocalController) Open(ctx context.Context) error {
 	// find all keyspace directories.
-	fileInfos, err := ioutil.ReadDir(controller.schemaChangeDir)
+	fileInfos, err := os.ReadDir(controller.schemaChangeDir)
 	if err != nil {
 		return err
 	}
@@ -85,7 +87,7 @@ func (controller *LocalController) Open(ctx context.Context) error {
 			continue
 		}
 		dirpath := path.Join(controller.schemaChangeDir, fileinfo.Name())
-		schemaChanges, err := ioutil.ReadDir(path.Join(dirpath, "input"))
+		schemaChanges, err := os.ReadDir(path.Join(dirpath, "input"))
 		if err != nil {
 			log.Warningf("there is no input dir in %s", dirpath)
 			continue
@@ -118,7 +120,7 @@ func (controller *LocalController) Read(ctx context.Context) ([]string, error) {
 	if controller.keyspace == "" || controller.sqlPath == "" {
 		return []string{}, nil
 	}
-	data, err := ioutil.ReadFile(controller.sqlPath)
+	data, err := os.ReadFile(controller.sqlPath)
 	if err != nil {
 		return nil, err
 	}

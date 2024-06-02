@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,22 +17,19 @@ limitations under the License.
 package messager
 
 import (
-	"sort"
+	"context"
 	"sync"
-	"time"
 
-	"golang.org/x/net/context"
+	"golang.org/x/sync/semaphore"
 
 	"vitess.io/vitess/go/sqltypes"
-	"vitess.io/vitess/go/sync2"
-	"vitess.io/vitess/go/vt/dbconfigs"
 	"vitess.io/vitess/go/vt/log"
-	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
-	"vitess.io/vitess/go/vt/vttablet/tabletserver/connpool"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/throttle/throttlerapp"
 
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
@@ -40,71 +37,85 @@ import (
 // TabletService defines the functions of TabletServer
 // that the messager needs for callback.
 type TabletService interface {
-	CheckMySQL()
-	PostponeMessages(ctx context.Context, target *querypb.Target, name string, ids []string) (count int64, err error)
-	PurgeMessages(ctx context.Context, target *querypb.Target, name string, timeCutoff int64) (count int64, err error)
+	tabletenv.Env
+	PostponeMessages(ctx context.Context, target *querypb.Target, querygen QueryGenerator, ids []string) (count int64, err error)
+	PurgeMessages(ctx context.Context, target *querypb.Target, querygen QueryGenerator, timeCutoff int64) (count int64, err error)
+}
+
+// VStreamer defines  the functions of VStreamer
+// that the messager needs.
+type VStreamer interface {
+	Stream(ctx context.Context, startPos string, tablePKs []*binlogdatapb.TableLastPK, filter *binlogdatapb.Filter, throttlerApp throttlerapp.Name, send func([]*binlogdatapb.VEvent) error) error
+	StreamResults(ctx context.Context, query string, send func(*binlogdatapb.VStreamResultsResponse) error) error
 }
 
 // Engine is the engine for handling messages.
 type Engine struct {
-	dbconfigs *dbconfigs.DBConfigs
-
 	mu       sync.Mutex
 	isOpen   bool
 	managers map[string]*messageManager
 
 	tsv          TabletService
 	se           *schema.Engine
-	conns        *connpool.Pool
-	postponeSema *sync2.Semaphore
+	vs           VStreamer
+	postponeSema *semaphore.Weighted
 }
 
 // NewEngine creates a new Engine.
-func NewEngine(tsv TabletService, se *schema.Engine, config tabletenv.TabletConfig) *Engine {
+func NewEngine(tsv TabletService, se *schema.Engine, vs VStreamer) *Engine {
 	return &Engine{
-		tsv: tsv,
-		se:  se,
-		conns: connpool.New(
-			config.PoolNamePrefix+"MessagerPool",
-			config.MessagePoolSize,
-			time.Duration(config.IdleTimeout*1e9),
-			tsv,
-		),
-		postponeSema: sync2.NewSemaphore(config.MessagePostponeCap, 0),
+		tsv:          tsv,
+		se:           se,
+		vs:           vs,
+		postponeSema: semaphore.NewWeighted(int64(tsv.Config().MessagePostponeParallelism)),
 		managers:     make(map[string]*messageManager),
 	}
 }
 
-// InitDBConfig must be called before Open.
-func (me *Engine) InitDBConfig(dbcfgs *dbconfigs.DBConfigs) {
-	me.dbconfigs = dbcfgs
-}
-
 // Open starts the Engine service.
-func (me *Engine) Open() error {
+func (me *Engine) Open() {
+	me.mu.Lock()
 	if me.isOpen {
-		return nil
+		me.mu.Unlock()
+		return
 	}
-	me.conns.Open(me.dbconfigs.AppWithDB(), me.dbconfigs.DbaWithDB(), me.dbconfigs.AppDebugWithDB())
-	me.se.RegisterNotifier("messages", me.schemaChanged)
 	me.isOpen = true
-	return nil
+	me.mu.Unlock()
+	log.Info("Messager: opening")
+	// Unlock before invoking RegisterNotifier because it
+	// obtains the same lock.
+	me.se.RegisterNotifier("messages", me.schemaChanged, true)
 }
 
 // Close closes the Engine service.
 func (me *Engine) Close() {
+	log.Infof("messager Engine - started execution of Close. Acquiring mu lock")
 	me.mu.Lock()
+	log.Infof("messager Engine - acquired mu lock")
 	defer me.mu.Unlock()
 	if !me.isOpen {
+		log.Infof("messager Engine is not open")
 		return
 	}
 	me.isOpen = false
+	log.Infof("messager Engine - unregistering notifiers")
 	me.se.UnregisterNotifier("messages")
+	log.Infof("messager Engine - closing all managers")
 	for _, mm := range me.managers {
 		mm.Close()
 	}
 	me.managers = make(map[string]*messageManager)
-	me.conns.Close()
+	log.Info("Messager: closed")
+}
+
+func (me *Engine) GetGenerator(name string) (QueryGenerator, error) {
+	me.mu.Lock()
+	defer me.mu.Unlock()
+	mm := me.managers[name]
+	if mm == nil {
+		return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "message table %s not found in schema", name)
+	}
+	return mm, nil
 }
 
 // Subscribe subscribes to messages from the requested table.
@@ -118,7 +129,7 @@ func (me *Engine) Subscribe(ctx context.Context, name string, send func(*sqltype
 	me.mu.Lock()
 	defer me.mu.Unlock()
 	if !me.isOpen {
-		return nil, vterrors.Errorf(vtrpcpb.Code_UNAVAILABLE, "messager engine is closed, probably because this is not a master any more")
+		return nil, vterrors.Errorf(vtrpcpb.Code_UNAVAILABLE, "messager engine is closed, probably because this is not a primary any more")
 	}
 	mm := me.managers[name]
 	if mm == nil {
@@ -127,153 +138,33 @@ func (me *Engine) Subscribe(ctx context.Context, name string, send func(*sqltype
 	return mm.Subscribe(ctx, send), nil
 }
 
-// LockDB obtains db locks for all messages that need to
-// be updated and returns the counterpart unlock function.
-func (me *Engine) LockDB(newMessages map[string][]*MessageRow, changedMessages map[string][]string) func() {
-	// Build the set of affected messages tables.
-	combined := make(map[string]struct{})
-	for name := range newMessages {
-		combined[name] = struct{}{}
-	}
-	for name := range changedMessages {
-		combined[name] = struct{}{}
-	}
-
-	// Build the list of manager objects (one per table).
-	var mms []*messageManager
-	// Don't do DBLock while holding lock on mu.
-	// It causes deadlocks.
-	func() {
-		me.mu.Lock()
-		defer me.mu.Unlock()
-		for name := range combined {
-			if mm := me.managers[name]; mm != nil {
-				mms = append(mms, mm)
-			}
-		}
-	}()
-	if len(mms) > 1 {
-		// Always use the same order in which manager objects are locked to avoid deadlocks.
-		// The previous order in "mms" is not guaranteed for multiple reasons:
-		// - We use a Go map above which does not guarantee an iteration order.
-		// - Transactions may not always use the same order when writing to multiple
-		//   messages tables.
-		sort.Slice(mms, func(i, j int) bool { return mms[i].name.String() < mms[j].name.String() })
-	}
-
-	// Lock each manager/messages table.
-	for _, mm := range mms {
-		mm.DBLock.Lock()
-	}
-	return func() {
-		for _, mm := range mms {
-			mm.DBLock.Unlock()
-		}
-	}
-}
-
-// UpdateCaches updates the caches for the committed changes.
-func (me *Engine) UpdateCaches(newMessages map[string][]*MessageRow, changedMessages map[string][]string) {
+func (me *Engine) schemaChanged(tables map[string]*schema.Table, created, altered, dropped []*schema.Table, _ bool) {
 	me.mu.Lock()
 	defer me.mu.Unlock()
-	now := time.Now().UnixNano()
-	for name, mrs := range newMessages {
+	for _, table := range append(dropped, altered...) {
+		name := table.Name.String()
 		mm := me.managers[name]
 		if mm == nil {
 			continue
 		}
-		MessageStats.Add([]string{name, "Queued"}, int64(len(mrs)))
-		for _, mr := range mrs {
-			if mr.TimeNext > now {
-				// We don't handle future messages yet.
-				continue
-			}
-			mm.Add(mr)
-		}
+		log.Infof("Stopping messager for dropped/updated table: %v", name)
+		mm.Close()
+		delete(me.managers, name)
 	}
-	for name, ids := range changedMessages {
-		mm := me.managers[name]
-		if mm == nil {
-			continue
-		}
-		mm.cache.Discard(ids)
-	}
-}
 
-// GenerateLoadMessagesQuery returns the ParsedQuery for loading messages by pk.
-// The results of the query can be used in a BuildMessageRow call.
-func (me *Engine) GenerateLoadMessagesQuery(name string) (*sqlparser.ParsedQuery, error) {
-	me.mu.Lock()
-	defer me.mu.Unlock()
-	mm := me.managers[name]
-	if mm == nil {
-		return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "message table %s not found in schema", name)
-	}
-	return mm.loadMessagesQuery, nil
-}
-
-// GenerateAckQuery returns the query and bind vars for acking a message.
-func (me *Engine) GenerateAckQuery(name string, ids []string) (string, map[string]*querypb.BindVariable, error) {
-	me.mu.Lock()
-	defer me.mu.Unlock()
-	mm := me.managers[name]
-	if mm == nil {
-		return "", nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "message table %s not found in schema", name)
-	}
-	query, bv := mm.GenerateAckQuery(ids)
-	return query, bv, nil
-}
-
-// GeneratePostponeQuery returns the query and bind vars for postponing a message.
-func (me *Engine) GeneratePostponeQuery(name string, ids []string) (string, map[string]*querypb.BindVariable, error) {
-	me.mu.Lock()
-	defer me.mu.Unlock()
-	mm := me.managers[name]
-	if mm == nil {
-		return "", nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "message table %s not found in schema", name)
-	}
-	query, bv := mm.GeneratePostponeQuery(ids)
-	return query, bv, nil
-}
-
-// GeneratePurgeQuery returns the query and bind vars for purging messages.
-func (me *Engine) GeneratePurgeQuery(name string, timeCutoff int64) (string, map[string]*querypb.BindVariable, error) {
-	me.mu.Lock()
-	defer me.mu.Unlock()
-	mm := me.managers[name]
-	if mm == nil {
-		return "", nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "message table %s not found in schema", name)
-	}
-	query, bv := mm.GeneratePurgeQuery(timeCutoff)
-	return query, bv, nil
-}
-
-func (me *Engine) schemaChanged(tables map[string]*schema.Table, created, altered, dropped []string) {
-	me.mu.Lock()
-	defer me.mu.Unlock()
-	for _, name := range created {
-		t := tables[name]
+	for _, t := range append(created, altered...) {
+		name := t.Name.String()
 		if t.Type != schema.Message {
 			continue
 		}
 		if me.managers[name] != nil {
-			tabletenv.InternalErrors.Add("Messages", 1)
-			log.Errorf("Newly created table alread exists in messages: %s", name)
+			me.tsv.Stats().InternalErrors.Add("Messages", 1)
+			log.Errorf("Newly created table already exists in messages: %s", name)
 			continue
 		}
-		mm := newMessageManager(me.tsv, t, me.conns, me.postponeSema)
+		mm := newMessageManager(me.tsv, me.vs, t, me.postponeSema)
 		me.managers[name] = mm
+		log.Infof("Starting messager for table: %v", name)
 		mm.Open()
-	}
-
-	// TODO(sougou): Update altered tables.
-
-	for _, name := range dropped {
-		mm := me.managers[name]
-		if mm == nil {
-			continue
-		}
-		mm.Close()
-		delete(me.managers, name)
 	}
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -19,9 +19,10 @@ package mysql
 import (
 	"bytes"
 	"encoding/binary"
-	"fmt"
 
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	"vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
 )
 
 // binlogEvent wraps a raw packet buffer and provides methods to examine it
@@ -29,38 +30,57 @@ import (
 // into flavor-specific event types to pull in common parsing code.
 //
 // The default v4 header format is:
-//                  offset : size
-//   +============================+
-//   | timestamp         0 : 4    |
-//   +----------------------------+
-//   | type_code         4 : 1    |
-//   +----------------------------+
-//   | server_id         5 : 4    |
-//   +----------------------------+
-//   | event_length      9 : 4    |
-//   +----------------------------+
-//   | next_position    13 : 4    |
-//   +----------------------------+
-//   | flags            17 : 2    |
-//   +----------------------------+
-//   | extra_headers    19 : x-19 |
-//   +============================+
-//   http://dev.mysql.com/doc/internals/en/event-header-fields.html
+//
+//	               offset : size
+//	+============================+
+//	| timestamp         0 : 4    |
+//	+----------------------------+
+//	| type_code         4 : 1    |
+//	+----------------------------+
+//	| server_id         5 : 4    |
+//	+----------------------------+
+//	| event_length      9 : 4    |
+//	+----------------------------+
+//	| next_position    13 : 4    |
+//	+----------------------------+
+//	| flags            17 : 2    |
+//	+----------------------------+
+//	| extra_headers    19 : x-19 |
+//	+============================+
+//	http://dev.mysql.com/doc/internals/en/event-header-fields.html
 type binlogEvent []byte
+
+const (
+	// Default length of the fixed header for v4 events.
+	BinlogFixedHeaderLen = 19
+	// The offset from 0 where the type is stored as 1 byte.
+	BinlogEventTypeOffset = 4
+	// Offset from 0 where the 4 byte length is stored.
+	BinlogEventLenOffset = 9
+	// Byte length of the checksum suffix when the CRC32 algorithm is used.
+	BinlogCRC32ChecksumLen = 4
+)
+
+// dataBytes returns the event bytes without header prefix and without checksum suffix
+func (ev binlogEvent) dataBytes(f BinlogFormat) []byte {
+	data := ev.Bytes()[f.HeaderLength:]
+	data = data[0 : len(data)-BinlogCRC32ChecksumLen]
+	return data
+}
 
 // IsValid implements BinlogEvent.IsValid().
 func (ev binlogEvent) IsValid() bool {
 	bufLen := len(ev.Bytes())
 
 	// The buffer must be at least 19 bytes to contain a valid header.
-	if bufLen < 19 {
+	if bufLen < BinlogFixedHeaderLen {
 		return false
 	}
 
 	// It's now safe to use methods that examine header fields.
 	// Let's see if the event is right about its own size.
 	evLen := ev.Length()
-	if evLen < 19 || evLen != uint32(bufLen) {
+	if evLen < BinlogFixedHeaderLen || evLen != uint32(bufLen) {
 		return false
 	}
 
@@ -77,7 +97,7 @@ func (ev binlogEvent) Bytes() []byte {
 
 // Type returns the type_code field from the header.
 func (ev binlogEvent) Type() byte {
-	return ev.Bytes()[4]
+	return ev.Bytes()[BinlogEventTypeOffset]
 }
 
 // Flags returns the flags field from the header.
@@ -100,6 +120,11 @@ func (ev binlogEvent) Length() uint32 {
 	return binary.LittleEndian.Uint32(ev.Bytes()[9 : 9+4])
 }
 
+// NextPosition returns the nextPosition field from the header
+func (ev binlogEvent) NextPosition() uint32 {
+	return binary.LittleEndian.Uint32(ev.Bytes()[13 : 13+4])
+}
+
 // IsFormatDescription implements BinlogEvent.IsFormatDescription().
 func (ev binlogEvent) IsFormatDescription() bool {
 	return ev.Type() == eFormatDescriptionEvent
@@ -120,6 +145,11 @@ func (ev binlogEvent) IsXID() bool {
 	return ev.Type() == eXIDEvent
 }
 
+// IsStop implements BinlogEvent.IsStop().
+func (ev binlogEvent) IsStop() bool {
+	return ev.Type() == eStopEvent
+}
+
 // IsIntVar implements BinlogEvent.IsIntVar().
 func (ev binlogEvent) IsIntVar() bool {
 	return ev.Type() == eIntVarEvent
@@ -133,6 +163,11 @@ func (ev binlogEvent) IsRand() bool {
 // IsPreviousGTIDs implements BinlogEvent.IsPreviousGTIDs().
 func (ev binlogEvent) IsPreviousGTIDs() bool {
 	return ev.Type() == ePreviousGTIDsEvent
+}
+
+// IsHeartbeat implements BinlogEvent.IsHeartbeat().
+func (ev binlogEvent) IsHeartbeat() bool {
+	return ev.Type() == eHeartbeatEvent
 }
 
 // IsTableMap implements BinlogEvent.IsTableMap().
@@ -169,28 +204,29 @@ func (ev binlogEvent) IsPseudo() bool {
 // Format implements BinlogEvent.Format().
 //
 // Expected format (L = total length of event data):
-//   # bytes   field
-//   2         format version
-//   50        server version string, 0-padded but not necessarily 0-terminated
-//   4         timestamp (same as timestamp header field)
-//   1         header length
-//   p         (one byte per packet type) event type header lengths
-//             Rest was infered from reading source code:
-//   1         checksum algorithm
-//   4         checksum
+//
+//	# bytes   field
+//	2         format version
+//	50        server version string, 0-padded but not necessarily 0-terminated
+//	4         timestamp (same as timestamp header field)
+//	1         header length
+//	p         (one byte per packet type) event type header lengths
+//	          Rest was inferred from reading source code:
+//	1         checksum algorithm
+//	4         checksum
 func (ev binlogEvent) Format() (f BinlogFormat, err error) {
 	// FORMAT_DESCRIPTION_EVENT has a fixed header size of 19
 	// because we have to read it before we know the header_length.
-	data := ev.Bytes()[19:]
+	data := ev.Bytes()[BinlogFixedHeaderLen:]
 
 	f.FormatVersion = binary.LittleEndian.Uint16(data[:2])
 	if f.FormatVersion != 4 {
-		return f, fmt.Errorf("format version = %d, we only support version 4", f.FormatVersion)
+		return f, vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "format version = %d, we only support version 4", f.FormatVersion)
 	}
 	f.ServerVersion = string(bytes.TrimRight(data[2:2+50], "\x00"))
 	f.HeaderLength = data[2+50+4]
-	if f.HeaderLength < 19 {
-		return f, fmt.Errorf("header length = %d, should be >= 19", f.HeaderLength)
+	if f.HeaderLength < BinlogFixedHeaderLen {
+		return f, vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "header length = %d, should be >= %d", f.HeaderLength, BinlogFixedHeaderLen)
 	}
 
 	// MySQL/MariaDB 5.6.1+ always adds a 4-byte checksum to the end of a
@@ -206,15 +242,16 @@ func (ev binlogEvent) Format() (f BinlogFormat, err error) {
 // Query implements BinlogEvent.Query().
 //
 // Expected format (L = total length of event data):
-//   # bytes   field
-//   4         thread_id
-//   4         execution time
-//   1         length of db_name, not including NULL terminator (X)
-//   2         error code
-//   2         length of status vars block (Y)
-//   Y         status vars block
-//   X+1       db_name + NULL terminator
-//   L-X-1-Y   SQL statement (no NULL terminator)
+//
+//	# bytes   field
+//	4         thread_id
+//	4         execution time
+//	1         length of db_name, not including NULL terminator (X)
+//	2         error code
+//	2         length of status vars block (Y)
+//	Y         status vars block
+//	X+1       db_name + NULL terminator
+//	L-X-1-Y   SQL statement (no NULL terminator)
 func (ev binlogEvent) Query(f BinlogFormat) (query Query, err error) {
 	const varsPos = 4 + 4 + 1 + 2 + 2
 
@@ -230,7 +267,7 @@ func (ev binlogEvent) Query(f BinlogFormat) (query Query, err error) {
 	// position of SQL query
 	sqlPos := dbPos + dbLen + 1 // +1 for NULL terminator
 	if sqlPos > len(data) {
-		return query, fmt.Errorf("SQL query position overflows buffer (%v > %v)", sqlPos, len(data))
+		return query, vterrors.Errorf(vtrpc.Code_INTERNAL, "SQL query position overflows buffer (%v > %v)", sqlPos, len(data))
 	}
 
 	// We've checked that the buffer is big enough for sql, so everything before
@@ -257,17 +294,17 @@ varsLoop:
 			pos += 8
 		case QCatalog: // Used in MySQL 5.0.0 - 5.0.3
 			if pos+1 > len(vars) {
-				return query, fmt.Errorf("Q_CATALOG status var overflows buffer (%v + 1 > %v)", pos, len(vars))
+				return query, vterrors.Errorf(vtrpc.Code_INTERNAL, "Q_CATALOG status var overflows buffer (%v + 1 > %v)", pos, len(vars))
 			}
 			pos += 1 + int(vars[pos]) + 1
 		case QCatalogNZCode: // Used in MySQL > 5.0.3 to replace QCatalog
 			if pos+1 > len(vars) {
-				return query, fmt.Errorf("Q_CATALOG_NZ_CODE status var overflows buffer (%v + 1 > %v)", pos, len(vars))
+				return query, vterrors.Errorf(vtrpc.Code_INTERNAL, "Q_CATALOG_NZ_CODE status var overflows buffer (%v + 1 > %v)", pos, len(vars))
 			}
 			pos += 1 + int(vars[pos])
 		case QCharsetCode:
 			if pos+6 > len(vars) {
-				return query, fmt.Errorf("Q_CHARSET_CODE status var overflows buffer (%v + 6 > %v)", pos, len(vars))
+				return query, vterrors.Errorf(vtrpc.Code_INTERNAL, "Q_CHARSET_CODE status var overflows buffer (%v + 6 > %v)", pos, len(vars))
 			}
 			query.Charset = &binlogdatapb.Charset{
 				Client: int32(binary.LittleEndian.Uint16(vars[pos : pos+2])),
@@ -287,15 +324,16 @@ varsLoop:
 // IntVar implements BinlogEvent.IntVar().
 //
 // Expected format (L = total length of event data):
-//   # bytes   field
-//   1         variable ID
-//   8         variable value
+//
+//	# bytes   field
+//	1         variable ID
+//	8         variable value
 func (ev binlogEvent) IntVar(f BinlogFormat) (byte, uint64, error) {
 	data := ev.Bytes()[f.HeaderLength:]
 
 	typ := data[0]
 	if typ != IntVarLastInsertID && typ != IntVarInsertID {
-		return 0, 0, fmt.Errorf("invalid IntVar ID: %v", data[0])
+		return 0, 0, vterrors.Errorf(vtrpc.Code_INTERNAL, "invalid IntVar ID: %v", data[0])
 	}
 
 	value := binary.LittleEndian.Uint64(data[1 : 1+8])
@@ -305,9 +343,10 @@ func (ev binlogEvent) IntVar(f BinlogFormat) (byte, uint64, error) {
 // Rand implements BinlogEvent.Rand().
 //
 // Expected format (L = total length of event data):
-//   # bytes   field
-//   8         seed 1
-//   8         seed 2
+//
+//	# bytes   field
+//	8         seed 1
+//	8         seed 2
 func (ev binlogEvent) Rand(f BinlogFormat) (seed1 uint64, seed2 uint64, err error) {
 	data := ev.Bytes()[f.HeaderLength:]
 	seed1 = binary.LittleEndian.Uint64(data[0:8])
@@ -330,4 +369,12 @@ func (ev binlogEvent) TableID(f BinlogFormat) uint64 {
 		uint64(ev[pos+3])<<24 |
 		uint64(ev[pos+4])<<32 |
 		uint64(ev[pos+5])<<40
+}
+
+func (ev binlogEvent) NextLogFile(f BinlogFormat) (string, uint64, error) {
+	data := ev.dataBytes(f)
+	pos := 0
+	logPos, pos, _ := readUint64(data, pos)
+	logFile := string(data[pos:])
+	return logFile, logPos, nil
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -18,22 +18,22 @@ package mysql
 
 import (
 	"bytes"
+	"crypto/subtle"
 	"encoding/json"
-	"flag"
-	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
+	"time"
+
+	"vitess.io/vitess/go/mysql/sqlerror"
 
 	"vitess.io/vitess/go/vt/log"
-	querypb "vitess.io/vitess/go/vt/proto/query"
-)
+	"vitess.io/vitess/go/vt/vterrors"
 
-var (
-	mysqlAuthServerStaticFile   = flag.String("mysql_auth_server_static_file", "", "JSON File to read the users/passwords from.")
-	mysqlAuthServerStaticString = flag.String("mysql_auth_server_static_string", "", "JSON representation of the users/passwords config.")
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	"vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
 const (
@@ -42,15 +42,16 @@ const (
 
 // AuthServerStatic implements AuthServer using a static configuration.
 type AuthServerStatic struct {
-	// Method can be set to:
-	// - MysqlNativePassword
-	// - MysqlClearPassword
-	// - MysqlDialog
-	// It defaults to MysqlNativePassword.
-	Method string
+	methods          []AuthMethod
+	file, jsonConfig string
+	reloadInterval   time.Duration
+	// This mutex helps us prevent data races between the multiple updates of entries.
+	mu sync.Mutex
+	// entries contains the users, passwords and user data.
+	entries map[string][]*AuthServerStaticEntry
 
-	// Entries contains the users, passwords and user data.
-	Entries map[string][]*AuthServerStaticEntry
+	sigChan chan os.Signal
+	ticker  *time.Ticker
 }
 
 // AuthServerStaticEntry stores the values for a given user.
@@ -70,170 +71,269 @@ type AuthServerStaticEntry struct {
 	Password            string
 	UserData            string
 	SourceHost          string
+	Groups              []string
 }
 
 // InitAuthServerStatic Handles initializing the AuthServerStatic if necessary.
-func InitAuthServerStatic() {
+func InitAuthServerStatic(mysqlAuthServerStaticFile, mysqlAuthServerStaticString string, mysqlAuthServerStaticReloadInterval time.Duration) {
 	// Check parameters.
-	if *mysqlAuthServerStaticFile == "" && *mysqlAuthServerStaticString == "" {
+	if mysqlAuthServerStaticFile == "" && mysqlAuthServerStaticString == "" {
 		// Not configured, nothing to do.
 		log.Infof("Not configuring AuthServerStatic, as mysql_auth_server_static_file and mysql_auth_server_static_string are empty")
 		return
 	}
-	if *mysqlAuthServerStaticFile != "" && *mysqlAuthServerStaticString != "" {
+	if mysqlAuthServerStaticFile != "" && mysqlAuthServerStaticString != "" {
 		// Both parameters specified, can only use one.
 		log.Exitf("Both mysql_auth_server_static_file and mysql_auth_server_static_string specified, can only use one.")
 	}
 
 	// Create and register auth server.
-	RegisterAuthServerStaticFromParams(*mysqlAuthServerStaticFile, *mysqlAuthServerStaticString)
-}
-
-// NewAuthServerStatic returns a new empty AuthServerStatic.
-func NewAuthServerStatic() *AuthServerStatic {
-	return &AuthServerStatic{
-		Method:  MysqlNativePassword,
-		Entries: make(map[string][]*AuthServerStaticEntry),
-	}
+	RegisterAuthServerStaticFromParams(mysqlAuthServerStaticFile, mysqlAuthServerStaticString, mysqlAuthServerStaticReloadInterval)
 }
 
 // RegisterAuthServerStaticFromParams creates and registers a new
 // AuthServerStatic, loaded for a JSON file or string. If file is set,
 // it uses file. Otherwise, load the string. It log.Exits out in case
 // of error.
-func RegisterAuthServerStaticFromParams(file, str string) {
-	authServerStatic := NewAuthServerStatic()
-
-	authServerStatic.loadConfigFromParams(file, str)
-	authServerStatic.installSignalHandlers()
-
-	// And register the server.
-	RegisterAuthServerImpl("static", authServerStatic)
+func RegisterAuthServerStaticFromParams(file, jsonConfig string, reloadInterval time.Duration) {
+	authServerStatic := NewAuthServerStatic(file, jsonConfig, reloadInterval)
+	if len(authServerStatic.entries) <= 0 {
+		log.Exitf("Failed to populate entries from file: %v", file)
+	}
+	RegisterAuthServer("static", authServerStatic)
 }
 
-func (a *AuthServerStatic) loadConfigFromParams(file, str string) {
-	jsonConfig := []byte(str)
-	if file != "" {
-		data, err := ioutil.ReadFile(file)
-		if err != nil {
-			log.Exitf("Failed to read mysql_auth_server_static_file file: %v", err)
+// NewAuthServerStatic returns a new empty AuthServerStatic.
+func NewAuthServerStatic(file, jsonConfig string, reloadInterval time.Duration) *AuthServerStatic {
+	a := &AuthServerStatic{
+		file:           file,
+		jsonConfig:     jsonConfig,
+		reloadInterval: reloadInterval,
+		entries:        make(map[string][]*AuthServerStaticEntry),
+	}
+
+	a.methods = []AuthMethod{NewMysqlNativeAuthMethod(a, a)}
+
+	a.reload()
+	a.installSignalHandlers()
+	return a
+}
+
+// NewAuthServerStaticWithAuthMethodDescription returns a new empty AuthServerStatic
+// but with support for a different auth method. Mostly used for testing purposes.
+func NewAuthServerStaticWithAuthMethodDescription(file, jsonConfig string, reloadInterval time.Duration, authMethodDescription AuthMethodDescription) *AuthServerStatic {
+	a := &AuthServerStatic{
+		file:           file,
+		jsonConfig:     jsonConfig,
+		reloadInterval: reloadInterval,
+		entries:        make(map[string][]*AuthServerStaticEntry),
+	}
+
+	var authMethod AuthMethod
+	switch authMethodDescription {
+	case CachingSha2Password:
+		authMethod = NewSha2CachingAuthMethod(a, a, a)
+	case MysqlNativePassword:
+		authMethod = NewMysqlNativeAuthMethod(a, a)
+	case MysqlClearPassword:
+		authMethod = NewMysqlClearAuthMethod(a, a)
+	case MysqlDialog:
+		authMethod = NewMysqlDialogAuthMethod(a, a, "")
+	}
+
+	a.methods = []AuthMethod{authMethod}
+
+	a.reload()
+	a.installSignalHandlers()
+	return a
+}
+
+// HandleUser is part of the Validator interface. We
+// handle any user here since we don't check up front.
+func (a *AuthServerStatic) HandleUser(user string) bool {
+	return true
+}
+
+// UserEntryWithPassword implements password lookup based on a plain
+// text password that is negotiated with the client.
+func (a *AuthServerStatic) UserEntryWithPassword(conn *Conn, user string, password string, remoteAddr net.Addr) (Getter, error) {
+	a.mu.Lock()
+	entries, ok := a.entries[user]
+	a.mu.Unlock()
+
+	if !ok {
+		return &StaticUserData{}, sqlerror.NewSQLError(sqlerror.ERAccessDeniedError, sqlerror.SSAccessDeniedError, "Access denied for user '%v'", user)
+	}
+
+	for _, entry := range entries {
+		// Validate the password.
+		if MatchSourceHost(remoteAddr, entry.SourceHost) && subtle.ConstantTimeCompare([]byte(password), []byte(entry.Password)) == 1 {
+			return &StaticUserData{entry.UserData, entry.Groups}, nil
 		}
-		jsonConfig = data
 	}
-
-	a.Entries = make(map[string][]*AuthServerStaticEntry) // clear old entries
-	if err := parseConfig(jsonConfig, &a.Entries); err != nil {
-		log.Exitf("Error parsing auth server config: %v", err)
-	}
+	return &StaticUserData{}, sqlerror.NewSQLError(sqlerror.ERAccessDeniedError, sqlerror.SSAccessDeniedError, "Access denied for user '%v'", user)
 }
 
-func (a *AuthServerStatic) installSignalHandlers() {
-	if *mysqlAuthServerStaticFile == "" {
+// UserEntryWithHash implements password lookup based on a
+// mysql_native_password hash that is negotiated with the client.
+func (a *AuthServerStatic) UserEntryWithHash(conn *Conn, salt []byte, user string, authResponse []byte, remoteAddr net.Addr) (Getter, error) {
+	a.mu.Lock()
+	entries, ok := a.entries[user]
+	a.mu.Unlock()
+
+	if !ok {
+		return &StaticUserData{}, sqlerror.NewSQLError(sqlerror.ERAccessDeniedError, sqlerror.SSAccessDeniedError, "Access denied for user '%v'", user)
+	}
+
+	for _, entry := range entries {
+		if entry.MysqlNativePassword != "" {
+			hash, err := DecodeMysqlNativePasswordHex(entry.MysqlNativePassword)
+			if err != nil {
+				return &StaticUserData{entry.UserData, entry.Groups}, sqlerror.NewSQLError(sqlerror.ERAccessDeniedError, sqlerror.SSAccessDeniedError, "Access denied for user '%v'", user)
+			}
+
+			isPass := VerifyHashedMysqlNativePassword(authResponse, salt, hash)
+			if MatchSourceHost(remoteAddr, entry.SourceHost) && isPass {
+				return &StaticUserData{entry.UserData, entry.Groups}, nil
+			}
+		} else {
+			computedAuthResponse := ScrambleMysqlNativePassword(salt, []byte(entry.Password))
+			// Validate the password.
+			if MatchSourceHost(remoteAddr, entry.SourceHost) && subtle.ConstantTimeCompare(authResponse, computedAuthResponse) == 1 {
+				return &StaticUserData{entry.UserData, entry.Groups}, nil
+			}
+		}
+	}
+	return &StaticUserData{}, sqlerror.NewSQLError(sqlerror.ERAccessDeniedError, sqlerror.SSAccessDeniedError, "Access denied for user '%v'", user)
+}
+
+// UserEntryWithCacheHash implements password lookup based on a
+// caching_sha2_password hash that is negotiated with the client.
+func (a *AuthServerStatic) UserEntryWithCacheHash(conn *Conn, salt []byte, user string, authResponse []byte, remoteAddr net.Addr) (Getter, CacheState, error) {
+	a.mu.Lock()
+	entries, ok := a.entries[user]
+	a.mu.Unlock()
+
+	if !ok {
+		return &StaticUserData{}, AuthRejected, sqlerror.NewSQLError(sqlerror.ERAccessDeniedError, sqlerror.SSAccessDeniedError, "Access denied for user '%v'", user)
+	}
+
+	for _, entry := range entries {
+		computedAuthResponse := ScrambleCachingSha2Password(salt, []byte(entry.Password))
+
+		// Validate the password.
+		if MatchSourceHost(remoteAddr, entry.SourceHost) && subtle.ConstantTimeCompare(authResponse, computedAuthResponse) == 1 {
+			return &StaticUserData{entry.UserData, entry.Groups}, AuthAccepted, nil
+		}
+	}
+	return &StaticUserData{}, AuthRejected, sqlerror.NewSQLError(sqlerror.ERAccessDeniedError, sqlerror.SSAccessDeniedError, "Access denied for user '%v'", user)
+}
+
+// AuthMethods returns the AuthMethod instances this auth server can handle.
+func (a *AuthServerStatic) AuthMethods() []AuthMethod {
+	return a.methods
+}
+
+// DefaultAuthMethodDescription returns the default auth method in the handshake which
+// is MysqlNativePassword for this auth server.
+func (a *AuthServerStatic) DefaultAuthMethodDescription() AuthMethodDescription {
+	return MysqlNativePassword
+}
+
+func (a *AuthServerStatic) reload() {
+	jsonBytes := []byte(a.jsonConfig)
+	if a.file != "" {
+		data, err := os.ReadFile(a.file)
+		if err != nil {
+			log.Errorf("Failed to read mysql_auth_server_static_file file: %v", err)
+			return
+		}
+		jsonBytes = data
+	}
+
+	entries := make(map[string][]*AuthServerStaticEntry)
+	if err := ParseConfig(jsonBytes, &entries); err != nil {
+		log.Errorf("Error parsing auth server config: %v", err)
 		return
 	}
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGHUP)
-	go func() {
-		for {
-			<-sigChan
-			a.loadConfigFromParams(*mysqlAuthServerStaticFile, "")
-		}
-	}()
+	a.mu.Lock()
+	a.entries = entries
+	a.mu.Unlock()
 }
 
-func parseConfig(jsonConfig []byte, config *map[string][]*AuthServerStaticEntry) error {
-	if err := json.Unmarshal(jsonConfig, config); err != nil {
+func (a *AuthServerStatic) installSignalHandlers() {
+	if a.file == "" {
+		return
+	}
+
+	a.sigChan = make(chan os.Signal, 1)
+	signal.Notify(a.sigChan, syscall.SIGHUP)
+	go func() {
+		for range a.sigChan {
+			a.reload()
+		}
+	}()
+
+	// If duration is set, it will reload configuration every interval
+	if a.reloadInterval > 0 {
+		a.ticker = time.NewTicker(a.reloadInterval)
+		go func() {
+			for range a.ticker.C {
+				a.sigChan <- syscall.SIGHUP
+			}
+		}()
+	}
+}
+
+func (a *AuthServerStatic) close() {
+	if a.ticker != nil {
+		a.ticker.Stop()
+	}
+	if a.sigChan != nil {
+		signal.Stop(a.sigChan)
+	}
+}
+
+// ParseConfig takes a JSON MySQL static config and converts to a validated map
+func ParseConfig(jsonBytes []byte, config *map[string][]*AuthServerStaticEntry) error {
+	decoder := json.NewDecoder(bytes.NewReader(jsonBytes))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(config); err != nil {
 		// Couldn't parse, will try to parse with legacy config
-		return parseLegacyConfig(jsonConfig, config)
+		return parseLegacyConfig(jsonBytes, config)
 	}
 	return validateConfig(*config)
 }
 
-func parseLegacyConfig(jsonConfig []byte, config *map[string][]*AuthServerStaticEntry) error {
+func parseLegacyConfig(jsonBytes []byte, config *map[string][]*AuthServerStaticEntry) error {
 	// legacy config doesn't have an array
 	legacyConfig := make(map[string]*AuthServerStaticEntry)
-	err := json.Unmarshal(jsonConfig, &legacyConfig)
-	if err == nil {
-		log.Warningf("Config parsed using legacy configuration. Please update to the latest format: {\"user\":[{\"Password\": \"xxx\"}, ...]}")
-		for key, value := range legacyConfig {
-			(*config)[key] = append((*config)[key], value)
-		}
-		return nil
+	decoder := json.NewDecoder(bytes.NewReader(jsonBytes))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&legacyConfig); err != nil {
+		return err
 	}
-	return err
+	log.Warningf("Config parsed using legacy configuration. Please update to the latest format: {\"user\":[{\"Password\": \"xxx\"}, ...]}")
+	for key, value := range legacyConfig {
+		(*config)[key] = append((*config)[key], value)
+	}
+	return nil
 }
 
 func validateConfig(config map[string][]*AuthServerStaticEntry) error {
 	for _, entries := range config {
 		for _, entry := range entries {
 			if entry.SourceHost != "" && entry.SourceHost != localhostName {
-				return fmt.Errorf("Invalid SourceHost found (only localhost is supported): %v", entry.SourceHost)
+				return vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "invalid SourceHost found (only localhost is supported): %v", entry.SourceHost)
 			}
 		}
 	}
 	return nil
 }
 
-// AuthMethod is part of the AuthServer interface.
-func (a *AuthServerStatic) AuthMethod(user string) (string, error) {
-	return a.Method, nil
-}
-
-// Salt is part of the AuthServer interface.
-func (a *AuthServerStatic) Salt() ([]byte, error) {
-	return NewSalt()
-}
-
-// ValidateHash is part of the AuthServer interface.
-func (a *AuthServerStatic) ValidateHash(salt []byte, user string, authResponse []byte, remoteAddr net.Addr) (Getter, error) {
-	// Find the entry.
-	entries, ok := a.Entries[user]
-	if !ok {
-		return &StaticUserData{""}, NewSQLError(ERAccessDeniedError, SSAccessDeniedError, "Access denied for user '%v'", user)
-	}
-
-	for _, entry := range entries {
-		if entry.MysqlNativePassword != "" {
-			isPass := isPassScrambleMysqlNativePassword(authResponse, salt, entry.MysqlNativePassword)
-			if matchSourceHost(remoteAddr, entry.SourceHost) && isPass {
-				return &StaticUserData{entry.UserData}, nil
-			}
-		}
-		computedAuthResponse := ScramblePassword(salt, []byte(entry.Password))
-		// Validate the password.
-		if matchSourceHost(remoteAddr, entry.SourceHost) && bytes.Compare(authResponse, computedAuthResponse) == 0 {
-			return &StaticUserData{entry.UserData}, nil
-		}
-	}
-	return &StaticUserData{""}, NewSQLError(ERAccessDeniedError, SSAccessDeniedError, "Access denied for user '%v'", user)
-}
-
-// Negotiate is part of the AuthServer interface.
-// It will be called if Method is anything else than MysqlNativePassword.
-// We only recognize MysqlClearPassword and MysqlDialog here.
-func (a *AuthServerStatic) Negotiate(c *Conn, user string, remoteAddr net.Addr) (Getter, error) {
-	// Finish the negotiation.
-	password, err := AuthServerNegotiateClearOrDialog(c, a.Method)
-	if err != nil {
-		return nil, err
-	}
-
-	// Find the entry.
-	entries, ok := a.Entries[user]
-	if !ok {
-		return &StaticUserData{""}, NewSQLError(ERAccessDeniedError, SSAccessDeniedError, "Access denied for user '%v'", user)
-	}
-	for _, entry := range entries {
-		// Validate the password.
-		if matchSourceHost(remoteAddr, entry.SourceHost) && entry.Password == password {
-			return &StaticUserData{entry.UserData}, nil
-		}
-	}
-	return &StaticUserData{""}, NewSQLError(ERAccessDeniedError, SSAccessDeniedError, "Access denied for user '%v'", user)
-}
-
-func matchSourceHost(remoteAddr net.Addr, targetSourceHost string) bool {
+// MatchSourceHost validates host entry in auth configuration
+func MatchSourceHost(remoteAddr net.Addr, targetSourceHost string) bool {
 	// Legacy support, there was not matcher defined default to true
 	if targetSourceHost == "" {
 		return true
@@ -247,12 +347,13 @@ func matchSourceHost(remoteAddr net.Addr, targetSourceHost string) bool {
 	return false
 }
 
-// StaticUserData holds the username
+// StaticUserData holds the username and groups
 type StaticUserData struct {
-	value string
+	Username string
+	Groups   []string
 }
 
-// Get returns the wrapped username
+// Get returns the wrapped username and groups
 func (sud *StaticUserData) Get() *querypb.VTGateCallerID {
-	return &querypb.VTGateCallerID{Username: sud.value}
+	return &querypb.VTGateCallerID{Username: sud.Username, Groups: sud.Groups}
 }

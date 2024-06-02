@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ limitations under the License.
 package gcsbackupstorage
 
 import (
-	"flag"
+	"context"
 	"fmt"
 	"io"
 	"sort"
@@ -27,24 +27,36 @@ import (
 	"sync"
 
 	"cloud.google.com/go/storage"
-	"golang.org/x/net/context"
+	"github.com/spf13/pflag"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 
 	"vitess.io/vitess/go/trace"
+	"vitess.io/vitess/go/vt/concurrency"
 	"vitess.io/vitess/go/vt/mysqlctl/backupstorage"
+	"vitess.io/vitess/go/vt/servenv"
 )
 
 var (
-	_ = flag.String("gcs_backup_storage_project", "", "This flag is unused and deprecated. It will be removed entirely in a future release.")
-
 	// bucket is where the backups will go.
-	bucket = flag.String("gcs_backup_storage_bucket", "", "Google Cloud Storage bucket to use for backups")
+	bucket string
 
 	// root is a prefix added to all object names.
-	root = flag.String("gcs_backup_storage_root", "", "root prefix for all backup-related object names")
+	root string
 )
+
+func registerFlags(fs *pflag.FlagSet) {
+	fs.StringVar(&bucket, "gcs_backup_storage_bucket", "", "Google Cloud Storage bucket to use for backups.")
+	fs.StringVar(&root, "gcs_backup_storage_root", "", "Root prefix for all backup-related object names.")
+}
+
+func init() {
+	servenv.OnParseFor("vtbackup", registerFlags)
+	servenv.OnParseFor("vtctl", registerFlags)
+	servenv.OnParseFor("vtctld", registerFlags)
+	servenv.OnParseFor("vttablet", registerFlags)
+}
 
 // GCSBackupHandle implements BackupHandle for Google Cloud Storage.
 type GCSBackupHandle struct {
@@ -53,6 +65,22 @@ type GCSBackupHandle struct {
 	dir      string
 	name     string
 	readOnly bool
+	errors   concurrency.AllErrorRecorder
+}
+
+// RecordError is part of the concurrency.ErrorRecorder interface.
+func (bh *GCSBackupHandle) RecordError(err error) {
+	bh.errors.RecordError(err)
+}
+
+// HasErrors is part of the concurrency.ErrorRecorder interface.
+func (bh *GCSBackupHandle) HasErrors() bool {
+	return bh.errors.HasErrors()
+}
+
+// Error is part of the concurrency.ErrorRecorder interface.
+func (bh *GCSBackupHandle) Error() error {
+	return bh.errors.Error()
 }
 
 // Directory implements BackupHandle.
@@ -71,7 +99,7 @@ func (bh *GCSBackupHandle) AddFile(ctx context.Context, filename string, filesiz
 		return nil, fmt.Errorf("AddFile cannot be called on read-only backup")
 	}
 	object := objName(bh.dir, bh.name, filename)
-	return bh.client.Bucket(*bucket).Object(object).NewWriter(ctx), nil
+	return bh.client.Bucket(bucket).Object(object).NewWriter(ctx), nil
 }
 
 // EndBackup implements BackupHandle.
@@ -96,7 +124,7 @@ func (bh *GCSBackupHandle) ReadFile(ctx context.Context, filename string) (io.Re
 		return nil, fmt.Errorf("ReadFile cannot be called on read-write backup")
 	}
 	object := objName(bh.dir, bh.name, filename)
-	return bh.client.Bucket(*bucket).Object(object).NewReader(ctx)
+	return bh.client.Bucket(bucket).Object(object).NewReader(ctx)
 }
 
 // GCSBackupStorage implements BackupStorage for Google Cloud Storage.
@@ -117,13 +145,20 @@ func (bs *GCSBackupStorage) ListBackups(ctx context.Context, dir string) ([]back
 
 	// List prefixes that begin with dir (i.e. list subdirs).
 	var subdirs []string
-	searchPrefix := objName(dir, "" /* include trailing slash */)
+
+	var searchPrefix string
+	if dir == "/" {
+		searchPrefix = ""
+	} else {
+		searchPrefix = objName(dir, "" /* include trailing slash */)
+	}
+
 	query := &storage.Query{
 		Delimiter: "/",
 		Prefix:    searchPrefix,
 	}
 
-	it := c.Bucket(*bucket).Objects(ctx, query)
+	it := c.Bucket(bucket).Objects(ctx, query)
 	for {
 		obj, err := it.Next()
 		if err == iterator.Done {
@@ -185,7 +220,7 @@ func (bs *GCSBackupStorage) RemoveBackup(ctx context.Context, dir, name string) 
 		Prefix: objName(dir, name, "" /* include trailing slash */),
 	}
 	// Delete all the found objects.
-	it := c.Bucket(*bucket).Objects(ctx, query)
+	it := c.Bucket(bucket).Objects(ctx, query)
 	for {
 		obj, err := it.Next()
 		if err == iterator.Done {
@@ -194,8 +229,8 @@ func (bs *GCSBackupStorage) RemoveBackup(ctx context.Context, dir, name string) 
 		if err != nil {
 			return err
 		}
-		if err := c.Bucket(*bucket).Object(obj.Name).Delete(ctx); err != nil {
-			return fmt.Errorf("unable to delete %q from bucket %q: %v", obj.Name, *bucket, err)
+		if err := c.Bucket(bucket).Object(obj.Name).Delete(ctx); err != nil {
+			return fmt.Errorf("unable to delete %q from bucket %q: %v", obj.Name, bucket, err)
 		}
 	}
 	return nil
@@ -219,6 +254,11 @@ func (bs *GCSBackupStorage) Close() error {
 	return nil
 }
 
+func (bs *GCSBackupStorage) WithParams(params backupstorage.Params) backupstorage.BackupStorage {
+	// TODO(maxeng): return a new GCSBackupStorage that uses params.
+	return bs
+}
+
 // client returns the GCS Storage client instance.
 // If there isn't one yet, it tries to create one.
 func (bs *GCSBackupStorage) client(ctx context.Context) (*storage.Client, error) {
@@ -230,7 +270,7 @@ func (bs *GCSBackupStorage) client(ctx context.Context) (*storage.Client, error)
 		// the creation context, so we create a new one, but
 		// keep the span information.
 		ctx = trace.CopySpan(context.Background(), ctx)
-		authClient, err := google.DefaultClient(ctx)
+		authClient, err := google.DefaultClient(ctx, storage.ScopeFullControl)
 		if err != nil {
 			return nil, err
 		}
@@ -245,10 +285,10 @@ func (bs *GCSBackupStorage) client(ctx context.Context) (*storage.Client, error)
 
 // objName joins path parts into an object name.
 // Unlike path.Join, it doesn't collapse ".." or strip trailing slashes.
-// It also adds the value of the -gcs_backup_storage_root flag if set.
+// It also adds the value of the --gcs_backup_storage_root flag if set.
 func objName(parts ...string) string {
-	if *root != "" {
-		return *root + "/" + strings.Join(parts, "/")
+	if root != "" {
+		return root + "/" + strings.Join(parts, "/")
 	}
 	return strings.Join(parts, "/")
 }

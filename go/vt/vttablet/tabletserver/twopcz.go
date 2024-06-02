@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,8 +19,11 @@ package tabletserver
 import (
 	"encoding/json"
 	"fmt"
-	"html/template"
 	"net/http"
+
+	"github.com/google/safehtml/template"
+
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/tx"
 
 	"vitess.io/vitess/go/acl"
 	"vitess.io/vitess/go/vt/log"
@@ -146,7 +149,6 @@ func twopczHandler(txe *TxExecutor, w http.ResponseWriter, r *http.Request) {
 	var msg string
 	if action != "" {
 		if err != nil {
-			msg = err.Error()
 			msg = fmt.Sprintf("%s(%s): %v", r.FormValue("Action"), dtid, err)
 		} else {
 			msg = fmt.Sprintf("%s(%s): completed.", r.FormValue("Action"), dtid)
@@ -161,8 +163,8 @@ func twopczHandler(txe *TxExecutor, w http.ResponseWriter, r *http.Request) {
 	if format == "json" {
 		w.Header().Set("Content-Type", "application/json")
 		js, err := json.Marshal(struct {
-			Distributed      []*DistributedTx
-			Prepared, Failed []*PreparedTx
+			Distributed      []*tx.DistributedTx
+			Prepared, Failed []*tx.PreparedTx
 		}{
 			Distributed: distributed,
 			Prepared:    prepared,
@@ -180,7 +182,7 @@ func twopczHandler(txe *TxExecutor, w http.ResponseWriter, r *http.Request) {
 	w.Write(gridTable)
 	w.Write([]byte("<h2>WARNING: Actions on this page can jeopardize data integrity.</h2>\n"))
 	if msg != "" {
-		w.Write([]byte(fmt.Sprintf("%s\n", msg)))
+		fmt.Fprintln(w, msg)
 	}
 
 	w.Write(startTable)

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -16,7 +16,16 @@ limitations under the License.
 
 package mysql
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"hash/crc32"
+
+	"vitess.io/vitess/go/mysql/replication"
+)
+
+const (
+	FlagLogEventArtificial = 0x20
+)
 
 // This file contains utility methods to create binlog replication
 // packets. They are mostly used for testing.
@@ -98,7 +107,12 @@ func (s *FakeBinlogStream) Packetize(f BinlogFormat, typ byte, flags uint16, dat
 	}
 
 	result := make([]byte, length)
-	binary.LittleEndian.PutUint32(result[0:4], s.Timestamp)
+	switch typ {
+	case eRotateEvent, eHeartbeatEvent:
+		// timestamp remains zero
+	default:
+		binary.LittleEndian.PutUint32(result[0:4], s.Timestamp)
+	}
 	result[4] = typ
 	binary.LittleEndian.PutUint32(result[5:9], s.ServerID)
 	binary.LittleEndian.PutUint32(result[9:13], uint32(length))
@@ -107,6 +121,13 @@ func (s *FakeBinlogStream) Packetize(f BinlogFormat, typ byte, flags uint16, dat
 		binary.LittleEndian.PutUint16(result[17:19], flags)
 	}
 	copy(result[f.HeaderLength:], data)
+
+	switch f.ChecksumAlgorithm {
+	case BinlogChecksumAlgCRC32:
+		checksum := crc32.ChecksumIEEE(result[0 : length-4])
+		binary.LittleEndian.PutUint32(result[length-4:], checksum)
+	}
+
 	return result
 }
 
@@ -127,7 +148,7 @@ func NewFormatDescriptionEvent(f BinlogFormat, s *FakeBinlogStream) BinlogEvent 
 		1 // (undocumented) checksum algorithm
 	data := make([]byte, length)
 	binary.LittleEndian.PutUint16(data[0:2], f.FormatVersion)
-	copy(data[2:52], []byte(f.ServerVersion))
+	copy(data[2:52], f.ServerVersion)
 	binary.LittleEndian.PutUint32(data[52:56], s.Timestamp)
 	data[56] = f.HeaderLength
 	copy(data[57:], f.HeaderSizes)
@@ -149,18 +170,44 @@ func NewInvalidFormatDescriptionEvent(f BinlogFormat, s *FakeBinlogStream) Binlo
 }
 
 // NewRotateEvent returns a RotateEvent.
-// The timestmap of such an event should be zero, so we patch it in.
+// The timestamp of such an event should be zero, so we patch it in.
 func NewRotateEvent(f BinlogFormat, s *FakeBinlogStream, position uint64, filename string) BinlogEvent {
 	length := 8 + // position
 		len(filename)
 	data := make([]byte, length)
 	binary.LittleEndian.PutUint64(data[0:8], position)
+	copy(data[8:], filename)
 
 	ev := s.Packetize(f, eRotateEvent, 0, data)
-	ev[0] = 0
-	ev[1] = 0
-	ev[2] = 0
-	ev[3] = 0
+	return NewMysql56BinlogEvent(ev)
+}
+
+func NewFakeRotateEvent(f BinlogFormat, s *FakeBinlogStream, filename string) BinlogEvent {
+	length := 8 + // position
+		len(filename)
+	data := make([]byte, length)
+	binary.LittleEndian.PutUint64(data[0:8], 4)
+	copy(data[8:], filename)
+
+	ev := s.Packetize(f, eRotateEvent, FlagLogEventArtificial, data)
+	return NewMysql56BinlogEvent(ev)
+}
+
+// NewHeartbeatEvent returns a HeartbeatEvent.
+// see https://dev.mysql.com/doc/internals/en/heartbeat-event.html
+func NewHeartbeatEvent(f BinlogFormat, s *FakeBinlogStream) BinlogEvent {
+	ev := s.Packetize(f, eHeartbeatEvent, 0, []byte{})
+	return NewMysql56BinlogEvent(ev)
+}
+
+// NewHeartbeatEvent returns a HeartbeatEvent.
+// see https://dev.mysql.com/doc/internals/en/heartbeat-event.html
+func NewHeartbeatEventWithLogFile(f BinlogFormat, s *FakeBinlogStream, filename string) BinlogEvent {
+	length := len(filename)
+	data := make([]byte, length)
+	copy(data, filename)
+
+	ev := s.Packetize(f, eHeartbeatEvent, 0, data)
 	return NewMysql56BinlogEvent(ev)
 }
 
@@ -170,7 +217,7 @@ func NewQueryEvent(f BinlogFormat, s *FakeBinlogStream, q Query) BinlogEvent {
 	if q.Charset != nil {
 		statusVarLength += 1 + 2 + 2 + 2
 	}
-	length := 4 + // slave proxy id
+	length := 4 + // proxy id
 		4 + // execution time
 		1 + // schema length
 		2 + // error code
@@ -197,7 +244,7 @@ func NewQueryEvent(f BinlogFormat, s *FakeBinlogStream, q Query) BinlogEvent {
 		data[pos+6] = byte(q.Charset.Server >> 8)
 		pos += 7
 	}
-	pos += copy(data[pos:pos+len(q.Database)], []byte(q.Database))
+	pos += copy(data[pos:pos+len(q.Database)], q.Database)
 	data[pos] = 0
 	pos++
 	copy(data[pos:], q.SQL)
@@ -247,7 +294,7 @@ func NewIntVarEvent(f BinlogFormat, s *FakeBinlogStream, typ byte, value uint64)
 
 // NewMariaDBGTIDEvent returns a MariaDB specific GTID event.
 // It ignores the Server in the gtid, instead uses the FakeBinlogStream.ServerID.
-func NewMariaDBGTIDEvent(f BinlogFormat, s *FakeBinlogStream, gtid MariadbGTID, hasBegin bool) BinlogEvent {
+func NewMariaDBGTIDEvent(f BinlogFormat, s *FakeBinlogStream, gtid replication.MariadbGTID, hasBegin bool) BinlogEvent {
 	length := 8 + // sequence
 		4 + // domain
 		1 // flags2
@@ -294,9 +341,9 @@ func NewTableMapEvent(f BinlogFormat, s *FakeBinlogStream, tableID uint64, tm *T
 		1 + // table name length
 		len(tm.Name) +
 		1 + // [00]
-		1 + // column-count FIXME(alainjobart) len enc
+		lenEncIntSize(uint64(len(tm.Types))) + // column-count len enc
 		len(tm.Types) +
-		1 + // lenenc-str column-meta-def FIXME(alainjobart) len enc
+		lenEncIntSize(uint64(metadataLength)) + // lenenc-str column-meta-def
 		metadataLength +
 		len(tm.CanBeNull.data)
 	data := make([]byte, length)
@@ -310,23 +357,18 @@ func NewTableMapEvent(f BinlogFormat, s *FakeBinlogStream, tableID uint64, tm *T
 	data[6] = byte(tm.Flags)
 	data[7] = byte(tm.Flags >> 8)
 	data[8] = byte(len(tm.Database))
-	pos := 6 + 2 + 1 + copy(data[9:], []byte(tm.Database))
+	pos := 6 + 2 + 1 + copy(data[9:], tm.Database)
 	data[pos] = 0
 	pos++
 	data[pos] = byte(len(tm.Name))
-	pos += 1 + copy(data[pos+1:], []byte(tm.Name))
+	pos += 1 + copy(data[pos+1:], tm.Name)
 	data[pos] = 0
 	pos++
 
-	data[pos] = byte(len(tm.Types)) // FIXME(alainjobart) lenenc
-	pos++
-
+	pos = writeLenEncInt(data, pos, uint64(len(tm.Types)))
 	pos += copy(data[pos:], tm.Types)
 
-	// Per-column meta data. Starting with len-enc length.
-	// FIXME(alainjobart) lenenc
-	data[pos] = byte(metadataLength)
-	pos++
+	pos = writeLenEncInt(data, pos, uint64(metadataLength))
 	for c, typ := range tm.Types {
 		pos = metadataWrite(data, pos, typ, tm.Metadata[c])
 	}
@@ -364,10 +406,20 @@ func newRowsEvent(f BinlogFormat, s *FakeBinlogStream, typ byte, tableID uint64,
 		panic("Not implemented, post_header_length==6")
 	}
 
+	hasIdentify := typ == eUpdateRowsEventV1 || typ == eUpdateRowsEventV2 ||
+		typ == eDeleteRowsEventV1 || typ == eDeleteRowsEventV2
+	hasData := typ == eWriteRowsEventV1 || typ == eWriteRowsEventV2 ||
+		typ == eUpdateRowsEventV1 || typ == eUpdateRowsEventV2
+
+	rowLen := rows.DataColumns.Count()
+	if hasIdentify {
+		rowLen = rows.IdentifyColumns.Count()
+	}
+
 	length := 6 + // table id
 		2 + // flags
 		2 + // extra data length, no extra data.
-		1 + // num columns FIXME(alainjobart) len enc
+		lenEncIntSize(uint64(rowLen)) + // num columns
 		len(rows.IdentifyColumns.data) + // only > 0 for Update & Delete
 		len(rows.DataColumns.data) // only > 0 for Write & Update
 	for _, row := range rows.Rows {
@@ -377,11 +429,6 @@ func newRowsEvent(f BinlogFormat, s *FakeBinlogStream, typ byte, tableID uint64,
 			len(row.Data)
 	}
 	data := make([]byte, length)
-
-	hasIdentify := typ == eUpdateRowsEventV1 || typ == eUpdateRowsEventV2 ||
-		typ == eDeleteRowsEventV1 || typ == eDeleteRowsEventV2
-	hasData := typ == eWriteRowsEventV1 || typ == eWriteRowsEventV2 ||
-		typ == eUpdateRowsEventV1 || typ == eUpdateRowsEventV2
 
 	data[0] = byte(tableID)
 	data[1] = byte(tableID >> 8)
@@ -394,12 +441,7 @@ func newRowsEvent(f BinlogFormat, s *FakeBinlogStream, typ byte, tableID uint64,
 	data[8] = 0x02
 	data[9] = 0x00
 
-	if hasIdentify {
-		data[10] = byte(rows.IdentifyColumns.Count()) // FIXME(alainjobart) len
-	} else {
-		data[10] = byte(rows.DataColumns.Count()) // FIXME(alainjobart) len
-	}
-	pos := 11
+	pos := writeLenEncInt(data, 10, uint64(rowLen))
 
 	if hasIdentify {
 		pos += copy(data[pos:], rows.IdentifyColumns.data)

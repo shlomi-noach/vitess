@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,15 +17,15 @@ limitations under the License.
 package tabletenv
 
 import (
-	"bytes"
-	"fmt"
-	"html/template"
+	"context"
+	"io"
 	"net/url"
 	"strings"
 	"time"
 
-	"golang.org/x/net/context"
+	"github.com/google/safehtml"
 
+	"vitess.io/vitess/go/logstats"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/streamlog"
 	"vitess.io/vitess/go/vt/callerid"
@@ -59,7 +59,9 @@ type LogStats struct {
 	QuerySources         byte
 	Rows                 [][]sqltypes.Value
 	TransactionID        int64
+	ReservedID           int64
 	Error                error
+	CachedPlan           bool
 }
 
 // NewLogStats constructs a new LogStats with supplied Method and ctx
@@ -76,11 +78,6 @@ func NewLogStats(ctx context.Context, methodName string) *LogStats {
 func (stats *LogStats) Send() {
 	stats.EndTime = time.Now()
 	StatsLogger.Send(stats)
-}
-
-// Context returns the context used by LogStats.
-func (stats *LogStats) Context() context.Context {
-	return stats.Ctx
 }
 
 // ImmediateCaller returns the immediate caller stored in LogStats.Ctx
@@ -103,7 +100,7 @@ func (stats *LogStats) AddRewrittenSQL(sql string, start time.Time) {
 	stats.QuerySources |= QuerySourceMySQL
 	stats.NumberOfQueries++
 	stats.rewrittenSqls = append(stats.rewrittenSqls, sql)
-	stats.MysqlResponseTime += time.Now().Sub(start)
+	stats.MysqlResponseTime += time.Since(start)
 }
 
 // TotalTime returns how long this query has been running
@@ -133,58 +130,6 @@ func (stats *LogStats) SizeOfResponse() int {
 	return size
 }
 
-// FmtBindVariables returns the map of bind variables as a string or a json
-// string depending on the streamlog.QueryLogFormat value. If RedactDebugUIQueries
-// is true then this returns the string "[REDACTED]"
-//
-// For values that are strings or byte slices it only reports their type
-// and length unless full is true.
-func (stats *LogStats) FmtBindVariables(full bool) string {
-	if *streamlog.RedactDebugUIQueries {
-		return "\"[REDACTED]\""
-	}
-
-	var out map[string]*querypb.BindVariable
-	if full {
-		out = stats.BindVariables
-	} else {
-		// NOTE(szopa): I am getting rid of potentially large bind
-		// variables.
-		out = make(map[string]*querypb.BindVariable)
-		for k, v := range stats.BindVariables {
-			if sqltypes.IsIntegral(v.Type) || sqltypes.IsFloat(v.Type) {
-				out[k] = v
-			} else if v.Type == querypb.Type_TUPLE {
-				out[k] = sqltypes.StringBindVariable(fmt.Sprintf("%v items", len(v.Values)))
-			} else {
-				out[k] = sqltypes.StringBindVariable(fmt.Sprintf("%v bytes", len(v.Value)))
-			}
-		}
-	}
-
-	if *streamlog.QueryLogFormat == streamlog.QueryLogFormatJSON {
-		var buf bytes.Buffer
-		buf.WriteString("{")
-		first := true
-		for k, v := range out {
-			if !first {
-				buf.WriteString(", ")
-			} else {
-				first = false
-			}
-			if sqltypes.IsIntegral(v.Type) || sqltypes.IsFloat(v.Type) {
-				fmt.Fprintf(&buf, "%q: {\"type\": %q, \"value\": %v}", k, v.Type, string(v.Value))
-			} else {
-				fmt.Fprintf(&buf, "%q: {\"type\": %q, \"value\": %q}", k, v.Type, string(v.Value))
-			}
-		}
-		buf.WriteString("}")
-		return buf.String()
-	}
-
-	return fmt.Sprintf("%v", out)
-}
-
 // FmtQuerySources returns a comma separated list of query
 // sources. If there were no query sources, it returns the string
 // "none".
@@ -208,7 +153,7 @@ func (stats *LogStats) FmtQuerySources() string {
 // ContextHTML returns the HTML version of the context that was used, or "".
 // This is a method on LogStats instead of a field so that it doesn't need
 // to be passed by value everywhere.
-func (stats *LogStats) ContextHTML() template.HTML {
+func (stats *LogStats) ContextHTML() safehtml.HTML {
 	return callinfo.HTMLFromContext(stats.Ctx)
 }
 
@@ -220,57 +165,81 @@ func (stats *LogStats) ErrorStr() string {
 	return ""
 }
 
-// RemoteAddrUsername returns some parts of CallInfo if set
-func (stats *LogStats) RemoteAddrUsername() (string, string) {
+// CallInfo returns some parts of CallInfo if set
+func (stats *LogStats) CallInfo() (string, string) {
 	ci, ok := callinfo.FromContext(stats.Ctx)
 	if !ok {
 		return "", ""
 	}
-	return ci.RemoteAddr(), ci.Username()
+	return ci.Text(), ci.Username()
 }
 
-// Format returns a tab separated list of logged fields.
-func (stats *LogStats) Format(params url.Values) string {
-	rewrittenSQL := "[REDACTED]"
-	if !*streamlog.RedactDebugUIQueries {
-		rewrittenSQL = stats.RewrittenSQL()
+// Logf formats the log record to the given writer, either as
+// tab-separated list of logged fields or as JSON.
+func (stats *LogStats) Logf(w io.Writer, params url.Values) error {
+	if !streamlog.ShouldEmitLog(stats.OriginalSQL, uint64(stats.RowsAffected), uint64(len(stats.Rows))) {
+		return nil
 	}
 
+	redacted := streamlog.GetRedactDebugUIQueries()
 	_, fullBindParams := params["full"]
-	formattedBindVars := stats.FmtBindVariables(fullBindParams)
-
 	// TODO: remove username here we fully enforce immediate caller id
-	remoteAddr, username := stats.RemoteAddrUsername()
+	callInfo, username := stats.CallInfo()
 
-	// Valid options for the QueryLogFormat are text or json
-	var fmtString string
-	switch *streamlog.QueryLogFormat {
-	case streamlog.QueryLogFormatText:
-		fmtString = "%v\t%v\t%v\t'%v'\t'%v'\t%v\t%v\t%.6f\t%v\t%q\t%v\t%v\t%q\t%v\t%.6f\t%.6f\t%v\t%v\t%q\t\n"
-	case streamlog.QueryLogFormatJSON:
-		fmtString = "{\"Method\": %q, \"RemoteAddr\": %q, \"Username\": %q, \"ImmediateCaller\": %q, \"Effective Caller\": %q, \"Start\": \"%v\", \"End\": \"%v\", \"TotalTime\": %.6f, \"PlanType\": %q, \"OriginalSQL\": %q, \"BindVars\": %v, \"Queries\": %v, \"RewrittenSQL\": %q, \"QuerySources\": %q, \"MysqlTime\": %.6f, \"ConnWaitTime\": %.6f, \"RowsAffected\": %v, \"ResponseSize\": %v, \"Error\": %q}\n"
+	log := logstats.NewLogger()
+	log.Init(streamlog.GetQueryLogFormat() == streamlog.QueryLogFormatJSON)
+	log.Key("Method")
+	log.StringUnquoted(stats.Method)
+	log.Key("CallInfo")
+	log.StringUnquoted(callInfo)
+	log.Key("Username")
+	log.StringUnquoted(username)
+	log.Key("ImmediateCaller")
+	log.StringSingleQuoted(stats.ImmediateCaller())
+	log.Key("Effective Caller")
+	log.StringSingleQuoted(stats.EffectiveCaller())
+	log.Key("Start")
+	log.Time(stats.StartTime)
+	log.Key("End")
+	log.Time(stats.EndTime)
+	log.Key("TotalTime")
+	log.Duration(stats.TotalTime())
+	log.Key("PlanType")
+	log.StringUnquoted(stats.PlanType)
+	log.Key("OriginalSQL")
+	log.String(stats.OriginalSQL)
+	log.Key("BindVars")
+	if redacted {
+		log.Redacted()
+	} else {
+		log.BindVariables(stats.BindVariables, fullBindParams)
 	}
+	log.Key("Queries")
+	log.Int(int64(stats.NumberOfQueries))
+	log.Key("RewrittenSQL")
+	if redacted {
+		log.Redacted()
+	} else {
+		log.String(stats.RewrittenSQL())
+	}
+	log.Key("QuerySources")
+	log.StringUnquoted(stats.FmtQuerySources())
+	log.Key("MysqlTime")
+	log.Duration(stats.MysqlResponseTime)
+	log.Key("ConnWaitTime")
+	log.Duration(stats.WaitingForConnection)
+	log.Key("RowsAffected")
+	log.Uint(uint64(stats.RowsAffected))
+	log.Key("TransactionID")
+	log.Int(stats.TransactionID)
+	log.Key("ResponseSize")
+	log.Int(int64(stats.SizeOfResponse()))
+	log.Key("Error")
+	log.String(stats.ErrorStr())
 
-	return fmt.Sprintf(
-		fmtString,
-		stats.Method,
-		remoteAddr,
-		username,
-		stats.ImmediateCaller(),
-		stats.EffectiveCaller(),
-		stats.StartTime.Format(time.StampMicro),
-		stats.EndTime.Format(time.StampMicro),
-		stats.TotalTime().Seconds(),
-		stats.PlanType,
-		stats.OriginalSQL,
-		formattedBindVars,
-		stats.NumberOfQueries,
-		rewrittenSQL,
-		stats.FmtQuerySources(),
-		stats.MysqlResponseTime.Seconds(),
-		stats.WaitingForConnection.Seconds(),
-		stats.RowsAffected,
-		stats.SizeOfResponse(),
-		stats.ErrorStr(),
-	)
+	// logstats from the vttablet are always tab-terminated; keep this for backwards
+	// compatibility for existing parsers
+	log.TabTerminated()
+
+	return log.Flush(w)
 }

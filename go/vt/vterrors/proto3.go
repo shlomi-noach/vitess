@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -31,11 +31,7 @@ func FromVTRPC(rpcErr *vtrpcpb.RPCError) error {
 	if rpcErr == nil {
 		return nil
 	}
-	code := rpcErr.Code
-	if code == vtrpcpb.Code_OK {
-		code = LegacyErrorCodeToCode(rpcErr.LegacyCode)
-	}
-	return New(code, rpcErr.Message)
+	return New(rpcErr.Code, rpcErr.Message)
 }
 
 // ToVTRPC converts from vtError to a vtrpcpb.RPCError.
@@ -43,10 +39,8 @@ func ToVTRPC(err error) *vtrpcpb.RPCError {
 	if err == nil {
 		return nil
 	}
-	code := Code(err)
 	return &vtrpcpb.RPCError{
-		LegacyCode: CodeToLegacyErrorCode(code),
-		Code:       code,
-		Message:    err.Error(),
+		Code:    Code(err),
+		Message: err.Error(),
 	}
 }

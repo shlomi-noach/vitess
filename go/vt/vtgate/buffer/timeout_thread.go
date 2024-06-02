@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -43,10 +43,10 @@ type timeoutThread struct {
 	queueNotEmpty chan struct{}
 }
 
-func newTimeoutThread(sb *shardBuffer) *timeoutThread {
+func newTimeoutThread(sb *shardBuffer, maxFailoverDuration time.Duration) *timeoutThread {
 	return &timeoutThread{
 		sb:            sb,
-		maxDuration:   time.NewTimer(*maxFailoverDuration),
+		maxDuration:   time.NewTimer(maxFailoverDuration),
 		stopChan:      make(chan struct{}),
 		queueNotEmpty: make(chan struct{}),
 	}
@@ -95,7 +95,7 @@ func (tt *timeoutThread) run() {
 // waitForEntry blocks until "e" exceeds its buffering window or buffering stops
 // in general. It returns true if the timeout thread should stop.
 func (tt *timeoutThread) waitForEntry(e *entry) bool {
-	windowExceeded := time.NewTimer(e.deadline.Sub(time.Now()))
+	windowExceeded := time.NewTimer(time.Until(e.deadline))
 	defer windowExceeded.Stop()
 
 	select {

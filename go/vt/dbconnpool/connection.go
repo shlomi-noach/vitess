@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,34 +17,65 @@ limitations under the License.
 package dbconnpool
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"time"
-
-	"golang.org/x/net/context"
 
 	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/mysql/sqlerror"
+	"vitess.io/vitess/go/pools/smartconnpool"
 	"vitess.io/vitess/go/sqltypes"
-	"vitess.io/vitess/go/stats"
 	"vitess.io/vitess/go/vt/dbconfigs"
 )
+
+type PooledDBConnection = smartconnpool.Pooled[*DBConnection]
 
 // DBConnection re-exposes mysql.Conn with some wrapping to implement
 // most of PoolConnection interface, except Recycle. That way it can be used
 // by itself. (Recycle needs to know about the Pool).
 type DBConnection struct {
 	*mysql.Conn
-	mysqlStats *stats.Timings
+	info dbconfigs.Connector
 }
 
-func (dbc *DBConnection) handleError(err error) {
-	if mysql.IsConnErr(err) {
-		dbc.Close()
+var errSettingNotSupported = errors.New("DBConnection does not support connection settings")
+
+func (dbc *DBConnection) ApplySetting(ctx context.Context, setting *smartconnpool.Setting) error {
+	return errSettingNotSupported
+}
+
+func (dbc *DBConnection) ResetSetting(ctx context.Context) error {
+	return errSettingNotSupported
+}
+
+func (dbc *DBConnection) Setting() *smartconnpool.Setting {
+	return nil
+}
+
+// NewDBConnection returns a new DBConnection based on the ConnParams
+// and will use the provided stats to collect timing.
+func NewDBConnection(ctx context.Context, info dbconfigs.Connector) (*DBConnection, error) {
+	c, err := info.Connect(ctx)
+	if err != nil {
+		return nil, err
 	}
+	return &DBConnection{Conn: c, info: info}, nil
+}
+
+// Reconnect replaces the existing underlying connection with a new one,
+// if possible. Recycle should still be called afterwards.
+func (dbc *DBConnection) Reconnect(ctx context.Context) error {
+	dbc.Conn.Close()
+	newConn, err := dbc.info.Connect(ctx)
+	if err != nil {
+		return err
+	}
+	dbc.Conn = newConn
+	return nil
 }
 
 // ExecuteFetch overwrites mysql.Conn.ExecuteFetch.
 func (dbc *DBConnection) ExecuteFetch(query string, maxrows int, wantfields bool) (*sqltypes.Result, error) {
-	defer dbc.mysqlStats.Record("Exec", time.Now())
 	mqr, err := dbc.Conn.ExecuteFetch(query, maxrows, wantfields)
 	if err != nil {
 		dbc.handleError(err)
@@ -54,8 +85,7 @@ func (dbc *DBConnection) ExecuteFetch(query string, maxrows int, wantfields bool
 }
 
 // ExecuteStreamFetch overwrites mysql.Conn.ExecuteStreamFetch.
-func (dbc *DBConnection) ExecuteStreamFetch(query string, callback func(*sqltypes.Result) error, streamBufferSize int) error {
-	defer dbc.mysqlStats.Record("ExecStream", time.Now())
+func (dbc *DBConnection) ExecuteStreamFetch(query string, callback func(*sqltypes.Result) error, alloc func() *sqltypes.Result, streamBufferSize int) error {
 
 	err := dbc.Conn.ExecuteStreamFetch(query)
 	if err != nil {
@@ -76,10 +106,10 @@ func (dbc *DBConnection) ExecuteStreamFetch(query string, callback func(*sqltype
 
 	// then get all the rows, sending them as we reach a decent packet size
 	// start with a pre-allocated array of 256 rows capacity
-	qr := &sqltypes.Result{Rows: make([][]sqltypes.Value, 0, 256)}
+	qr := alloc()
 	byteCount := 0
 	for {
-		row, err := dbc.FetchNext()
+		row, err := dbc.FetchNext(nil)
 		if err != nil {
 			dbc.handleError(err)
 			return err
@@ -97,9 +127,8 @@ func (dbc *DBConnection) ExecuteStreamFetch(query string, callback func(*sqltype
 			if err != nil {
 				return err
 			}
-			// empty the rows so we start over, but we keep the
-			// same capacity
-			qr.Rows = qr.Rows[:0]
+
+			qr = alloc()
 			byteCount = 0
 		}
 	}
@@ -114,19 +143,8 @@ func (dbc *DBConnection) ExecuteStreamFetch(query string, callback func(*sqltype
 	return nil
 }
 
-// NewDBConnection returns a new DBConnection based on the ConnParams
-// and will use the provided stats to collect timing.
-func NewDBConnection(info *mysql.ConnParams, mysqlStats *stats.Timings) (*DBConnection, error) {
-	start := time.Now()
-	defer mysqlStats.Record("Connect", start)
-	params, err := dbconfigs.WithCredentials(info)
-	if err != nil {
-		return nil, err
+func (dbc *DBConnection) handleError(err error) {
+	if sqlerror.IsConnErr(err) {
+		dbc.Close()
 	}
-	ctx := context.Background()
-	c, err := mysql.Connect(ctx, params)
-	if err != nil {
-		mysqlStats.Record("ConnectError", start)
-	}
-	return &DBConnection{c, mysqlStats}, err
 }

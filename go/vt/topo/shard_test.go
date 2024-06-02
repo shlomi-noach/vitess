@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,12 +17,14 @@ limitations under the License.
 package topo
 
 import (
+	"context"
 	"reflect"
-	"strings"
 	"testing"
 
-	"golang.org/x/net/context"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	"vitess.io/vitess/go/test/utils"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
@@ -58,20 +60,19 @@ func TestAddCells(t *testing.T) {
 	}
 }
 
-func TestRemoveCells(t *testing.T) {
+func TestRemoveCellsFromList(t *testing.T) {
 	var cells []string
 	allCells := []string{"first", "second", "third"}
 
 	// remove from empty list should return allCells - what we remove
-	var emptyResult bool
-	cells, emptyResult = removeCells(cells, []string{"second"}, allCells)
-	if emptyResult || !reflect.DeepEqual(cells, []string{"first", "third"}) {
-		t.Fatalf("removeCells(full)-second failed: got %v", cells)
+	cells = removeCellsFromList([]string{"second"}, allCells)
+	if !reflect.DeepEqual(cells, []string{"first", "third"}) {
+		t.Fatalf("removeCells(full)-second failed: got %v", allCells)
 	}
 
 	// removethe next two cells, should return empty list
-	cells, emptyResult = removeCells(cells, []string{"first", "third"}, allCells)
-	if !emptyResult {
+	cells = removeCellsFromList(cells, []string{"first", "third"})
+	if len(cells) != 0 {
 		t.Fatalf("removeCells(full)-first-third is not empty: %v", cells)
 	}
 }
@@ -86,276 +87,255 @@ func lockedKeyspaceContext(keyspace string) context.Context {
 	})
 }
 
-func TestUpdateSourceBlacklistedTables(t *testing.T) {
-	si := NewShardInfo("ks", "sh", &topodatapb.Shard{
-		Cells: []string{"first", "second", "third"},
-	}, nil)
+func addToDenyList(ctx context.Context, si *ShardInfo, tabletType topodatapb.TabletType, cells, tables []string) error {
+	if err := si.UpdateDeniedTables(ctx, tabletType, cells, false, tables); err != nil {
+		return err
+	}
+	return nil
+}
 
-	// check we enforce the keyspace lock
+func removeFromDenyList(ctx context.Context, si *ShardInfo, tabletType topodatapb.TabletType, cells, tables []string) error {
+	if err := si.UpdateDeniedTables(ctx, tabletType, cells, true, tables); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateDenyList(t *testing.T, si *ShardInfo, tabletType topodatapb.TabletType, cells, tables []string) {
+	tc := si.GetTabletControl(tabletType)
+	require.ElementsMatch(t, tc.Cells, cells)
+	require.ElementsMatch(t, tc.DeniedTables, tables)
+}
+
+func TestUpdateSourcePrimaryDeniedTables(t *testing.T) {
+	primary := topodatapb.TabletType_PRIMARY
+	si := NewShardInfo("ks", "sh", &topodatapb.Shard{}, nil)
+	ctx := lockedKeyspaceContext("ks")
+	t1, t2, t3, t4 := "t1", "t2", "t3", "t4"
+	tables1 := []string{t1, t2}
+	tables2 := []string{t3, t4}
+
+	require.NoError(t, addToDenyList(ctx, si, primary, nil, tables1))
+	validateDenyList(t, si, primary, nil, tables1)
+
+	require.NoError(t, addToDenyList(ctx, si, primary, nil, tables2))
+	validateDenyList(t, si, primary, nil, append(tables1, tables2...))
+
+	require.Error(t, addToDenyList(ctx, si, primary, nil, tables2), dlTablesAlreadyPresent)
+	require.Error(t, addToDenyList(ctx, si, primary, nil, []string{t1}), dlTablesAlreadyPresent)
+
+	require.NoError(t, removeFromDenyList(ctx, si, primary, nil, tables2))
+	validateDenyList(t, si, primary, nil, tables1)
+
+	require.Error(t, removeFromDenyList(ctx, si, primary, nil, tables2), dlTablesNotPresent)
+	require.Error(t, removeFromDenyList(ctx, si, primary, nil, []string{t3}), dlTablesNotPresent)
+	validateDenyList(t, si, primary, nil, tables1)
+
+	require.NoError(t, removeFromDenyList(ctx, si, primary, nil, []string{t1}))
+	require.NoError(t, removeFromDenyList(ctx, si, primary, nil, []string{t2}))
+	require.Nil(t, si.GetTabletControl(primary))
+
+	require.Error(t, addToDenyList(ctx, si, primary, []string{"cell"}, tables1), dlNoCellsForPrimary)
+}
+
+func TestUpdateSourceDeniedTables(t *testing.T) {
+	si := NewShardInfo("ks", "sh", &topodatapb.Shard{}, nil)
 	ctx := context.Background()
-	if err := si.UpdateSourceBlacklistedTables(ctx, topodatapb.TabletType_RDONLY, nil, false, nil); err == nil || err.Error() != "keyspace ks is not locked (no locksInfo)" {
-		t.Fatalf("unlocked keyspace produced wrong error: %v", err)
-	}
-	ctx = lockedKeyspaceContext("ks")
+	ctxWithLock := lockedKeyspaceContext("ks")
 
-	// add one cell
-	if err := si.UpdateSourceBlacklistedTables(ctx, topodatapb.TabletType_RDONLY, []string{"first"}, false, []string{"t1", "t2"}); err != nil || !reflect.DeepEqual(si.TabletControls, []*topodatapb.Shard_TabletControl{
+	type testCase struct {
+		name       string
+		ctx        context.Context
+		tabletType topodatapb.TabletType
+		cells      []string
+		remove     bool
+		tables     []string
+
+		wantError         string
+		wantTabletControl *topodatapb.Shard_TabletControl
+	}
+
+	// These tests update the state of the shard tablet controls, so subsequent tests
+	// depend on the cumulative state from the previous tests.
+	testCases := []testCase{
 		{
-			TabletType:        topodatapb.TabletType_RDONLY,
-			Cells:             []string{"first"},
-			BlacklistedTables: []string{"t1", "t2"},
+			name:       "enforce keyspace lock",
+			ctx:        ctx,
+			tabletType: topodatapb.TabletType_RDONLY,
+			cells:      []string{"first"},
+
+			wantError: "keyspace ks is not locked (no locksInfo)",
 		},
-	}) {
-		t.Fatalf("one cell add failed: %v", si)
-	}
-
-	// remove that cell, going back
-	if err := si.UpdateSourceBlacklistedTables(ctx, topodatapb.TabletType_RDONLY, []string{"first"}, true, nil); err != nil || len(si.TabletControls) != 0 {
-		t.Fatalf("going back should have remove the record: %v", si)
-	}
-
-	// re-add a cell, then another with different table list to
-	// make sure it fails
-	if err := si.UpdateSourceBlacklistedTables(ctx, topodatapb.TabletType_RDONLY, []string{"first"}, false, []string{"t1", "t2"}); err != nil {
-		t.Fatalf("one cell add failed: %v", si)
-	}
-	if err := si.UpdateSourceBlacklistedTables(ctx, topodatapb.TabletType_RDONLY, []string{"second"}, false, []string{"t2", "t3"}); err == nil || err.Error() != "trying to use two different sets of blacklisted tables for shard ks/sh: [t1 t2] and [t2 t3]" {
-		t.Fatalf("different table list should fail: %v", err)
-	}
-	if err := si.UpdateDisableQueryService(ctx, topodatapb.TabletType_RDONLY, []string{"first"}, true); err == nil || err.Error() != "cannot safely alter DisableQueryService as BlacklistedTables is set" {
-		t.Fatalf("UpdateDisableQueryService should fail: %v", err)
-	}
-
-	// add another cell, see the list grow
-	if err := si.UpdateSourceBlacklistedTables(ctx, topodatapb.TabletType_RDONLY, []string{"second"}, false, []string{"t1", "t2"}); err != nil || !reflect.DeepEqual(si.TabletControls, []*topodatapb.Shard_TabletControl{
 		{
-			TabletType:        topodatapb.TabletType_RDONLY,
-			Cells:             []string{"first", "second"},
-			BlacklistedTables: []string{"t1", "t2"},
+			name:       "add one cell",
+			tabletType: topodatapb.TabletType_RDONLY,
+			cells:      []string{"first"},
+			tables:     []string{"t1", "t2"},
+			wantTabletControl: &topodatapb.Shard_TabletControl{
+				TabletType:   topodatapb.TabletType_RDONLY,
+				Cells:        []string{"first"},
+				DeniedTables: []string{"t1", "t2"},
+			},
 		},
-	}) {
-		t.Fatalf("second cell add failed: %v", si)
+		{
+			name:       "remove the only cell",
+			tabletType: topodatapb.TabletType_RDONLY,
+			cells:      []string{"first"},
+			remove:     true,
+		},
+		{
+			name:       "re-add cell",
+			tabletType: topodatapb.TabletType_RDONLY,
+			cells:      []string{"first"},
+			tables:     []string{"t1", "t2"},
+			wantTabletControl: &topodatapb.Shard_TabletControl{
+				TabletType:   topodatapb.TabletType_RDONLY,
+				Cells:        []string{"first"},
+				DeniedTables: []string{"t1", "t2"},
+			},
+		},
+		{
+			name:       "re-add existing cell, different tables, should fail",
+			tabletType: topodatapb.TabletType_RDONLY,
+			cells:      []string{"first"},
+			tables:     []string{"t3"},
+			wantError:  "trying to use two different sets of denied tables for shard",
+		},
+		{
+			name:       "add all cells, see cell list grow to all",
+			tabletType: topodatapb.TabletType_RDONLY,
+			cells:      []string{"first", "second", "third"},
+			tables:     []string{"t1", "t2"},
+			wantTabletControl: &topodatapb.Shard_TabletControl{
+				TabletType:   topodatapb.TabletType_RDONLY,
+				Cells:        []string{"first", "second", "third"},
+				DeniedTables: []string{"t1", "t2"},
+			},
+		},
+		{
+			name:       "remove one cell",
+			tabletType: topodatapb.TabletType_RDONLY,
+			cells:      []string{"second"},
+			remove:     true,
+			tables:     []string{"t1", "t2"},
+			wantTabletControl: &topodatapb.Shard_TabletControl{
+				TabletType:   topodatapb.TabletType_RDONLY,
+				Cells:        []string{"first", "third"},
+				DeniedTables: []string{"t1", "t2"},
+			},
+		},
+		{
+			name:       "add replica tablet type",
+			tabletType: topodatapb.TabletType_REPLICA,
+			cells:      []string{"first"},
+			tables:     []string{"t1", "t2"},
+			wantTabletControl: &topodatapb.Shard_TabletControl{
+				TabletType:   topodatapb.TabletType_REPLICA,
+				Cells:        []string{"first"},
+				DeniedTables: []string{"t1", "t2"},
+			},
+		},
+		{
+			name:       "confirm rdonly still stays the same, after replica was added",
+			tabletType: topodatapb.TabletType_RDONLY,
+			wantTabletControl: &topodatapb.Shard_TabletControl{
+				TabletType:   topodatapb.TabletType_RDONLY,
+				Cells:        []string{"first", "third"},
+				DeniedTables: []string{"t1", "t2"},
+			},
+		},
+		{
+			name:       "remove rdonly entry",
+			tabletType: topodatapb.TabletType_RDONLY,
+			cells:      []string{"first", "third"},
+			remove:     true,
+			tables:     []string{"t1", "t2"},
+		},
+		{
+			name:       "remove replica entry",
+			tabletType: topodatapb.TabletType_REPLICA,
+			cells:      []string{"first", "third"},
+			remove:     true,
+			tables:     []string{"t1", "t2"},
+		},
 	}
 
-	// add all cells, see the list grow to all
-	if err := si.UpdateSourceBlacklistedTables(ctx, topodatapb.TabletType_RDONLY, nil, false, []string{"t1", "t2"}); err != nil || !reflect.DeepEqual(si.TabletControls, []*topodatapb.Shard_TabletControl{
-		{
-			TabletType:        topodatapb.TabletType_RDONLY,
-			Cells:             nil,
-			BlacklistedTables: []string{"t1", "t2"},
-		},
-	}) {
-		t.Fatalf("all cells add failed: %v", si)
-	}
-
-	// remove one cell from the full list
-	if err := si.UpdateSourceBlacklistedTables(ctx, topodatapb.TabletType_RDONLY, []string{"second"}, true, []string{"t1", "t2"}); err != nil || !reflect.DeepEqual(si.TabletControls, []*topodatapb.Shard_TabletControl{
-		{
-			TabletType:        topodatapb.TabletType_RDONLY,
-			Cells:             []string{"first", "third"},
-			BlacklistedTables: []string{"t1", "t2"},
-		},
-	}) {
-		t.Fatalf("one cell removal from all failed: %v", si)
+	for _, tcase := range testCases {
+		t.Run(tcase.name, func(t *testing.T) {
+			if tcase.ctx == nil {
+				tcase.ctx = ctxWithLock
+			}
+			var err error
+			if tcase.tables != nil || tcase.cells != nil {
+				err = si.UpdateDeniedTables(tcase.ctx, tcase.tabletType, tcase.cells, tcase.remove, tcase.tables)
+			}
+			if tcase.wantError != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tcase.wantError)
+				return
+			}
+			require.NoError(t, err)
+			if tcase.wantTabletControl == nil {
+				require.Nil(t, si.GetTabletControl(tcase.tabletType))
+			} else {
+				require.EqualValuesf(t, tcase.wantTabletControl, si.GetTabletControl(tcase.tabletType),
+					"want: %v, got: %v", tcase.wantTabletControl, si.GetTabletControl(tcase.tabletType))
+			}
+		})
 	}
 }
 
-func TestUpdateDisableQueryService(t *testing.T) {
-	si := NewShardInfo("ks", "sh", &topodatapb.Shard{
-		Cells: []string{"first", "second", "third"},
-	}, nil)
+func TestValidateShardName(t *testing.T) {
+	t.Parallel()
 
-	// check we enforce the keyspace lock
-	ctx := context.Background()
-	if err := si.UpdateDisableQueryService(ctx, topodatapb.TabletType_RDONLY, nil, true); err == nil || err.Error() != "keyspace ks is not locked (no locksInfo)" {
-		t.Fatalf("unlocked keyspace produced wrong error: %v", err)
-	}
-	ctx = lockedKeyspaceContext("ks")
-
-	// add one cell
-	if err := si.UpdateDisableQueryService(ctx, topodatapb.TabletType_RDONLY, []string{"first"}, true); err != nil || !reflect.DeepEqual(si.TabletControls, []*topodatapb.Shard_TabletControl{
+	cases := []struct {
+		name          string
+		expectedRange *topodatapb.KeyRange
+		valid         bool
+	}{
 		{
-			TabletType:          topodatapb.TabletType_RDONLY,
-			Cells:               []string{"first"},
-			DisableQueryService: true,
+			name:  "0",
+			valid: true,
 		},
-	}) {
-		t.Fatalf("one cell add failed: %v", si)
-	}
-
-	// remove that cell, going back
-	if err := si.UpdateDisableQueryService(ctx, topodatapb.TabletType_RDONLY, []string{"first"}, false); err != nil || len(si.TabletControls) != 0 {
-		t.Fatalf("going back should have remove the record: %v %v", err, si)
-	}
-
-	// re-add a cell, then another with a table list to
-	// make sure it fails
-	if err := si.UpdateDisableQueryService(ctx, topodatapb.TabletType_RDONLY, []string{"first"}, true); err != nil {
-		t.Fatalf("one cell add failed: %v", si)
-	}
-	if err := si.UpdateSourceBlacklistedTables(ctx, topodatapb.TabletType_RDONLY, []string{"second"}, false, []string{"t1", "t1"}); err == nil || err.Error() != "cannot safely alter BlacklistedTables as DisableQueryService is set for shard ks/sh" {
-		t.Fatalf("UpdateSourceBlacklistedTables should fail: %v", err)
-	}
-
-	// add another cell, see the list grow
-	if err := si.UpdateDisableQueryService(ctx, topodatapb.TabletType_RDONLY, []string{"second"}, true); err != nil || !reflect.DeepEqual(si.TabletControls, []*topodatapb.Shard_TabletControl{
 		{
-			TabletType:          topodatapb.TabletType_RDONLY,
-			Cells:               []string{"first", "second"},
-			DisableQueryService: true,
+			name: "-80",
+			expectedRange: &topodatapb.KeyRange{
+				Start: nil,
+				End:   []byte{0x80},
+			},
+			valid: true,
 		},
-	}) {
-		t.Fatalf("second cell add failed: %v", si)
+		{
+			name: "40-80",
+			expectedRange: &topodatapb.KeyRange{
+				Start: []byte{0x40},
+				End:   []byte{0x80},
+			},
+			valid: true,
+		},
+		{
+			name:  "foo-bar",
+			valid: false,
+		},
+		{
+			name:  "a/b",
+			valid: false,
+		},
 	}
 
-	// add all cells, see the list grow to all
-	if err := si.UpdateDisableQueryService(ctx, topodatapb.TabletType_RDONLY, nil, true); err != nil || !reflect.DeepEqual(si.TabletControls, []*topodatapb.Shard_TabletControl{
-		{
-			TabletType:          topodatapb.TabletType_RDONLY,
-			Cells:               nil,
-			DisableQueryService: true,
-		},
-	}) {
-		t.Fatalf("all cells add failed: %v", si)
-	}
+	for _, tcase := range cases {
+		tcase := tcase
+		t.Run(tcase.name, func(t *testing.T) {
+			t.Parallel()
 
-	// remove one cell from the full list
-	if err := si.UpdateDisableQueryService(ctx, topodatapb.TabletType_RDONLY, []string{"second"}, false); err != nil || !reflect.DeepEqual(si.TabletControls, []*topodatapb.Shard_TabletControl{
-		{
-			TabletType:          topodatapb.TabletType_RDONLY,
-			Cells:               []string{"first", "third"},
-			DisableQueryService: true,
-		},
-	}) {
-		t.Fatalf("one cell removal from all failed: %v", si)
-	}
-}
+			_, kr, err := ValidateShardName(tcase.name)
+			if !tcase.valid {
+				assert.Error(t, err, "expected %q to be an invalid shard name", tcase.name)
+				return
+			}
 
-func TestUpdateServedTypesMap(t *testing.T) {
-	si := NewShardInfo("ks", "sh", &topodatapb.Shard{
-		Cells: []string{"first", "second", "third"},
-	}, nil)
-
-	// add all cells for rdonly
-	if err := si.UpdateServedTypesMap(topodatapb.TabletType_RDONLY, nil, false); err != nil || !reflect.DeepEqual(si.ServedTypes, []*topodatapb.Shard_ServedType{
-		{
-			TabletType: topodatapb.TabletType_RDONLY,
-			Cells:      nil,
-		},
-	}) {
-		t.Fatalf("rdonly all cells add failed: %v", err)
-	}
-
-	// add some cells for replica
-	if err := si.UpdateServedTypesMap(topodatapb.TabletType_REPLICA, []string{"second"}, false); err != nil || !reflect.DeepEqual(si.ServedTypes, []*topodatapb.Shard_ServedType{
-		{
-			TabletType: topodatapb.TabletType_RDONLY,
-			Cells:      nil,
-		},
-		{
-			TabletType: topodatapb.TabletType_REPLICA,
-			Cells:      []string{"second"},
-		},
-	}) {
-		t.Fatalf("replica some cells add failed: %v", err)
-	}
-
-	// remove some cells for rdonly
-	if err := si.UpdateServedTypesMap(topodatapb.TabletType_RDONLY, []string{"second"}, true); err != nil || !reflect.DeepEqual(si.ServedTypes, []*topodatapb.Shard_ServedType{
-		{
-			TabletType: topodatapb.TabletType_RDONLY,
-			Cells:      []string{"first", "third"},
-		},
-		{
-			TabletType: topodatapb.TabletType_REPLICA,
-			Cells:      []string{"second"},
-		},
-	}) {
-		t.Fatalf("remove some cells for rdonly failed: %v", err)
-	}
-
-	// remove last cell for replica
-	if err := si.UpdateServedTypesMap(topodatapb.TabletType_REPLICA, []string{"second"}, true); err != nil || !reflect.DeepEqual(si.ServedTypes, []*topodatapb.Shard_ServedType{
-		{
-			TabletType: topodatapb.TabletType_RDONLY,
-			Cells:      []string{"first", "third"},
-		},
-	}) {
-		t.Fatalf("remove last cell for replica failed: %v", err)
-	}
-
-	// Migrate each serving type (add it to this shard).
-	// REPLICA
-	if err := si.UpdateServedTypesMap(topodatapb.TabletType_REPLICA, nil, false); err != nil || !reflect.DeepEqual(si.ServedTypes, []*topodatapb.Shard_ServedType{
-		{
-			TabletType: topodatapb.TabletType_RDONLY,
-			Cells:      []string{"first", "third"},
-		},
-		{
-			TabletType: topodatapb.TabletType_REPLICA,
-			Cells:      nil,
-		},
-	}) {
-		t.Fatalf("migrate replica failed: %v", err)
-	}
-	// RDONLY
-	if err := si.UpdateServedTypesMap(topodatapb.TabletType_RDONLY, nil, false); err != nil || !reflect.DeepEqual(si.ServedTypes, []*topodatapb.Shard_ServedType{
-		{
-			TabletType: topodatapb.TabletType_RDONLY,
-			Cells:      nil,
-		},
-		{
-			TabletType: topodatapb.TabletType_REPLICA,
-			Cells:      nil,
-		},
-	}) {
-		t.Fatalf("migrate rdonly failed: %v", err)
-	}
-	// MASTER
-	if err := si.UpdateServedTypesMap(topodatapb.TabletType_MASTER, nil, false); err != nil || !reflect.DeepEqual(si.ServedTypes, []*topodatapb.Shard_ServedType{
-		{
-			TabletType: topodatapb.TabletType_RDONLY,
-			Cells:      nil,
-		},
-		{
-			TabletType: topodatapb.TabletType_REPLICA,
-			Cells:      nil,
-		},
-		{
-			TabletType: topodatapb.TabletType_MASTER,
-			Cells:      nil,
-		},
-	}) {
-		t.Fatalf("migrate master failed: %v", err)
-	}
-
-	// try to migrate master away, see it fail
-	if err := si.UpdateServedTypesMap(topodatapb.TabletType_MASTER, nil, true); err == nil || err.Error() != "cannot migrate MASTER away from ks/sh until everything else is migrated. Make sure that the following types are migrated first: RDONLY, REPLICA" {
-		t.Fatalf("migrate master away unexpected error: %v", err)
-	}
-
-	// Migrate each serving type away from this shard.
-	// RDONLY
-	if err := si.UpdateServedTypesMap(topodatapb.TabletType_RDONLY, nil, true); err != nil {
-		t.Fatalf("remove master failed: %v", err)
-	}
-	// Cannot migrate a type away (here RDONLY) which is not served (anymore).
-	if err := si.UpdateServedTypesMap(topodatapb.TabletType_RDONLY, nil, true); err == nil || !strings.HasPrefix(err.Error(), "supplied type RDONLY cannot be migrated out of the shard because it is not a served type: ") {
-		t.Fatalf("migrate rdonly should have failed because it's already migrated: %v", err)
-	}
-	// REPLICA
-	if err := si.UpdateServedTypesMap(topodatapb.TabletType_REPLICA, nil, true); err != nil {
-		t.Fatalf("remove master failed: %v", err)
-	}
-	// MASTER
-	// Migration fails if a list of cells is specified.
-	if err := si.UpdateServedTypesMap(topodatapb.TabletType_MASTER, []string{"first", "third"}, true); err == nil || err.Error() != "cannot migrate only some cells for MASTER in shard ks/sh. Do not specify a list of cells" {
-		t.Fatalf("remove master failed: %v", err)
-	}
-	if err := si.UpdateServedTypesMap(topodatapb.TabletType_MASTER, nil, true); err != nil {
-		t.Fatalf("remove master failed: %v", err)
-	}
-	if len(si.ServedTypes) != 0 {
-		t.Fatalf("expected empty map after removing all")
+			require.NoError(t, err, "expected %q to be a valid shard name, got error: %v", tcase.name, err)
+			utils.MustMatch(t, tcase.expectedRange, kr)
+		})
 	}
 }

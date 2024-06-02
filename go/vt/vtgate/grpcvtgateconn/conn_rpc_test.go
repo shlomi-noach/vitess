@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,29 +17,29 @@ limitations under the License.
 package grpcvtgateconn
 
 import (
-	"flag"
+	"context"
 	"io"
-	"io/ioutil"
 	"net"
 	"os"
 	"testing"
 
+	"github.com/spf13/pflag"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/grpcclient"
 	"vitess.io/vitess/go/vt/servenv"
 	"vitess.io/vitess/go/vt/vtgate/grpcvtgateservice"
 	"vitess.io/vitess/go/vt/vtgate/vtgateconn"
-	"vitess.io/vitess/go/vt/vtgate/vtgateconntest"
 )
 
 // TestGRPCVTGateConn makes sure the grpc service works
 func TestGRPCVTGateConn(t *testing.T) {
 	// fake service
-	service := vtgateconntest.CreateFakeServer(t)
+	service := CreateFakeServer(t)
 
 	// listen on a random port
-	listener, err := net.Listen("tcp", ":0")
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Cannot listen: %v", err)
 	}
@@ -55,11 +55,11 @@ func TestGRPCVTGateConn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial failed: %v", err)
 	}
-	vtgateconntest.RegisterTestDialProtocol(client)
+	RegisterTestDialProtocol(client)
 
 	// run the test suite
-	vtgateconntest.TestSuite(t, client, service)
-	vtgateconntest.TestErrorSuite(t, service)
+	RunTests(t, client, service)
+	RunErrorTests(t, service)
 
 	// and clean up
 	client.Close()
@@ -69,10 +69,10 @@ func TestGRPCVTGateConn(t *testing.T) {
 func TestGRPCVTGateConnAuth(t *testing.T) {
 	var opts []grpc.ServerOption
 	// fake service
-	service := vtgateconntest.CreateFakeServer(t)
+	service := CreateFakeServer(t)
 
 	// listen on a random port
-	listener, err := net.Listen("tcp", ":0")
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Cannot listen: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestGRPCVTGateConnAuth(t *testing.T) {
          "Password": "valid"
         }`
 
-	f, err := ioutil.TempFile("", "static_auth_creds.json")
+	f, err := os.CreateTemp("", "static_auth_creds.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,16 +105,24 @@ func TestGRPCVTGateConnAuth(t *testing.T) {
 
 	// Create a Go RPC client connecting to the server
 	ctx := context.Background()
-	flag.Set("grpc_auth_static_client_creds", f.Name())
+	fs := pflag.NewFlagSet("", pflag.ContinueOnError)
+	grpcclient.RegisterFlags(fs)
+
+	grpcclient.ResetStaticAuth()
+	err = fs.Parse([]string{
+		"--grpc_auth_static_client_creds",
+		f.Name(),
+	})
+	require.NoError(t, err, "failed to set `--grpc_auth_static_client_creds=%s`", f.Name())
 	client, err := dial(ctx, listener.Addr().String())
 	if err != nil {
 		t.Fatalf("dial failed: %v", err)
 	}
-	vtgateconntest.RegisterTestDialProtocol(client)
+	RegisterTestDialProtocol(client)
 
 	// run the test suite
-	vtgateconntest.TestSuite(t, client, service)
-	vtgateconntest.TestErrorSuite(t, service)
+	RunTests(t, client, service)
+	RunErrorTests(t, service)
 
 	// and clean up
 	client.Close()
@@ -124,7 +132,7 @@ func TestGRPCVTGateConnAuth(t *testing.T) {
 	 "Password": "valid"
 	}`
 
-	f, err = ioutil.TempFile("", "static_auth_creds.json")
+	f, err = os.CreateTemp("", "static_auth_creds.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,15 +146,23 @@ func TestGRPCVTGateConnAuth(t *testing.T) {
 
 	// Create a Go RPC client connecting to the server
 	ctx = context.Background()
-	flag.Set("grpc_auth_static_client_creds", f.Name())
+	fs = pflag.NewFlagSet("", pflag.ContinueOnError)
+	grpcclient.RegisterFlags(fs)
+
+	grpcclient.ResetStaticAuth()
+	err = fs.Parse([]string{
+		"--grpc_auth_static_client_creds",
+		f.Name(),
+	})
+	require.NoError(t, err, "failed to set `--grpc_auth_static_client_creds=%s`", f.Name())
 	client, err = dial(ctx, listener.Addr().String())
 	if err != nil {
 		t.Fatalf("dial failed: %v", err)
 	}
-	vtgateconntest.RegisterTestDialProtocol(client)
-	conn, err := vtgateconn.DialProtocol(context.Background(), "test", "")
+	RegisterTestDialProtocol(client)
+	conn, _ := vtgateconn.DialProtocol(context.Background(), "test", "")
 	// run the test suite
-	_, err = conn.Begin(context.Background())
+	_, err = conn.Session("", nil).Execute(context.Background(), "select * from t", nil)
 	want := "rpc error: code = Unauthenticated desc = username and password must be provided"
 	if err == nil || err.Error() != want {
 		t.Errorf("expected auth failure:\n%v, want\n%s", err, want)

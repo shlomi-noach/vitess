@@ -1,5 +1,7 @@
+//go:build !windows
+
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -52,9 +54,11 @@ import (
 	"fmt"
 	"log/syslog"
 	"os"
+	"testing"
 
 	"vitess.io/vitess/go/event"
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/servenv"
 )
 
 // Syslogger is the interface that events should implement if they want to be
@@ -80,11 +84,6 @@ type syslogWriter interface {
 var writer syslogWriter
 
 func listener(ev Syslogger) {
-	if writer == nil {
-		log.Errorf("no connection, dropping syslog event: %#v", ev)
-		return
-	}
-
 	// Ask the event to convert itself to a syslog message.
 	sev, msg := ev.Syslog()
 
@@ -92,21 +91,53 @@ func listener(ev Syslogger) {
 	var err error
 	switch sev {
 	case syslog.LOG_EMERG:
-		err = writer.Emerg(msg)
+		if writer != nil {
+			err = writer.Emerg(msg)
+		} else {
+			log.Errorf(msg)
+		}
 	case syslog.LOG_ALERT:
-		err = writer.Alert(msg)
+		if writer != nil {
+			err = writer.Alert(msg)
+		} else {
+			log.Errorf(msg)
+		}
 	case syslog.LOG_CRIT:
-		err = writer.Crit(msg)
+		if writer != nil {
+			err = writer.Crit(msg)
+		} else {
+			log.Errorf(msg)
+		}
 	case syslog.LOG_ERR:
-		err = writer.Err(msg)
+		if writer != nil {
+			err = writer.Err(msg)
+		} else {
+			log.Errorf(msg)
+		}
 	case syslog.LOG_WARNING:
-		err = writer.Warning(msg)
+		if writer != nil {
+			err = writer.Warning(msg)
+		} else {
+			log.Warningf(msg)
+		}
 	case syslog.LOG_NOTICE:
-		err = writer.Notice(msg)
+		if writer != nil {
+			err = writer.Notice(msg)
+		} else {
+			log.Infof(msg)
+		}
 	case syslog.LOG_INFO:
-		err = writer.Info(msg)
+		if writer != nil {
+			err = writer.Info(msg)
+		} else {
+			log.Infof(msg)
+		}
 	case syslog.LOG_DEBUG:
-		err = writer.Debug(msg)
+		if writer != nil {
+			err = writer.Debug(msg)
+		} else {
+			log.Infof(msg)
+		}
 	default:
 		err = fmt.Errorf("invalid syslog severity: %v", sev)
 	}
@@ -116,10 +147,28 @@ func listener(ev Syslogger) {
 }
 
 func init() {
+	// We only want to init syslog when the app is being initialized
+	// Some binaries import the syslog package indirectly leading to
+	// the syslog.New function being called and this might fail if
+	// running inside Docker without the syslog daemon enabled, leading
+	// logging the error which will make glog think there are not --log_dir
+	// flag set as we have not parsed the flags yet.
+	// https://github.com/vitessio/vitess/issues/15120
+	servenv.OnInit(func() {
+		initSyslog()
+	})
+
+	// We still do the init of syslog if we are testing this package.
+	if testing.Testing() {
+		initSyslog()
+	}
+}
+
+func initSyslog() {
 	var err error
 	writer, err = syslog.New(syslog.LOG_INFO|syslog.LOG_USER, os.Args[0])
 	if err != nil {
-		log.Errorf("can't connect to syslog")
+		log.Errorf("can't connect to syslog: %v", err.Error())
 		writer = nil
 	}
 

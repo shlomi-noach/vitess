@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,16 +17,17 @@ limitations under the License.
 package binlog
 
 import (
+	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
-	"golang.org/x/net/context"
-
-	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/mysql/replication"
 	"vitess.io/vitess/go/stats"
-	"vitess.io/vitess/go/sync2"
 	"vitess.io/vitess/go/tb"
+	"vitess.io/vitess/go/vt/dbconfigs"
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
 
@@ -58,47 +59,16 @@ var (
 // UpdateStreamControl is the interface an UpdateStream service implements
 // to bring it up or down.
 type UpdateStreamControl interface {
+	// InitDBConfigs is called after the db name is computed.
+	InitDBConfig(*dbconfigs.DBConfigs)
+	// RegisterService registers the UpdateStream service.
+	RegisterService()
 	// Enable will allow any new RPC calls
 	Enable()
-
 	// Disable will interrupt all current calls, and disallow any new call
 	Disable()
-
 	// IsEnabled returns true iff the service is enabled
 	IsEnabled() bool
-}
-
-// UpdateStreamControlMock is an implementation of UpdateStreamControl
-// to be used in tests
-type UpdateStreamControlMock struct {
-	enabled bool
-	sync.Mutex
-}
-
-// NewUpdateStreamControlMock creates a new UpdateStreamControlMock
-func NewUpdateStreamControlMock() *UpdateStreamControlMock {
-	return &UpdateStreamControlMock{}
-}
-
-// Enable is part of UpdateStreamControl
-func (m *UpdateStreamControlMock) Enable() {
-	m.Lock()
-	m.enabled = true
-	m.Unlock()
-}
-
-// Disable is part of UpdateStreamControl
-func (m *UpdateStreamControlMock) Disable() {
-	m.Lock()
-	m.enabled = false
-	m.Unlock()
-}
-
-// IsEnabled is part of UpdateStreamControl
-func (m *UpdateStreamControlMock) IsEnabled() bool {
-	m.Lock()
-	defer m.Unlock()
-	return m.enabled
 }
 
 // UpdateStreamImpl is the real implementation of UpdateStream
@@ -108,14 +78,15 @@ type UpdateStreamImpl struct {
 	ts       *topo.Server
 	keyspace string
 	cell     string
-	cp       *mysql.ConnParams
+	cp       dbconfigs.Connector
 	se       *schema.Engine
 
 	// actionLock protects the following variables
 	actionLock     sync.Mutex
-	state          sync2.AtomicInt64
+	state          atomic.Int64
 	stateWaitGroup sync.WaitGroup
 	streams        StreamList
+	parser         *sqlparser.Parser
 }
 
 // StreamList is a map of context.CancelFunc to mass-interrupt ongoing
@@ -169,14 +140,19 @@ type RegisterUpdateStreamServiceFunc func(UpdateStream)
 var RegisterUpdateStreamServices []RegisterUpdateStreamServiceFunc
 
 // NewUpdateStream returns a new UpdateStreamImpl object
-func NewUpdateStream(ts *topo.Server, keyspace string, cell string, cp *mysql.ConnParams, se *schema.Engine) *UpdateStreamImpl {
+func NewUpdateStream(ts *topo.Server, keyspace string, cell string, se *schema.Engine, parser *sqlparser.Parser) *UpdateStreamImpl {
 	return &UpdateStreamImpl{
 		ts:       ts,
 		keyspace: keyspace,
 		cell:     cell,
-		cp:       cp,
 		se:       se,
+		parser:   parser,
 	}
+}
+
+// InitDBConfig should be invoked after the db name is computed.
+func (updateStream *UpdateStreamImpl) InitDBConfig(dbcfgs *dbconfigs.DBConfigs) {
+	updateStream.cp = dbcfgs.DbaWithDB()
 }
 
 // RegisterService needs to be called to publish stats, and to start listening
@@ -184,7 +160,7 @@ func NewUpdateStream(ts *topo.Server, keyspace string, cell string, cp *mysql.Co
 func (updateStream *UpdateStreamImpl) RegisterService() {
 	// publish the stats
 	stats.Publish("UpdateStreamState", stats.StringFunc(func() string {
-		return usStateNames[updateStream.state.Get()]
+		return usStateNames[updateStream.state.Load()]
 	}))
 
 	// and register all the RPC protocols
@@ -208,9 +184,9 @@ func (updateStream *UpdateStreamImpl) Enable() {
 		return
 	}
 
-	updateStream.state.Set(usEnabled)
+	updateStream.state.Store(usEnabled)
 	updateStream.streams.Init()
-	log.Infof("Enabling update stream, dbname: %s", updateStream.cp.DbName)
+	log.Infof("Enabling update stream, dbname: %s", updateStream.cp.DBName())
 }
 
 // Disable will disallow any connection to the service
@@ -222,7 +198,7 @@ func (updateStream *UpdateStreamImpl) Disable() {
 		return
 	}
 
-	updateStream.state.Set(usDisabled)
+	updateStream.state.Store(usDisabled)
 	updateStream.streams.Stop()
 	updateStream.stateWaitGroup.Wait()
 	log.Infof("Update Stream Disabled")
@@ -230,12 +206,12 @@ func (updateStream *UpdateStreamImpl) Disable() {
 
 // IsEnabled returns true if UpdateStreamImpl is enabled
 func (updateStream *UpdateStreamImpl) IsEnabled() bool {
-	return updateStream.state.Get() == usEnabled
+	return updateStream.state.Load() == usEnabled
 }
 
 // StreamKeyRange is part of the UpdateStream interface
 func (updateStream *UpdateStreamImpl) StreamKeyRange(ctx context.Context, position string, keyRange *topodatapb.KeyRange, charset *binlogdatapb.Charset, callback func(trans *binlogdatapb.BinlogTransaction) error) (err error) {
-	pos, err := mysql.DecodePosition(position)
+	pos, err := replication.DecodePosition(position)
 	if err != nil {
 		return err
 	}
@@ -254,14 +230,14 @@ func (updateStream *UpdateStreamImpl) StreamKeyRange(ctx context.Context, positi
 	defer streamCount.Add("KeyRange", -1)
 	log.Infof("ServeUpdateStream starting @ %#v", pos)
 
-	// Calls cascade like this: binlog.Streamer->KeyRangeFilterFunc->func(*binlogdatapb.BinlogTransaction)->callback
-	f := KeyRangeFilterFunc(keyRange, func(trans *binlogdatapb.BinlogTransaction) error {
+	// Calls cascade like this: binlog.Streamer->keyRangeFilterFunc->func(*binlogdatapb.BinlogTransaction)->callback
+	f := keyRangeFilterFunc(keyRange, func(trans *binlogdatapb.BinlogTransaction) error {
 		keyrangeStatements.Add(int64(len(trans.Statements)))
 		keyrangeTransactions.Add(1)
 		return callback(trans)
 	})
 	bls := NewStreamer(updateStream.cp, updateStream.se, charset, pos, 0, f)
-	bls.resolverFactory, err = newKeyspaceIDResolverFactory(ctx, updateStream.ts, updateStream.keyspace, updateStream.cell)
+	bls.resolverFactory, err = newKeyspaceIDResolverFactory(ctx, updateStream.ts, updateStream.keyspace, updateStream.cell, updateStream.parser)
 	if err != nil {
 		return fmt.Errorf("newKeyspaceIDResolverFactory failed: %v", err)
 	}
@@ -275,7 +251,7 @@ func (updateStream *UpdateStreamImpl) StreamKeyRange(ctx context.Context, positi
 
 // StreamTables is part of the UpdateStream interface
 func (updateStream *UpdateStreamImpl) StreamTables(ctx context.Context, position string, tables []string, charset *binlogdatapb.Charset, callback func(trans *binlogdatapb.BinlogTransaction) error) (err error) {
-	pos, err := mysql.DecodePosition(position)
+	pos, err := replication.DecodePosition(position)
 	if err != nil {
 		return err
 	}
@@ -294,8 +270,8 @@ func (updateStream *UpdateStreamImpl) StreamTables(ctx context.Context, position
 	defer streamCount.Add("Tables", -1)
 	log.Infof("ServeUpdateStream starting @ %#v", pos)
 
-	// Calls cascade like this: binlog.Streamer->TablesFilterFunc->func(*binlogdatapb.BinlogTransaction)->callback
-	f := TablesFilterFunc(tables, func(trans *binlogdatapb.BinlogTransaction) error {
+	// Calls cascade like this: binlog.Streamer->tablesFilterFunc->func(*binlogdatapb.BinlogTransaction)->callback
+	f := tablesFilterFunc(tables, func(trans *binlogdatapb.BinlogTransaction) error {
 		tablesStatements.Add(int64(len(trans.Statements)))
 		tablesTransactions.Add(1)
 		return callback(trans)

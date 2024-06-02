@@ -1,5 +1,5 @@
 /*
-Copyright 2018 The Vitess Authors
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -59,12 +59,13 @@ func (cp ClientProtocol) String() string {
 
 // ConnParams specifies how to connect to the vtgate(s)
 type ConnParams struct {
-	Hosts    []string
-	Port     int
-	DB       string
-	Username string
-	Password string
-	Protocol ClientProtocol
+	Hosts      []string
+	Port       int
+	DB         string
+	Username   string
+	Password   string
+	UnixSocket string
+	Protocol   ClientProtocol
 }
 
 // Bench controls the test
@@ -118,7 +119,9 @@ func (b *Bench) Run(ctx context.Context) error {
 	}
 
 	b.createThreads(ctx)
-	b.runTest(ctx)
+	if err := b.runTest(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -228,7 +231,7 @@ func (bt *benchThread) clientLoop(ctx context.Context) {
 			log.Errorf("query error: %v", err)
 			break
 		} else {
-			b.Rows.Add(int64(result.RowsAffected))
+			b.Rows.Add(int64(len(result.Rows)))
 		}
 
 	}

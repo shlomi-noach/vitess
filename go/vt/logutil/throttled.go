@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -46,7 +46,7 @@ func NewThrottledLogger(name string, maxInterval time.Duration) *ThrottledLogger
 	}
 }
 
-type logFunc func(int, ...interface{})
+type logFunc func(int, ...any)
 
 var (
 	infoDepth    = log.InfoDepth
@@ -54,7 +54,7 @@ var (
 	errorDepth   = log.ErrorDepth
 )
 
-func (tl *ThrottledLogger) log(logF logFunc, format string, v ...interface{}) {
+func (tl *ThrottledLogger) log(logF logFunc, format string, v ...any) {
 	now := time.Now()
 
 	tl.mu.Lock()
@@ -69,7 +69,7 @@ func (tl *ThrottledLogger) log(logF logFunc, format string, v ...interface{}) {
 	// to log and reset skippedCount
 	if tl.skippedCount == 0 {
 		go func(d time.Duration) {
-			time.Sleep(d)
+			<-time.After(d)
 			tl.mu.Lock()
 			defer tl.mu.Unlock()
 			// Because of the go func(), we lose the stack trace,
@@ -82,16 +82,16 @@ func (tl *ThrottledLogger) log(logF logFunc, format string, v ...interface{}) {
 }
 
 // Infof logs an info if not throttled.
-func (tl *ThrottledLogger) Infof(format string, v ...interface{}) {
+func (tl *ThrottledLogger) Infof(format string, v ...any) {
 	tl.log(infoDepth, format, v...)
 }
 
 // Warningf logs a warning if not throttled.
-func (tl *ThrottledLogger) Warningf(format string, v ...interface{}) {
+func (tl *ThrottledLogger) Warningf(format string, v ...any) {
 	tl.log(warningDepth, format, v...)
 }
 
 // Errorf logs an error if not throttled.
-func (tl *ThrottledLogger) Errorf(format string, v ...interface{}) {
+func (tl *ThrottledLogger) Errorf(format string, v ...any) {
 	tl.log(errorDepth, format, v...)
 }

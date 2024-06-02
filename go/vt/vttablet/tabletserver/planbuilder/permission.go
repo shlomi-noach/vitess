@@ -1,5 +1,5 @@
 /*
-Copyright 2018 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -39,7 +39,7 @@ func BuildPermissions(stmt sqlparser.Statement) []Permission {
 	case *sqlparser.Union, *sqlparser.Select:
 		permissions = buildSubqueryPermissions(node, tableacl.READER, permissions)
 	case *sqlparser.Insert:
-		permissions = buildTableNamePermissions(node.Table, tableacl.WRITER, permissions)
+		permissions = buildTableExprPermissions(node.Table, tableacl.WRITER, permissions)
 		permissions = buildSubqueryPermissions(node, tableacl.READER, permissions)
 	case *sqlparser.Update:
 		permissions = buildTableExprsPermissions(node.TableExprs, tableacl.WRITER, permissions)
@@ -47,18 +47,26 @@ func BuildPermissions(stmt sqlparser.Statement) []Permission {
 	case *sqlparser.Delete:
 		permissions = buildTableExprsPermissions(node.TableExprs, tableacl.WRITER, permissions)
 		permissions = buildSubqueryPermissions(node, tableacl.READER, permissions)
-	case *sqlparser.Set, *sqlparser.Show, *sqlparser.OtherRead:
-		// no-op
-	case *sqlparser.DDL:
-		if !node.Table.IsEmpty() {
-			permissions = buildTableNamePermissions(node.Table, tableacl.ADMIN, permissions)
+	case sqlparser.DDLStatement:
+		for _, t := range node.AffectedTables() {
+			permissions = buildTableNamePermissions(t, tableacl.ADMIN, permissions)
 		}
-		if !node.NewName.IsEmpty() {
-			permissions = buildTableNamePermissions(node.NewName, tableacl.ADMIN, permissions)
+	case
+		*sqlparser.AlterMigration,
+		*sqlparser.RevertMigration,
+		*sqlparser.ShowMigrationLogs,
+		*sqlparser.ShowThrottledApps,
+		*sqlparser.ShowThrottlerStatus:
+		permissions = []Permission{} // TODO(shlomi) what are the correct permissions here? Table is unknown
+	case *sqlparser.Flush:
+		for _, t := range node.TableNames {
+			permissions = buildTableNamePermissions(t, tableacl.ADMIN, permissions)
 		}
-	case *sqlparser.OtherAdmin:
-		// no op
-	case *sqlparser.Begin, *sqlparser.Commit, *sqlparser.Rollback:
+	case *sqlparser.Analyze:
+		permissions = buildTableNamePermissions(node.Table, tableacl.WRITER, permissions)
+	case *sqlparser.OtherAdmin, *sqlparser.CallProc, *sqlparser.Begin, *sqlparser.Commit, *sqlparser.Rollback,
+		*sqlparser.Load, *sqlparser.Savepoint, *sqlparser.Release, *sqlparser.SRollback, *sqlparser.Set, *sqlparser.Show, sqlparser.Explain,
+		*sqlparser.UnlockTables:
 		// no op
 	default:
 		panic(fmt.Errorf("BUG: unexpected statement type: %T", node))
@@ -68,18 +76,15 @@ func BuildPermissions(stmt sqlparser.Statement) []Permission {
 
 func buildSubqueryPermissions(stmt sqlparser.Statement, role tableacl.Role, permissions []Permission) []Permission {
 	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
-		switch node := node.(type) {
-		case *sqlparser.Select:
-			permissions = buildTableExprsPermissions(node.From, role, permissions)
-		case sqlparser.TableExprs:
-			return false, nil
+		if sel, ok := node.(*sqlparser.Select); ok {
+			permissions = buildTableExprsPermissions(sel.From, role, permissions)
 		}
 		return true, nil
 	}, stmt)
 	return permissions
 }
 
-func buildTableExprsPermissions(node sqlparser.TableExprs, role tableacl.Role, permissions []Permission) []Permission {
+func buildTableExprsPermissions(node []sqlparser.TableExpr, role tableacl.Role, permissions []Permission) []Permission {
 	for _, node := range node {
 		permissions = buildTableExprPermissions(node, role, permissions)
 	}
@@ -89,14 +94,11 @@ func buildTableExprsPermissions(node sqlparser.TableExprs, role tableacl.Role, p
 func buildTableExprPermissions(node sqlparser.TableExpr, role tableacl.Role, permissions []Permission) []Permission {
 	switch node := node.(type) {
 	case *sqlparser.AliasedTableExpr:
-		// An AliasedTableExpr can also be a subquery, but we should skip them here
+		// An AliasedTableExpr can also be a derived table, but we should skip them here
 		// because the buildSubQueryPermissions walker will catch them and extract
 		// the corresponding table names.
-		switch node := node.Expr.(type) {
-		case sqlparser.TableName:
-			permissions = buildTableNamePermissions(node, role, permissions)
-		case *sqlparser.Subquery:
-			permissions = buildSubqueryPermissions(node.Select, role, permissions)
+		if tblName, ok := node.Expr.(sqlparser.TableName); ok {
+			permissions = buildTableNamePermissions(tblName, role, permissions)
 		}
 	case *sqlparser.ParenTableExpr:
 		permissions = buildTableExprsPermissions(node.Exprs, role, permissions)

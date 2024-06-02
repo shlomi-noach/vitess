@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,6 +17,8 @@ limitations under the License.
 package zkctl
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -33,6 +35,18 @@ func TestLifeCycle(t *testing.T) {
 	myID := 255
 
 	zkConf := MakeZkConfigFromString(config, uint32(myID))
+	tpcKeepAliveCfg := "tcpKeepAlive=true"
+	adminServerCfg := "admin.serverPort=8081"
+	zkConf.Extra = []string{tpcKeepAliveCfg, adminServerCfg}
+
+	if zkObservedConf, err := MakeZooCfg([]string{zkConf.ConfigFile()}, zkConf, "header"); err != nil {
+		t.Fatalf("MakeZooCfg err: %v", err)
+	} else if !strings.Contains(zkObservedConf, fmt.Sprintf("\n%s\n", tpcKeepAliveCfg)) {
+		t.Fatalf("Expected tpcKeepAliveCfg in zkObservedConf")
+	} else if !strings.Contains(zkObservedConf, fmt.Sprintf("\n%s\n", adminServerCfg)) {
+		t.Fatalf("Expected adminServerCfg in zkObservedConf")
+	}
+
 	zkd := NewZkd(zkConf)
 	if err := zkd.Init(); err != nil {
 		t.Fatalf("Init() err: %v", err)
@@ -49,4 +63,5 @@ func TestLifeCycle(t *testing.T) {
 	if err := zkd.Teardown(); err != nil {
 		t.Fatalf("Teardown() err: %v", err)
 	}
+
 }

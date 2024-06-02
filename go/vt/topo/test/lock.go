@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -17,11 +17,11 @@ limitations under the License.
 package test
 
 import (
+	"context"
 	"path"
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
 	"vitess.io/vitess/go/vt/topo"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -34,8 +34,7 @@ var timeUntilLockIsTaken = 10 * time.Millisecond
 
 // checkLock checks we can lock / unlock as expected. It's using a keyspace
 // as the lock target.
-func checkLock(t *testing.T, ts *topo.Server) {
-	ctx := context.Background()
+func checkLock(t *testing.T, ctx context.Context, ts *topo.Server) {
 	if err := ts.CreateKeyspace(ctx, "test_keyspace", &topodatapb.Keyspace{}); err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
 	}
@@ -142,10 +141,10 @@ func checkLockUnblocks(ctx context.Context, t *testing.T, conn topo.Conn) {
 		<-unblock
 		lockDescriptor, err := conn.Lock(ctx, keyspacePath, "unblocks")
 		if err != nil {
-			t.Fatalf("Lock(test_keyspace) failed: %v", err)
+			t.Errorf("Lock(test_keyspace) failed: %v", err)
 		}
 		if err = lockDescriptor.Unlock(ctx); err != nil {
-			t.Fatalf("Unlock(test_keyspace): %v", err)
+			t.Errorf("Unlock(test_keyspace): %v", err)
 		}
 		close(finished)
 	}()
@@ -170,6 +169,6 @@ func checkLockUnblocks(ctx context.Context, t *testing.T, conn topo.Conn) {
 	select {
 	case <-finished:
 	case <-timeout:
-		t.Fatalf("unlocking timed out")
+		t.Fatalf("Unlock(test_keyspace) timed out")
 	}
 }

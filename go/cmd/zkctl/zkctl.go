@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,77 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// zkctl initializes and controls ZooKeeper with Vitess-specific configuration.
 package main
 
 import (
-	"bufio"
-	"flag"
-	"fmt"
-	"os"
-
+	"vitess.io/vitess/go/cmd/zkctl/command"
 	"vitess.io/vitess/go/exit"
 	"vitess.io/vitess/go/vt/log"
-	"vitess.io/vitess/go/vt/logutil"
-	"vitess.io/vitess/go/vt/zkctl"
 )
-
-var usage = `
-Commands:
-
-	init | start | shutdown | teardown
-`
-
-var (
-	zkCfg = flag.String("zk.cfg", "6@<hostname>:3801:3802:3803",
-		"zkid@server1:leaderPort1:electionPort1:clientPort1,...)")
-	myID = flag.Uint("zk.myid", 0,
-		"which server do you want to be? only needed when running multiple instance on one box, otherwise myid is implied by hostname")
-
-	stdin *bufio.Reader
-)
-
-func init() {
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
-		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, usage)
-	}
-	stdin = bufio.NewReader(os.Stdin)
-}
 
 func main() {
 	defer exit.Recover()
-	defer logutil.Flush()
 
-	flag.Parse()
-	args := flag.Args()
-
-	if len(args) == 0 {
-		flag.Usage()
-		exit.Return(1)
-	}
-
-	zkConfig := zkctl.MakeZkConfigFromString(*zkCfg, uint32(*myID))
-	zkd := zkctl.NewZkd(zkConfig)
-
-	action := flag.Arg(0)
-	var err error
-	switch action {
-	case "init":
-		err = zkd.Init()
-	case "shutdown":
-		err = zkd.Shutdown()
-	case "start":
-		err = zkd.Start()
-	case "teardown":
-		err = zkd.Teardown()
-	default:
-		log.Errorf("invalid action: %v", action)
-		exit.Return(1)
-	}
-	if err != nil {
-		log.Errorf("failed %v: %v", action, err)
+	if err := command.Root.Execute(); err != nil {
+		log.Error(err)
 		exit.Return(1)
 	}
 }

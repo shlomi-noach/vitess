@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,8 +16,6 @@ limitations under the License.
 
 package vtgate
 
-// This is a V3 file. Do not intermix with V2.
-
 import (
 	"sort"
 
@@ -33,10 +31,12 @@ type VSchemaStats struct {
 // VSchemaKeyspaceStats contains a rollup of the VSchema stats for a keyspace.
 // It is used to display a table with the information in the status page.
 type VSchemaKeyspaceStats struct {
-	Keyspace    string
-	Sharded     bool
-	TableCount  int
-	VindexCount int
+	Keyspace                 string
+	Sharded                  bool
+	TableCount               int
+	VindexCount              int
+	VindexUnknownParamsCount int
+	Error                    string
 }
 
 // NewVSchemaStats returns a new VSchemaStats from a VSchema.
@@ -55,6 +55,14 @@ func NewVSchemaStats(vschema *vindexes.VSchema, errorMessage string) *VSchemaSta
 			for _, t := range k.Tables {
 				s.VindexCount += len(t.ColumnVindexes) + len(t.Ordered) + len(t.Owned)
 			}
+			for _, vdx := range k.Vindexes {
+				if pv, ok := vdx.(vindexes.ParamValidating); ok {
+					s.VindexUnknownParamsCount += len(pv.UnknownParams())
+				}
+			}
+		}
+		if k.Error != nil {
+			s.Error = k.Error.Error()
 		}
 		stats.Keyspaces = append(stats.Keyspaces, s)
 	}
@@ -75,9 +83,9 @@ const (
     padding: 0.2rem;
   }
 </style>
-<table>
+<table class="refreshRequired">
   <tr>
-    <th colspan="4">VSchema Cache <i><a href="/debug/vschema">in JSON</a></i></th>
+    <th colspan="5">VSchema Cache <i><a href="/debug/vschema">in JSON</a></i></th>
   </tr>
 {{if .Error}}
   <tr>
@@ -93,12 +101,16 @@ const (
     <th>Sharded</th>
     <th>Table Count</th>
     <th>Vindex Count</th>
+    <th>Vindex Unknown Parameters Count</th>
+    <th>Error</th>
   </tr>
 {{range $i, $ks := .Keyspaces}}  <tr>
     <td>{{$ks.Keyspace}}</td>
     <td>{{if $ks.Sharded}}Yes{{else}}No{{end}}</td>
     <td>{{$ks.TableCount}}</td>
     <td>{{$ks.VindexCount}}</td>
+    <td>{{$ks.VindexUnknownParamsCount}}</td>
+    <td style="color:red">{{$ks.Error}}</td>
   </tr>{{end}}
 </table>
 `

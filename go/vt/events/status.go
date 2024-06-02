@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -29,11 +29,11 @@ import (
 //
 // For example:
 //
-//   type MyEvent struct {
-//     StatusUpdater
-//   }
-//   ev := &MyEvent{}
-//   event.DispatchUpdate(ev, "new status")
+//	type MyEvent struct {
+//	  StatusUpdater
+//	}
+//	ev := &MyEvent{}
+//	event.DispatchUpdate(ev, "new status")
 type StatusUpdater struct {
 	Status string
 
@@ -44,7 +44,7 @@ type StatusUpdater struct {
 
 // Update sets a new status and initializes the EventID if necessary.
 // This implements event.Updater.Update().
-func (su *StatusUpdater) Update(status interface{}) {
+func (su *StatusUpdater) Update(status any) {
 	su.Status = status.(string)
 
 	// initialize event ID

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,8 +26,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"strconv"
+	"time"
 )
+
+const DefaultShutdownTimeout = 5 * time.Minute
 
 // Mycnf is a memory structure that contains a bunch of interesting
 // parameters to start mysqld. It can be used to generate standard
@@ -40,7 +44,7 @@ type Mycnf struct {
 
 	// MysqlPort is the port for the MySQL server running on this machine.
 	// It is mainly used to communicate with topology server.
-	MysqlPort int32
+	MysqlPort int
 
 	// DataDir is where the table files are
 	// (used by vt software for Clone)
@@ -53,6 +57,10 @@ type Mycnf struct {
 	// InnodbLogGroupHomeDir is the logs directory for innodb.
 	// (used by vt software for Clone)
 	InnodbLogGroupHomeDir string
+
+	// SecureFilePriv is the path for loading secure files
+	// (used by vt software for bulk loading into tablet instances)
+	SecureFilePriv string
 
 	// SocketFile is the path to the local mysql.sock file.
 	// (used by vt software to check server is running)
@@ -88,7 +96,11 @@ type Mycnf struct {
 	BinLogPath string
 
 	// MasterInfoFile is the master.info file location.
-	// (unused by vt software for now)
+	// Unused when vitess manages mysql config because we set
+	// master_info_repository = TABLE and
+	// relay_log_info_repository = TABLE
+	// However it is possible to use custom cnf files with vitess
+	// and to generate them using command-line flags, so we allow a way to set this property
 	MasterInfoFile string
 
 	// PidFile is the mysql.pid file location
@@ -99,12 +111,17 @@ type Mycnf struct {
 	// (unused by vt software for now)
 	TmpDir string
 
-	// SlaveLoadTmpDir is where to create tmp files for replication
-	// (unused by vt software for now)
-	SlaveLoadTmpDir string
-
 	mycnfMap map[string]string
-	path     string // the actual path that represents this mycnf
+	Path     string // the actual path that represents this mycnf
+}
+
+const (
+	myCnfWaitRetryTime = 100 * time.Millisecond
+)
+
+// TabletDir returns the tablet directory.
+func (cnf *Mycnf) TabletDir() string {
+	return path.Dir(cnf.DataDir)
 }
 
 func (cnf *Mycnf) lookup(key string) string {
@@ -143,17 +160,27 @@ func normKey(bkey []byte) string {
 
 // ReadMycnf will read an existing my.cnf from disk, and update the passed in Mycnf object
 // with values from the my.cnf on disk.
-func ReadMycnf(mycnf *Mycnf) (*Mycnf, error) {
-	f, err := os.Open(mycnf.path)
+func ReadMycnf(mycnf *Mycnf, waitTime time.Duration) (*Mycnf, error) {
+	f, err := os.Open(mycnf.Path)
+	if waitTime != 0 {
+		timer := time.NewTimer(waitTime)
+		for err != nil {
+			select {
+			case <-timer.C:
+				return nil, err
+			default:
+				time.Sleep(myCnfWaitRetryTime)
+				f, err = os.Open(mycnf.Path)
+			}
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
 	buf := bufio.NewReader(f)
-	if err != nil {
-		return nil, err
-	}
+
 	mycnf.mycnfMap = make(map[string]string)
 	var lval, rval string
 	var parts [][]byte
@@ -174,9 +201,13 @@ func ReadMycnf(mycnf *Mycnf) (*Mycnf, error) {
 		mycnf.mycnfMap[lval] = rval
 	}
 
-	serverID, err := mycnf.lookupInt("server-id")
+	serverIDStr, err := mycnf.lookupWithDefault("server-id", "")
 	if err != nil {
 		return nil, err
+	}
+	serverID, err := strconv.ParseUint(serverIDStr, 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert server-id: %v", err)
 	}
 	mycnf.ServerID = uint32(serverID)
 
@@ -184,7 +215,7 @@ func ReadMycnf(mycnf *Mycnf) (*Mycnf, error) {
 	if err != nil {
 		return nil, err
 	}
-	mycnf.MysqlPort = int32(port)
+	mycnf.MysqlPort = port
 
 	mapping := map[string]*string{
 		"datadir":                   &mycnf.DataDir,
@@ -201,7 +232,7 @@ func ReadMycnf(mycnf *Mycnf) (*Mycnf, error) {
 		"master-info-file":          &mycnf.MasterInfoFile,
 		"pid-file":                  &mycnf.PidFile,
 		"tmpdir":                    &mycnf.TmpDir,
-		"slave_load_tmpdir":         &mycnf.SlaveLoadTmpDir,
+		"secure-file-priv":          &mycnf.SecureFilePriv,
 	}
 	for key, member := range mapping {
 		val, err := mycnf.lookupWithDefault(key, *member)

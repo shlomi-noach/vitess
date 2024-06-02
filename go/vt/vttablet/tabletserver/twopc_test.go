@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,12 +17,13 @@ limitations under the License.
 package tabletserver
 
 import (
+	"context"
 	"encoding/json"
 	"reflect"
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/tx"
 
 	"vitess.io/vitess/go/sqltypes"
 
@@ -30,14 +31,15 @@ import (
 )
 
 func TestReadAllRedo(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	// Reuse code from tx_executor_test.
-	_, tsv, db := newTestTxExecutor(t)
+	_, tsv, db := newTestTxExecutor(t, ctx)
 	defer db.Close()
 	defer tsv.StopService()
 	tpc := tsv.te.twoPC
-	ctx := context.Background()
 
-	conn, err := tsv.qe.conns.Get(ctx)
+	conn, err := tsv.qe.conns.Get(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +50,7 @@ func TestReadAllRedo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var want []*PreparedTx
+	var want []*tx.PreparedTx
 	if !reflect.DeepEqual(prepared, want) {
 		t.Errorf("ReadAllRedo: %s, want %s", jsonStr(prepared), jsonStr(want))
 	}
@@ -74,7 +76,7 @@ func TestReadAllRedo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want = []*PreparedTx{{
+	want = []*tx.PreparedTx{{
 		Dtid:    "dtid0",
 		Queries: []string{"stmt01"},
 		Time:    time.Unix(0, 1),
@@ -109,7 +111,7 @@ func TestReadAllRedo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want = []*PreparedTx{{
+	want = []*tx.PreparedTx{{
 		Dtid:    "dtid0",
 		Queries: []string{"stmt01", "stmt02"},
 		Time:    time.Unix(0, 1),
@@ -149,7 +151,7 @@ func TestReadAllRedo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want = []*PreparedTx{{
+	want = []*tx.PreparedTx{{
 		Dtid:    "dtid0",
 		Queries: []string{"stmt01", "stmt02"},
 		Time:    time.Unix(0, 1),
@@ -208,7 +210,7 @@ func TestReadAllRedo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want = []*PreparedTx{{
+	want = []*tx.PreparedTx{{
 		Dtid:    "dtid0",
 		Queries: []string{"stmt01", "stmt02"},
 		Time:    time.Unix(0, 1),
@@ -220,7 +222,7 @@ func TestReadAllRedo(t *testing.T) {
 	if !reflect.DeepEqual(prepared, want) {
 		t.Errorf("ReadAllRedo: %s, want %s", jsonStr(prepared), jsonStr(want))
 	}
-	wantFailed := []*PreparedTx{{
+	wantFailed := []*tx.PreparedTx{{
 		Dtid:    "dtid1",
 		Queries: []string{"stmt11"},
 		Time:    time.Unix(0, 1),
@@ -235,13 +237,14 @@ func TestReadAllRedo(t *testing.T) {
 }
 
 func TestReadAllTransactions(t *testing.T) {
-	_, tsv, db := newTestTxExecutor(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, tsv, db := newTestTxExecutor(t, ctx)
 	defer db.Close()
 	defer tsv.StopService()
 	tpc := tsv.te.twoPC
-	ctx := context.Background()
 
-	conn, err := tsv.qe.conns.Get(ctx)
+	conn, err := tsv.qe.conns.Get(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +255,7 @@ func TestReadAllTransactions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var want []*DistributedTx
+	var want []*tx.DistributedTx
 	if !reflect.DeepEqual(distributed, want) {
 		t.Errorf("ReadAllTransactions: %s, want %s", jsonStr(distributed), jsonStr(want))
 	}
@@ -277,7 +280,7 @@ func TestReadAllTransactions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want = []*DistributedTx{{
+	want = []*tx.DistributedTx{{
 		Dtid:    "dtid0",
 		State:   "PREPARE",
 		Created: time.Unix(0, 1),
@@ -316,7 +319,7 @@ func TestReadAllTransactions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want = []*DistributedTx{{
+	want = []*tx.DistributedTx{{
 		Dtid:    "dtid0",
 		State:   "PREPARE",
 		Created: time.Unix(0, 1),
@@ -364,7 +367,7 @@ func TestReadAllTransactions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want = []*DistributedTx{{
+	want = []*tx.DistributedTx{{
 		Dtid:    "dtid0",
 		State:   "PREPARE",
 		Created: time.Unix(0, 1),
@@ -389,7 +392,7 @@ func TestReadAllTransactions(t *testing.T) {
 	}
 }
 
-func jsonStr(v interface{}) string {
+func jsonStr(v any) string {
 	out, _ := json.Marshal(v)
 	return string(out)
 }

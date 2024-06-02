@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,9 +19,8 @@ package timer
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
-
-	"vitess.io/vitess/go/sync2"
 )
 
 // Out-of-band messages
@@ -56,11 +55,11 @@ A zero value interval will cause the timer to wait indefinitely, and it
 will react only to an explicit Trigger or Stop.
 */
 type Timer struct {
-	interval sync2.AtomicDuration
+	interval atomic.Int64
 
 	// state management
 	mu      sync.Mutex
-	running bool
+	running atomic.Bool
 
 	// msg is used for out-of-band messages
 	msg chan typeAction
@@ -71,7 +70,7 @@ func NewTimer(interval time.Duration) *Timer {
 	tm := &Timer{
 		msg: make(chan typeAction),
 	}
-	tm.interval.Set(interval)
+	tm.interval.Store(interval.Nanoseconds())
 	return tm
 }
 
@@ -79,24 +78,28 @@ func NewTimer(interval time.Duration) *Timer {
 func (tm *Timer) Start(keephouse func()) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
-	if tm.running {
+	isRunning := tm.running.Swap(true)
+	if isRunning {
 		return
 	}
-	tm.running = true
 	go tm.run(keephouse)
 }
 
 func (tm *Timer) run(keephouse func()) {
+	var timer *time.Timer
 	for {
 		var ch <-chan time.Time
-		interval := tm.interval.Get()
-		if interval <= 0 {
-			ch = nil
-		} else {
-			ch = time.After(interval)
+		interval := tm.interval.Load()
+		if interval > 0 {
+			timer = time.NewTimer(time.Duration(interval))
+			ch = timer.C
 		}
 		select {
 		case action := <-tm.msg:
+			if timer != nil {
+				timer.Stop()
+				timer = nil
+			}
 			switch action {
 			case timerStop:
 				return
@@ -112,10 +115,10 @@ func (tm *Timer) run(keephouse func()) {
 // SetInterval changes the wait interval.
 // It will cause the timer to restart the wait.
 func (tm *Timer) SetInterval(ns time.Duration) {
-	tm.interval.Set(ns)
+	tm.interval.Store(ns.Nanoseconds())
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
-	if tm.running {
+	if tm.running.Load() {
 		tm.msg <- timerReset
 	}
 }
@@ -125,7 +128,7 @@ func (tm *Timer) SetInterval(ns time.Duration) {
 func (tm *Timer) Trigger() {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
-	if tm.running {
+	if tm.running.Load() {
 		tm.msg <- timerTrigger
 	}
 }
@@ -143,13 +146,17 @@ func (tm *Timer) TriggerAfter(duration time.Duration) {
 func (tm *Timer) Stop() {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
-	if tm.running {
+	isRunning := tm.running.Swap(false)
+	if isRunning {
 		tm.msg <- timerStop
-		tm.running = false
 	}
 }
 
 // Interval returns the current interval.
 func (tm *Timer) Interval() time.Duration {
-	return tm.interval.Get()
+	return time.Duration(tm.interval.Load())
+}
+
+func (tm *Timer) Running() bool {
+	return tm.running.Load()
 }

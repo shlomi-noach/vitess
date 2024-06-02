@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,6 +19,9 @@ package json2
 import (
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
 )
@@ -29,14 +32,10 @@ func TestMarshalPB(t *testing.T) {
 		Type: querypb.Type_VARCHAR,
 	}
 	b, err := MarshalPB(col)
-	if err != nil {
-		t.Fatal(err)
-	}
+
+	require.NoErrorf(t, err, "MarshalPB(%+v) error", col)
 	want := "{\"name\":\"c1\",\"type\":\"VARCHAR\"}"
-	got := string(b)
-	if got != want {
-		t.Errorf("MarshalPB(col): %q, want %q", got, want)
-	}
+	assert.Equalf(t, want, string(b), "MarshalPB(%+v)", col)
 }
 
 func TestMarshalIndentPB(t *testing.T) {
@@ -44,13 +43,10 @@ func TestMarshalIndentPB(t *testing.T) {
 		Name: "c1",
 		Type: querypb.Type_VARCHAR,
 	}
-	b, err := MarshalIndentPB(col, "  ")
-	if err != nil {
-		t.Fatal(err)
-	}
+	indent := "  "
+	b, err := MarshalIndentPB(col, indent)
+
+	require.NoErrorf(t, err, "MarshalIndentPB(%+v, %q) error", col, indent)
 	want := "{\n  \"name\": \"c1\",\n  \"type\": \"VARCHAR\"\n}"
-	got := string(b)
-	if got != want {
-		t.Errorf("MarshalPB(col): %q, want %q", got, want)
-	}
+	assert.Equal(t, want, string(b), "MarshalIndentPB(%+v, %q)", col, indent)
 }

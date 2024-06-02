@@ -1,5 +1,5 @@
 /*
-Copyright 2018 The Vitess Authors.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,7 +16,10 @@ limitations under the License.
 
 package topo
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
 
 // ErrorCode is the error code for topo errors.
 type ErrorCode int
@@ -31,6 +34,9 @@ const (
 	BadVersion
 	PartialResult
 	NoUpdateNeeded
+	NoImplementation
+	NoReadOnlyImplementation
+	ResourceExhausted
 )
 
 // Error represents a topo error.
@@ -59,6 +65,12 @@ func NewError(code ErrorCode, node string) error {
 		message = fmt.Sprintf("partial result: %s", node)
 	case NoUpdateNeeded:
 		message = fmt.Sprintf("no update needed: %s", node)
+	case NoImplementation:
+		message = fmt.Sprintf("no such topology implementation %s", node)
+	case NoReadOnlyImplementation:
+		message = fmt.Sprintf("no read-only topology implementation %s", node)
+	case ResourceExhausted:
+		message = fmt.Sprintf("server resource exhausted: %s", node)
 	default:
 		message = fmt.Sprintf("unknown code: %s", node)
 	}
@@ -75,8 +87,15 @@ func (e Error) Error() string {
 
 // IsErrType returns true if the error has the specified ErrorCode.
 func IsErrType(err error, code ErrorCode) bool {
+	var e Error
+
+	if errors.As(err, &e) {
+		return e.code == code
+	}
+
 	if e, ok := err.(Error); ok {
 		return e.code == code
 	}
+
 	return false
 }

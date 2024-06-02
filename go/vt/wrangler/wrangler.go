@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,17 +19,28 @@ limitations under the License.
 package wrangler
 
 import (
+	"context"
+
+	"golang.org/x/sync/semaphore"
+
+	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/vtctl/grpcvtctldserver"
+	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vttablet/tmclient"
+
+	vtctlservicepb "vitess.io/vitess/go/vt/proto/vtctlservice"
 )
 
 var (
 	// DefaultActionTimeout is a good default for interactive
 	// remote actions. We usually take a lock then do an action,
-	// so basing this to be greater than DefaultLockTimeout is good.
+	// lock actions use RemoteOperationTimeout,
+	// so basing this to be greater than RemoteOperationTimeout is good.
 	// Use this as the default value for Context that need a deadline.
-	DefaultActionTimeout = topo.DefaultLockTimeout * 4
+	DefaultActionTimeout = topo.RemoteOperationTimeout * 4
 )
 
 // Wrangler manages complex actions on the topology, like reparents,
@@ -38,17 +49,42 @@ var (
 // Multiple go routines can use the same Wrangler at the same time,
 // provided they want to share the same logger / topo server / lock timeout.
 type Wrangler struct {
-	logger logutil.Logger
-	ts     *topo.Server
-	tmc    tmclient.TabletManagerClient
+	env      *vtenv.Environment
+	logger   logutil.Logger
+	ts       *topo.Server
+	tmc      tmclient.TabletManagerClient
+	vtctld   vtctlservicepb.VtctldServer
+	sourceTs *topo.Server
+	// VExecFunc is a test-only fixture that allows us to short circuit vexec commands.
+	// DO NOT USE in production code.
+	VExecFunc func(ctx context.Context, workflow, keyspace, query string, dryRun bool) (map[*topo.TabletInfo]*sqltypes.Result, error)
+	// Limt the number of concurrent background goroutines if needed.
+	sem            *semaphore.Weighted
+	WorkflowParams *VReplicationWorkflowParams
 }
 
 // New creates a new Wrangler object.
-func New(logger logutil.Logger, ts *topo.Server, tmc tmclient.TabletManagerClient) *Wrangler {
+func New(env *vtenv.Environment, logger logutil.Logger, ts *topo.Server, tmc tmclient.TabletManagerClient) *Wrangler {
 	return &Wrangler{
-		logger: logger,
-		ts:     ts,
-		tmc:    tmc,
+		env:      env,
+		logger:   logger,
+		ts:       ts,
+		tmc:      tmc,
+		vtctld:   grpcvtctldserver.NewVtctldServer(env, ts),
+		sourceTs: ts,
+	}
+}
+
+// NewTestWrangler creates a new Wrangler object for use in tests. This should NOT be used
+// in production.
+func NewTestWrangler(logger logutil.Logger, ts *topo.Server, tmc tmclient.TabletManagerClient) *Wrangler {
+	return &Wrangler{
+		env:      vtenv.NewTestEnv(),
+		logger:   logger,
+		ts:       ts,
+		tmc:      tmc,
+		vtctld:   grpcvtctldserver.NewTestVtctldServer(ts, tmc),
+		sourceTs: ts,
 	}
 }
 
@@ -63,6 +99,12 @@ func (wr *Wrangler) TabletManagerClient() tmclient.TabletManagerClient {
 	return wr.tmc
 }
 
+// VtctldServer returns the vtctlservicepb.VtctldServer implementation this
+// wrangler is using.
+func (wr *Wrangler) VtctldServer() vtctlservicepb.VtctldServer {
+	return wr.vtctld
+}
+
 // SetLogger can be used to change the current logger. Not synchronized,
 // no calls to this wrangler should be in progress.
 func (wr *Wrangler) SetLogger(logger logutil.Logger) {
@@ -72,4 +114,9 @@ func (wr *Wrangler) SetLogger(logger logutil.Logger) {
 // Logger returns the logger associated with this wrangler.
 func (wr *Wrangler) Logger() logutil.Logger {
 	return wr.logger
+}
+
+// SQLParser returns the parser this wrangler is using.
+func (wr *Wrangler) SQLParser() *sqlparser.Parser {
+	return wr.env.Parser()
 }

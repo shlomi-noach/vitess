@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -134,4 +134,14 @@ func (aer *AllErrorRecorder) ErrorStrings() []string {
 		errs = append(errs, e.Error())
 	}
 	return errs
+}
+
+// GetErrors returns a reference to the internal errors array.
+//
+// Note that the array is not copied, so this should only be used
+// once the recording is complete.
+func (aer *AllErrorRecorder) GetErrors() []error {
+	aer.mu.Lock()
+	defer aer.mu.Unlock()
+	return aer.Errors
 }

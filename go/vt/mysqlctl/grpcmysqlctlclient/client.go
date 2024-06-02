@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,14 +19,15 @@ limitations under the License.
 package grpcmysqlctlclient
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-
-	"golang.org/x/net/context"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	"vitess.io/vitess/go/vt/grpcclient"
 	"vitess.io/vitess/go/vt/mysqlctl/mysqlctlclient"
@@ -39,11 +40,17 @@ type client struct {
 	c  mysqlctlpb.MysqlCtlClient
 }
 
-func factory(network, addr string) (mysqlctlclient.MysqlctlClient, error) {
+func factory(ctx context.Context, network, addr string) (mysqlctlclient.MysqlctlClient, error) {
 	// create the RPC client
-	cc, err := grpcclient.Dial(addr, grpcclient.FailFast(false), grpc.WithInsecure(), grpc.WithDialer(func(addr string, timeout time.Duration) (net.Conn, error) {
-		return net.DialTimeout(network, addr, timeout)
-	}))
+	cc, err := grpcclient.DialContext(
+		ctx,
+		addr,
+		grpcclient.FailFast(false),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithContextDialer(func(ctx context.Context, addr string,
+		) (net.Conn, error) {
+			return new(net.Dialer).DialContext(ctx, network, addr)
+		}))
 	if err != nil {
 		return nil, err
 	}
@@ -83,6 +90,23 @@ func (c *client) RunMysqlUpgrade(ctx context.Context) error {
 	})
 }
 
+// ApplyBinlogFile is part of the MysqlctlClient interface.
+func (c *client) ApplyBinlogFile(ctx context.Context, req *mysqlctlpb.ApplyBinlogFileRequest) error {
+	return c.withRetry(ctx, func() error {
+		_, err := c.c.ApplyBinlogFile(ctx, req)
+		return err
+	})
+}
+
+// ReadBinlogFilesTimestamps is part of the MysqlctlClient interface.
+func (c *client) ReadBinlogFilesTimestamps(ctx context.Context, req *mysqlctlpb.ReadBinlogFilesTimestampsRequest) (resp *mysqlctlpb.ReadBinlogFilesTimestampsResponse, err error) {
+	err = c.withRetry(ctx, func() error {
+		resp, err = c.c.ReadBinlogFilesTimestamps(ctx, req)
+		return err
+	})
+	return resp, err
+}
+
 // ReinitConfig is part of the MysqlctlClient interface.
 func (c *client) ReinitConfig(ctx context.Context) error {
 	return c.withRetry(ctx, func() error {
@@ -97,6 +121,20 @@ func (c *client) RefreshConfig(ctx context.Context) error {
 		_, err := c.c.RefreshConfig(ctx, &mysqlctlpb.RefreshConfigRequest{})
 		return err
 	})
+}
+
+// VersionString is part of the MysqlctlClient interface.
+func (c *client) VersionString(ctx context.Context) (string, error) {
+	var version string
+	err := c.withRetry(ctx, func() error {
+		r, err := c.c.VersionString(ctx, &mysqlctlpb.VersionStringRequest{})
+		if err != nil {
+			return err
+		}
+		version = r.Version
+		return nil
+	})
+	return version, err
 }
 
 // Close is part of the MysqlctlClient interface.
@@ -115,10 +153,13 @@ func (c *client) withRetry(ctx context.Context, f func() error) error {
 		default:
 		}
 		if err := f(); err != nil {
-			if grpc.Code(err) == codes.Unavailable {
-				lastError = err
-				time.Sleep(100 * time.Millisecond)
-				continue
+			if st, ok := status.FromError(err); ok {
+				code := st.Code()
+				if code == codes.Unavailable {
+					lastError = err
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
 			}
 			return err
 		}

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,30 +17,25 @@ limitations under the License.
 package json2
 
 import (
-	"bytes"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/golang/protobuf/jsonpb"
-	"github.com/golang/protobuf/proto"
+	"vitess.io/vitess/go/hack"
 )
+
+func init() {
+	hack.DisableProtoBufRandomness()
+}
 
 // MarshalPB marshals a proto.
 func MarshalPB(pb proto.Message) ([]byte, error) {
-	buf := new(bytes.Buffer)
-	m := jsonpb.Marshaler{}
-	if err := m.Marshal(buf, pb); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	return protojson.Marshal(pb)
 }
 
 // MarshalIndentPB MarshalIndents a proto.
 func MarshalIndentPB(pb proto.Message, indent string) ([]byte, error) {
-	buf := new(bytes.Buffer)
-	m := jsonpb.Marshaler{
-		Indent: indent,
-	}
-	if err := m.Marshal(buf, pb); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	return protojson.MarshalOptions{
+		Multiline: true,
+		Indent:    indent,
+	}.Marshal(pb)
 }

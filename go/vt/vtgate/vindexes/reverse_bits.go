@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package vindexes
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -28,19 +29,24 @@ import (
 )
 
 var (
-	_ Vindex     = (*ReverseBits)(nil)
-	_ Reversible = (*ReverseBits)(nil)
+	_ SingleColumn = (*ReverseBits)(nil)
+	_ Reversible   = (*ReverseBits)(nil)
+	_ Hashing      = (*ReverseBits)(nil)
 )
 
 // ReverseBits defines vindex that reverses the bits of a number.
 // It's Unique, Reversible and Functional.
 type ReverseBits struct {
-	name string
+	name          string
+	unknownParams []string
 }
 
-// NewReverseBits creates a new ReverseBits.
-func NewReverseBits(name string, m map[string]string) (Vindex, error) {
-	return &ReverseBits{name: name}, nil
+// newReverseBits creates a new ReverseBits.
+func newReverseBits(name string, m map[string]string) (Vindex, error) {
+	return &ReverseBits{
+		name:          name,
+		unknownParams: FindUnknownParams(m, nil),
+	}, nil
 }
 
 // String returns the name of the vindex.
@@ -58,34 +64,34 @@ func (vind *ReverseBits) IsUnique() bool {
 	return true
 }
 
-// IsFunctional returns true since the Vindex is functional.
-func (vind *ReverseBits) IsFunctional() bool {
-	return true
+// NeedsVCursor satisfies the Vindex interface.
+func (vind *ReverseBits) NeedsVCursor() bool {
+	return false
 }
 
 // Map returns the corresponding KeyspaceId values for the given ids.
-func (vind *ReverseBits) Map(cursor VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
-	out := make([]key.Destination, len(ids))
-	for i, id := range ids {
-		num, err := sqltypes.ToUint64(id)
+func (vind *ReverseBits) Map(ctx context.Context, vcursor VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
+	out := make([]key.Destination, 0, len(ids))
+	for _, id := range ids {
+		num, err := vind.Hash(id)
 		if err != nil {
-			out[i] = key.DestinationNone{}
+			out = append(out, key.DestinationNone{})
 			continue
 		}
-		out[i] = key.DestinationKeyspaceID(reverse(num))
+		out = append(out, key.DestinationKeyspaceID(num))
 	}
 	return out, nil
 }
 
 // Verify returns true if ids maps to ksids.
-func (vind *ReverseBits) Verify(_ VCursor, ids []sqltypes.Value, ksids [][]byte) ([]bool, error) {
-	out := make([]bool, len(ids))
-	for i := range ids {
-		num, err := sqltypes.ToUint64(ids[i])
+func (vind *ReverseBits) Verify(ctx context.Context, vcursor VCursor, ids []sqltypes.Value, ksids [][]byte) ([]bool, error) {
+	out := make([]bool, 0, len(ids))
+	for i, id := range ids {
+		num, err := vind.Hash(id)
 		if err != nil {
-			return nil, fmt.Errorf("reverseBits.Verify: %v", err)
+			return nil, err
 		}
-		out[i] = (bytes.Compare(reverse(num), ksids[i]) == 0)
+		out = append(out, bytes.Equal(num, ksids[i]))
 	}
 	return out, nil
 }
@@ -103,8 +109,21 @@ func (vind *ReverseBits) ReverseMap(_ VCursor, ksids [][]byte) ([]sqltypes.Value
 	return reverseIds, nil
 }
 
+// UnknownParams implements the ParamValidating interface.
+func (vind *ReverseBits) UnknownParams() []string {
+	return vind.unknownParams
+}
+
+func (vind *ReverseBits) Hash(id sqltypes.Value) ([]byte, error) {
+	num, err := id.ToCastUint64()
+	if err != nil {
+		return nil, err
+	}
+	return reverse(num), nil
+}
+
 func init() {
-	Register("reverse_bits", NewReverseBits)
+	Register("reverse_bits", newReverseBits)
 }
 
 func reverse(shardKey uint64) []byte {

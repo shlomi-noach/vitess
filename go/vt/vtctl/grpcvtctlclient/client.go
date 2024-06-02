@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,13 +18,14 @@ limitations under the License.
 package grpcvtctlclient
 
 import (
-	"flag"
+	"context"
 	"time"
 
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
+
 	"vitess.io/vitess/go/vt/grpcclient"
 	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/vtctl/grpcclientcommon"
 	"vitess.io/vitess/go/vt/vtctl/vtctlclient"
 
 	logutilpb "vitess.io/vitess/go/vt/proto/logutil"
@@ -32,25 +33,18 @@ import (
 	vtctlservicepb "vitess.io/vitess/go/vt/proto/vtctlservice"
 )
 
-var (
-	cert = flag.String("vtctld_grpc_cert", "", "the cert to use to connect")
-	key  = flag.String("vtctld_grpc_key", "", "the key to use to connect")
-	ca   = flag.String("vtctld_grpc_ca", "", "the server ca to use to validate servers when connecting")
-	name = flag.String("vtctld_grpc_server_name", "", "the server name to use to validate server certificate")
-)
-
 type gRPCVtctlClient struct {
 	cc *grpc.ClientConn
 	c  vtctlservicepb.VtctlClient
 }
 
-func gRPCVtctlClientFactory(addr string) (vtctlclient.VtctlClient, error) {
-	opt, err := grpcclient.SecureDialOption(*cert, *key, *ca, *name)
+func gRPCVtctlClientFactory(ctx context.Context, addr string) (vtctlclient.VtctlClient, error) {
+	opt, err := grpcclientcommon.SecureDialOption()
 	if err != nil {
 		return nil, err
 	}
 	// create the RPC client
-	cc, err := grpcclient.Dial(addr, grpcclient.FailFast(false), opt)
+	cc, err := grpcclient.DialContext(ctx, addr, grpcclient.FailFast(false), opt)
 	if err != nil {
 		return nil, err
 	}

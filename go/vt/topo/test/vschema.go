@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,10 +17,12 @@ limitations under the License.
 package test
 
 import (
+	"context"
 	"testing"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
+
 	"vitess.io/vitess/go/vt/topo"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -28,8 +30,7 @@ import (
 )
 
 // checkVSchema runs the tests on the VSchema part of the API
-func checkVSchema(t *testing.T, ts *topo.Server) {
-	ctx := context.Background()
+func checkVSchema(t *testing.T, ctx context.Context, ts *topo.Server) {
 	if err := ts.CreateKeyspace(ctx, "test_keyspace", &topodatapb.Keyspace{}); err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
 	}
@@ -38,8 +39,7 @@ func checkVSchema(t *testing.T, ts *topo.Server) {
 		t.Fatalf("CreateShard: %v", err)
 	}
 
-	got, err := ts.GetVSchema(ctx, "test_keyspace")
-	want := &vschemapb.Keyspace{}
+	_, err := ts.GetVSchema(ctx, "test_keyspace")
 	if !topo.IsErrType(err, topo.NoNode) {
 		t.Error(err)
 	}
@@ -53,11 +53,9 @@ func checkVSchema(t *testing.T, ts *topo.Server) {
 		t.Fatal(err)
 	}
 
-	got, err = ts.GetVSchema(ctx, "test_keyspace")
-	if err != nil {
-		t.Error(err)
-	}
-	want = &vschemapb.Keyspace{
+	got, err := ts.GetVSchema(ctx, "test_keyspace")
+	require.NoError(t, err)
+	want := &vschemapb.Keyspace{
 		Tables: map[string]*vschemapb.Table{
 			"unsharded": {},
 		},
@@ -69,14 +67,10 @@ func checkVSchema(t *testing.T, ts *topo.Server) {
 	err = ts.SaveVSchema(ctx, "test_keyspace", &vschemapb.Keyspace{
 		Sharded: true,
 	})
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 
 	got, err = ts.GetVSchema(ctx, "test_keyspace")
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	want = &vschemapb.Keyspace{
 		Sharded: true,
 	}
@@ -92,5 +86,28 @@ func checkVSchema(t *testing.T, ts *topo.Server) {
 	}
 	if len(shards) != 1 || shards[0] != "b0-c0" {
 		t.Errorf(`GetShardNames: want [ "b0-c0" ], got %v`, shards)
+	}
+}
+
+// checkRoutingRules runs the tests on the routing rules part of the API
+func checkRoutingRules(t *testing.T, ctx context.Context, ts *topo.Server) {
+	if _, err := ts.GetRoutingRules(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	want := &vschemapb.RoutingRules{
+		Rules: []*vschemapb.RoutingRule{{
+			FromTable: "t1",
+			ToTables:  []string{"t2", "t3"},
+		}},
+	}
+	if err := ts.SaveRoutingRules(ctx, want); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ts.GetRoutingRules(ctx)
+	require.NoError(t, err)
+	if !proto.Equal(got, want) {
+		t.Errorf("GetRoutingRules: %v, want %v", got, want)
 	}
 }

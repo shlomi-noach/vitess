@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,9 +17,9 @@ limitations under the License.
 package endtoend
 
 import (
+	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"reflect"
 	"strings"
@@ -27,19 +27,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/test/utils"
 	"vitess.io/vitess/go/vt/callerid"
 	"vitess.io/vitess/go/vt/log"
-	"vitess.io/vitess/go/vt/sqlparser"
-	"vitess.io/vitess/go/vt/vttablet/endtoend/framework"
-	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
-
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vttablet/endtoend/framework"
 )
 
 func TestSimpleRead(t *testing.T) {
@@ -50,12 +49,8 @@ func TestSimpleRead(t *testing.T) {
 		return
 	}
 	vend := framework.DebugVars()
-	if err := compareIntDiff(vend, "Queries/TotalCount", vstart, 1); err != nil {
-		t.Error(err)
-	}
-	if err := compareIntDiff(vend, "Queries/Histograms/PASS_SELECT/Count", vstart, 1); err != nil {
-		t.Error(err)
-	}
+	compareIntDiff(t, vend, "Queries/TotalCount", vstart, 1)
+	compareIntDiff(t, vend, "Queries/Histograms/Select/Count", vstart, 1)
 }
 
 func TestBinary(t *testing.T) {
@@ -92,16 +87,14 @@ func TestBinary(t *testing.T) {
 				Flags:        128,
 			},
 		},
-		RowsAffected: 1,
 		Rows: [][]sqltypes.Value{
 			{
 				sqltypes.NewVarBinary(binaryData),
 			},
 		},
+		StatusFlags: sqltypes.ServerStatusAutocommit,
 	}
-	if !qr.Equal(&want) {
-		t.Errorf("Execute: \n%#v, want \n%#v", prettyPrint(*qr), prettyPrint(want))
-	}
+	utils.MustMatch(t, want, *qr)
 
 	// Test with bindvars.
 	_, err = client.Execute(
@@ -129,50 +122,44 @@ func TestNocacheListArgs(t *testing.T) {
 	qr, err := client.Execute(
 		query,
 		map[string]*querypb.BindVariable{
-			"list": sqltypes.TestBindVariable([]interface{}{2, 3, 4}),
+			"list": sqltypes.TestBindVariable([]any{2, 3, 4}),
 		},
 	)
 	if err != nil {
 		t.Error(err)
 		return
 	}
-	if qr.RowsAffected != 2 {
-		t.Errorf("rows affected: %d, want 2", qr.RowsAffected)
-	}
+	assert.Equal(t, 2, len(qr.Rows))
 
 	qr, err = client.Execute(
 		query,
 		map[string]*querypb.BindVariable{
-			"list": sqltypes.TestBindVariable([]interface{}{3, 4}),
+			"list": sqltypes.TestBindVariable([]any{3, 4}),
 		},
 	)
 	if err != nil {
 		t.Error(err)
 		return
 	}
-	if qr.RowsAffected != 1 {
-		t.Errorf("rows affected: %d, want 1", qr.RowsAffected)
-	}
+	assert.Equal(t, 1, len(qr.Rows))
 
 	qr, err = client.Execute(
 		query,
 		map[string]*querypb.BindVariable{
-			"list": sqltypes.TestBindVariable([]interface{}{3}),
+			"list": sqltypes.TestBindVariable([]any{3}),
 		},
 	)
 	if err != nil {
 		t.Error(err)
 		return
 	}
-	if qr.RowsAffected != 1 {
-		t.Errorf("rows affected: %d, want 1", qr.RowsAffected)
-	}
+	assert.Equal(t, 1, len(qr.Rows))
 
 	// Error case
 	_, err = client.Execute(
 		query,
 		map[string]*querypb.BindVariable{
-			"list": sqltypes.TestBindVariable([]interface{}{}),
+			"list": sqltypes.TestBindVariable([]any{}),
 		},
 	)
 	want := "empty list supplied for list (CallerID: dev)"
@@ -190,14 +177,11 @@ func TestIntegrityError(t *testing.T) {
 	if err == nil || !strings.HasPrefix(err.Error(), want) {
 		t.Errorf("Error: %v, want prefix %s", err, want)
 	}
-	if err := compareIntDiff(framework.DebugVars(), "Errors/ALREADY_EXISTS", vstart, 1); err != nil {
-		t.Error(err)
-	}
+	compareIntDiff(t, framework.DebugVars(), "Errors/ALREADY_EXISTS", vstart, 1)
 }
 
 func TestTrailingComment(t *testing.T) {
-	vstart := framework.DebugVars()
-	v1 := framework.FetchInt(vstart, "QueryCacheLength")
+	v1 := framework.Server.QueryPlanCacheLen()
 
 	bindVars := map[string]*querypb.BindVariable{"ival": sqltypes.Int64BindVariable(1)}
 	client := framework.NewClient()
@@ -212,35 +196,10 @@ func TestTrailingComment(t *testing.T) {
 			t.Error(err)
 			return
 		}
-		v2 := framework.FetchInt(framework.DebugVars(), "QueryCacheLength")
+		v2 := framework.Server.QueryPlanCacheLen()
 		if v2 != v1+1 {
 			t.Errorf("QueryCacheLength(%s): %d, want %d", query, v2, v1+1)
 		}
-	}
-}
-
-func TestUpsertNonPKHit(t *testing.T) {
-	client := framework.NewClient()
-	err := client.Begin(false)
-	if err != nil {
-		t.Error(err)
-		return
-	}
-	defer client.Rollback()
-
-	_, err = client.Execute("insert into upsert_test(id1, id2) values (1, 1)", nil)
-	if err != nil {
-		t.Error(err)
-		return
-	}
-	_, err = client.Execute(
-		"insert into upsert_test(id1, id2) values "+
-			"(2, 1) on duplicate key update id2 = 2",
-		nil,
-	)
-	want := "Duplicate entry '1' for key 'id2_idx'"
-	if err == nil || !strings.HasPrefix(err.Error(), want) {
-		t.Errorf("Execute: %v, must start with %s", err, want)
 	}
 }
 
@@ -302,36 +261,33 @@ func TestSidecarTables(t *testing.T) {
 }
 
 func TestConsolidation(t *testing.T) {
-	defer framework.Server.SetPoolSize(framework.Server.PoolSize())
-	framework.Server.SetPoolSize(1)
+	defer framework.Server.SetPoolSize(context.Background(), framework.Server.PoolSize())
+
+	err := framework.Server.SetPoolSize(context.Background(), 1)
+	require.NoError(t, err)
+
+	const tag = "Waits/Histograms/Consolidations/Count"
 
 	for sleep := 0.1; sleep < 10.0; sleep *= 2 {
-		vstart := framework.DebugVars()
+		want := framework.FetchInt(framework.DebugVars(), tag) + 1
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() {
-			query := fmt.Sprintf("select sleep(%v) from dual /* query: 1 */", sleep)
+			query := fmt.Sprintf("/* query: 1 */ select sleep(%v) from dual /* query: 1 */", sleep)
 			framework.NewClient().Execute(query, nil)
 			wg.Done()
 		}()
 		go func() {
-			query := fmt.Sprintf("select sleep(%v) from dual /* query: 2 */", sleep)
+			query := fmt.Sprintf("/* query: 2 */ select sleep(%v) from dual /* query: 2 */", sleep)
 			framework.NewClient().Execute(query, nil)
 			wg.Done()
 		}()
 		wg.Wait()
 
-		vend := framework.DebugVars()
-		if err := compareIntDiff(vend, "Waits/TotalCount", vstart, 1); err != nil {
-			t.Logf("DebugVars Waits/TotalCount not incremented with sleep=%v", sleep)
-			continue
+		if framework.FetchInt(framework.DebugVars(), tag) == want {
+			return
 		}
-		if err := compareIntDiff(vend, "Waits/Histograms/Consolidations/Count", vstart, 1); err != nil {
-			t.Logf("DebugVars Waits/Histograms/Consolidations/Count not incremented with sleep=%v", sleep)
-			continue
-		}
-		t.Logf("DebugVars properly incremented with sleep=%v", sleep)
-		return
+		t.Logf("Consolidation didn't succeed with sleep for %v, trying a longer sleep", sleep)
 	}
 	t.Error("DebugVars for consolidation not incremented")
 }
@@ -344,11 +300,8 @@ func TestBindInSelect(t *testing.T) {
 		"select :bv from dual",
 		map[string]*querypb.BindVariable{"bv": sqltypes.Int64BindVariable(1)},
 	)
-	if err != nil {
-		t.Error(err)
-		return
-	}
-	want := &sqltypes.Result{
+	require.NoError(t, err)
+	want57 := &sqltypes.Result{
 		Fields: []*querypb.Field{{
 			Name:         "1",
 			Type:         sqltypes.Int64,
@@ -356,15 +309,21 @@ func TestBindInSelect(t *testing.T) {
 			Charset:      63,
 			Flags:        32897,
 		}},
-		RowsAffected: 1,
 		Rows: [][]sqltypes.Value{
 			{
 				sqltypes.NewInt64(1),
 			},
 		},
 	}
-	if !qr.Equal(want) {
-		t.Errorf("Execute: \n%#v, want \n%#v", prettyPrint(*qr), prettyPrint(*want))
+	want80 := want57.Copy()
+	want80.Fields[0].ColumnLength = 2
+
+	wantMaria := want57.Copy()
+	wantMaria.Fields[0].Type = sqltypes.Int32
+	wantMaria.Rows[0][0] = sqltypes.NewInt32(1)
+
+	if !qr.Equal(want57) && !qr.Equal(want80) && !qr.Equal(wantMaria) {
+		t.Errorf("Execute:\n%v, want\n%v,\n%v or\n%v", prettyPrint(*qr), prettyPrint(*want57), prettyPrint(*want80), prettyPrint(*wantMaria))
 	}
 
 	// String bind var.
@@ -376,22 +335,22 @@ func TestBindInSelect(t *testing.T) {
 		t.Error(err)
 		return
 	}
-	want = &sqltypes.Result{
+	want := &sqltypes.Result{
 		Fields: []*querypb.Field{{
 			Name:         "abcd",
 			Type:         sqltypes.VarChar,
-			ColumnLength: 12,
-			Charset:      33,
-			Decimals:     31,
+			ColumnLength: 16,
+			Charset:      45,
 			Flags:        1,
 		}},
-		RowsAffected: 1,
 		Rows: [][]sqltypes.Value{
 			{
 				sqltypes.NewVarChar("abcd"),
 			},
 		},
 	}
+	// MariaDB 10.3 has different behavior.
+	qr.Fields[0].Decimals = 0
 	if !qr.Equal(want) {
 		t.Errorf("Execute: \n%#v, want \n%#v", prettyPrint(*qr), prettyPrint(*want))
 	}
@@ -409,18 +368,18 @@ func TestBindInSelect(t *testing.T) {
 		Fields: []*querypb.Field{{
 			Name:         "",
 			Type:         sqltypes.VarChar,
-			ColumnLength: 6,
-			Charset:      33,
-			Decimals:     31,
+			ColumnLength: 8,
+			Charset:      45,
 			Flags:        1,
 		}},
-		RowsAffected: 1,
 		Rows: [][]sqltypes.Value{
 			{
 				sqltypes.NewVarChar("\x00\xff"),
 			},
 		},
 	}
+	// MariaDB 10.3 has different behavior.
+	qr.Fields[0].Decimals = 0
 	if !qr.Equal(want) {
 		t.Errorf("Execute: \n%#v, want \n%#v", prettyPrint(*qr), prettyPrint(*want))
 	}
@@ -433,7 +392,7 @@ func TestHealth(t *testing.T) {
 		return
 	}
 	defer response.Body.Close()
-	result, err := ioutil.ReadAll(response.Body)
+	result, err := io.ReadAll(response.Body)
 	if err != nil {
 		t.Error(err)
 		return
@@ -445,15 +404,15 @@ func TestHealth(t *testing.T) {
 
 func TestStreamHealth(t *testing.T) {
 	var health *querypb.StreamHealthResponse
-	framework.Server.BroadcastHealth(0, nil)
+	framework.Server.BroadcastHealth()
 	if err := framework.Server.StreamHealth(context.Background(), func(shr *querypb.StreamHealthResponse) error {
 		health = shr
 		return io.EOF
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if !proto.Equal(health.Target, &framework.Target) {
-		t.Errorf("Health: %+v, want %+v", *health.Target, framework.Target)
+	if !proto.Equal(health.Target, framework.Target) {
+		t.Errorf("Health: %+v, want %+v", health.Target, framework.Target)
 	}
 }
 
@@ -468,7 +427,7 @@ func TestQueryStats(t *testing.T) {
 		t.Fatal(err)
 	}
 	stat := framework.QueryStats()[query]
-	duration := int(time.Now().Sub(start))
+	duration := int(time.Since(start))
 	if stat.Time <= 0 || stat.Time > duration {
 		t.Errorf("stat.Time: %d, must be between 0 and %d", stat.Time, duration)
 	}
@@ -478,16 +437,16 @@ func TestQueryStats(t *testing.T) {
 	stat.Time = 0
 	stat.MysqlTime = 0
 	want := framework.QueryStat{
-		Query:      query,
-		Table:      "vitess_a",
-		Plan:       "PASS_SELECT",
-		QueryCount: 1,
-		RowCount:   2,
-		ErrorCount: 0,
+		Query:        query,
+		Table:        "vitess_a",
+		Plan:         "Select",
+		QueryCount:   1,
+		RowsAffected: 0,
+		RowsReturned: 2,
+		ErrorCount:   0,
 	}
-	if stat != want {
-		t.Errorf("stat: %+v, want %+v", stat, want)
-	}
+
+	utils.MustMatch(t, want, stat)
 
 	// Query cache should be updated for errors that happen at MySQL level also.
 	query = "select /* query_stats */ eid from vitess_a where dontexist(eid) = :eid"
@@ -496,30 +455,95 @@ func TestQueryStats(t *testing.T) {
 	stat.Time = 0
 	stat.MysqlTime = 0
 	want = framework.QueryStat{
-		Query:      query,
-		Table:      "vitess_a",
-		Plan:       "PASS_SELECT",
-		QueryCount: 1,
-		RowCount:   0,
-		ErrorCount: 1,
+		Query:        query,
+		Table:        "vitess_a",
+		Plan:         "Select",
+		QueryCount:   1,
+		RowsAffected: 0,
+		RowsReturned: 0,
+		ErrorCount:   1,
 	}
-	if stat != want {
-		t.Errorf("stat: %+v, want %+v", stat, want)
-	}
+	utils.MustMatch(t, want, stat)
 	vend := framework.DebugVars()
-	if err := compareIntDiff(vend, "QueryCounts/vitess_a.PASS_SELECT", vstart, 2); err != nil {
-		t.Error(err)
+	require.False(t, framework.IsPresent(vend, "QueryRowsAffected/vitess_a.Select"))
+	compareIntDiff(t, vend, "QueryCounts/vitess_a.Select", vstart, 2)
+	compareIntDiff(t, vend, "QueryRowsReturned/vitess_a.Select", vstart, 2)
+	compareIntDiff(t, vend, "QueryErrorCounts/vitess_a.Select", vstart, 1)
+	compareIntDiff(t, vend, "QueryErrorCountsWithCode/vitess_a.Select.UNKNOWN", vstart, 1)
+
+	query = "update /* query_stats */ vitess_a set name = 'a'"
+	_, _ = client.Execute(query, bv)
+	defer func() {
+		// restore the table rows for other tests to use
+		query = "update /* query_stats */ vitess_a set name = 'abcd' where id = 1"
+		_, _ = client.Execute(query, bv)
+		query = "update /* query_stats */ vitess_a set name = 'bcde' where id = 2"
+		_, _ = client.Execute(query, bv)
+	}()
+	stat = framework.QueryStats()[query]
+	stat.Time = 0
+	stat.MysqlTime = 0
+	want = framework.QueryStat{
+		Query:        query,
+		Table:        "vitess_a",
+		Plan:         "UpdateLimit",
+		QueryCount:   1,
+		RowsAffected: 2,
+		RowsReturned: 0,
+		ErrorCount:   0,
 	}
-	if err := compareIntDiff(vend, "QueryRowCounts/vitess_a.PASS_SELECT", vstart, 2); err != nil {
-		t.Error(err)
+	utils.MustMatch(t, want, stat)
+	vend = framework.DebugVars()
+	require.False(t, framework.IsPresent(vend, "QueryRowsReturned/vitess_a.UpdateLimit"))
+	compareIntDiff(t, vend, "QueryCounts/vitess_a.UpdateLimit", vstart, 1)
+	compareIntDiff(t, vend, "QueryRowsAffected/vitess_a.UpdateLimit", vstart, 2)
+	compareIntDiff(t, vend, "QueryErrorCounts/vitess_a.UpdateLimit", vstart, 0)
+
+	query = "insert /* query_stats */ into vitess_a (eid, id, name, foo) values(100, 100, 'sdf', 'asdf')"
+	_, _ = client.Execute(query, bv)
+	stat = framework.QueryStats()[query]
+	stat.Time = 0
+	stat.MysqlTime = 0
+	want = framework.QueryStat{
+		Query:        query,
+		Table:        "vitess_a",
+		Plan:         "Insert",
+		QueryCount:   1,
+		RowsAffected: 1,
+		RowsReturned: 0,
+		ErrorCount:   0,
 	}
-	if err := compareIntDiff(vend, "QueryErrorCounts/vitess_a.PASS_SELECT", vstart, 1); err != nil {
-		t.Error(err)
+	utils.MustMatch(t, want, stat)
+	vend = framework.DebugVars()
+	require.False(t, framework.IsPresent(vend, "QueryRowsReturned/vitess_a.Insert"))
+	compareIntDiff(t, vend, "QueryCounts/vitess_a.Insert", vstart, 1)
+	compareIntDiff(t, vend, "QueryRowsAffected/vitess_a.Insert", vstart, 1)
+	compareIntDiff(t, vend, "QueryErrorCounts/vitess_a.Insert", vstart, 0)
+
+	query = "delete /* query_stats */ from vitess_a where eid = 100"
+	_, _ = client.Execute(query, bv)
+	stat = framework.QueryStats()[query]
+	stat.Time = 0
+	stat.MysqlTime = 0
+	want = framework.QueryStat{
+		Query:        query,
+		Table:        "vitess_a",
+		Plan:         "DeleteLimit",
+		QueryCount:   1,
+		RowsAffected: 1,
+		RowsReturned: 0,
+		ErrorCount:   0,
 	}
+	utils.MustMatch(t, want, stat)
+	vend = framework.DebugVars()
+	require.False(t, framework.IsPresent(vend, "QueryRowsReturned/vitess_a.DeleteLimit"))
+	compareIntDiff(t, vend, "QueryCounts/vitess_a.DeleteLimit", vstart, 1)
+	compareIntDiff(t, vend, "QueryRowsAffected/vitess_a.DeleteLimit", vstart, 1)
+	compareIntDiff(t, vend, "QueryErrorCounts/vitess_a.DeleteLimit", vstart, 0)
 
 	// Ensure BeginExecute also updates the stats and strips comments.
 	query = "select /* begin_execute */ 1 /* trailing comment */"
-	if _, err := client.BeginExecute(query, bv); err != nil {
+	if _, err := client.BeginExecute(query, bv, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := client.Rollback(); err != nil {
@@ -552,110 +576,54 @@ func TestDBAStatements(t *testing.T) {
 		t.Error(err)
 		return
 	}
-	if qr.RowsAffected != 4 {
-		t.Errorf("RowsAffected: %d, want 4", qr.RowsAffected)
-	}
+	assert.Equal(t, 4, len(qr.Rows))
 
 	qr, err = client.Execute("explain vitess_a", nil)
 	if err != nil {
 		t.Error(err)
 		return
 	}
-	if qr.RowsAffected != 4 {
-		t.Errorf("RowsAffected: %d, want 4", qr.RowsAffected)
-	}
+	assert.Equal(t, 4, len(qr.Rows))
 }
 
-var testLogs []string
+type testLogger struct {
+	logs        []string
+	savedInfof  func(format string, args ...any)
+	savedErrorf func(format string, args ...any)
+}
 
-func recordInfof(format string, args ...interface{}) {
+func newTestLogger() *testLogger {
+	tl := &testLogger{
+		savedInfof:  log.Infof,
+		savedErrorf: log.Errorf,
+	}
+	log.Infof = tl.recordInfof
+	log.Errorf = tl.recordErrorf
+	return tl
+}
+
+func (tl *testLogger) Close() {
+	log.Infof = tl.savedInfof
+	log.Errorf = tl.savedErrorf
+}
+
+func (tl *testLogger) recordInfof(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
-	testLogs = append(testLogs, msg)
-	log.Infof(msg)
+	tl.logs = append(tl.logs, msg)
+	tl.savedInfof(msg)
 }
 
-func recordErrorf(format string, args ...interface{}) {
+func (tl *testLogger) recordErrorf(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
-	testLogs = append(testLogs, msg)
-	log.Errorf(msg)
+	tl.logs = append(tl.logs, msg)
+	tl.savedErrorf(msg)
 }
 
-func setupTestLogger() {
-	testLogs = make([]string, 0)
-	tabletenv.Infof = recordInfof
-	tabletenv.Errorf = recordErrorf
-}
-
-func clearTestLogger() {
-	tabletenv.Infof = log.Infof
-	tabletenv.Errorf = log.Errorf
-}
-
-func getTestLog(i int) string {
-	if i < len(testLogs) {
-		return testLogs[i]
+func (tl *testLogger) getLog(i int) string {
+	if i < len(tl.logs) {
+		return tl.logs[i]
 	}
-	return fmt.Sprintf("ERROR: log %d/%d does not exist", i, len(testLogs))
-}
-
-func TestLogTruncation(t *testing.T) {
-	client := framework.NewClient()
-	setupTestLogger()
-	defer clearTestLogger()
-
-	// Test that a long error string is not truncated by default
-	_, err := client.Execute(
-		"insert into vitess_test values(123, :data, null, null)",
-		map[string]*querypb.BindVariable{"data": sqltypes.StringBindVariable("THIS IS A LONG LONG LONG LONG QUERY STRING THAT SHOULD BE SHORTENED")},
-	)
-	wantLog := "Data truncated for column 'floatval' at row 1 (errno 1265) (sqlstate 01000) (CallerID: dev): Sql: \"insert into vitess_test values(123, :data, null, null)\", BindVars: {#maxLimit: \"type:INT64 value:\\\"10001\\\" \"data: \"type:VARCHAR value:\\\"THIS IS A LONG LONG LONG LONG QUERY STRING THAT SHOULD BE SHORTENED\\\" \"}"
-	wantErr := "Data truncated for column 'floatval' at row 1 (errno 1265) (sqlstate 01000) (CallerID: dev): Sql: \"insert into vitess_test values(123, :data, null, null)\", BindVars: {#maxLimit: \"type:INT64 value:\\\"10001\\\" \"data: \"type:VARCHAR value:\\\"THIS IS A LONG LONG LONG LONG QUERY STRING THAT SHOULD BE SHORTENED\\\" \"}"
-	if err == nil {
-		t.Errorf("query unexpectedly succeeded")
-	}
-	if getTestLog(0) != wantLog {
-		t.Errorf("log was unexpectedly truncated: got '%s', want '%s'", getTestLog(0), wantLog)
-	}
-
-	if err.Error() != wantErr {
-		t.Errorf("error was unexpectedly truncated: got '%s', want '%s'", err.Error(), wantErr)
-	}
-
-	// Test that the data too long error is truncated once the option is set
-	*sqlparser.TruncateErrLen = 30
-	_, err = client.Execute(
-		"insert into vitess_test values(123, :data, null, null)",
-		map[string]*querypb.BindVariable{"data": sqltypes.StringBindVariable("THIS IS A LONG LONG LONG LONG QUERY STRING THAT SHOULD BE SHORTENED")},
-	)
-	wantLog = "Data truncated for column 'floatval' at row 1 (errno 1265) (sqlstate 01000) (CallerID: dev): Sql: \"insert into vitess [TRUNCATED]\", BindVars: {#maxLim [TRUNCATED]"
-	wantErr = "Data truncated for column 'floatval' at row 1 (errno 1265) (sqlstate 01000) (CallerID: dev): Sql: \"insert into vitess_test values(123, :data, null, null)\", BindVars: {#maxLimit: \"type:INT64 value:\\\"10001\\\" \"data: \"type:VARCHAR value:\\\"THIS IS A LONG LONG LONG LONG QUERY STRING THAT SHOULD BE SHORTENED\\\" \"}"
-	if err == nil {
-		t.Errorf("query unexpectedly succeeded")
-	}
-	if getTestLog(1) != wantLog {
-		t.Errorf("log was not truncated properly: got '%s', want '%s'", getTestLog(1), wantLog)
-	}
-	if err.Error() != wantErr {
-		t.Errorf("error was unexpectedly truncated: got '%s', want '%s'", err.Error(), wantErr)
-	}
-
-	// Test that trailing comments are preserved data too long error is truncated once the option is set
-	*sqlparser.TruncateErrLen = 30
-	_, err = client.Execute(
-		"insert into vitess_test values(123, :data, null, null) /* KEEP ME */",
-		map[string]*querypb.BindVariable{"data": sqltypes.StringBindVariable("THIS IS A LONG LONG LONG LONG QUERY STRING THAT SHOULD BE SHORTENED")},
-	)
-	wantLog = "Data truncated for column 'floatval' at row 1 (errno 1265) (sqlstate 01000) (CallerID: dev): Sql: \"insert into vitess [TRUNCATED] /* KEEP ME */\", BindVars: {#maxLim [TRUNCATED]"
-	wantErr = "Data truncated for column 'floatval' at row 1 (errno 1265) (sqlstate 01000) (CallerID: dev): Sql: \"insert into vitess_test values(123, :data, null, null) /* KEEP ME */\", BindVars: {#maxLimit: \"type:INT64 value:\\\"10001\\\" \"data: \"type:VARCHAR value:\\\"THIS IS A LONG LONG LONG LONG QUERY STRING THAT SHOULD BE SHORTENED\\\" \"}"
-	if err == nil {
-		t.Errorf("query unexpectedly succeeded")
-	}
-	if getTestLog(2) != wantLog {
-		t.Errorf("log was not truncated properly: got '%s', want '%s'", getTestLog(2), wantLog)
-	}
-	if err.Error() != wantErr {
-		t.Errorf("error was unexpectedly truncated: got '%s', want '%s'", err.Error(), wantErr)
-	}
+	return fmt.Sprintf("ERROR: log %d/%d does not exist", i, len(tl.logs))
 }
 
 func TestClientFoundRows(t *testing.T) {
@@ -670,12 +638,8 @@ func TestClientFoundRows(t *testing.T) {
 		t.Error(err)
 	}
 	qr, err := client.Execute("update vitess_test set charval='aa' where intval=124", nil)
-	if err != nil {
-		t.Error(err)
-	}
-	if qr.RowsAffected != 0 {
-		t.Errorf("Execute(rowsFound==false): %d, want 0", qr.RowsAffected)
-	}
+	require.NoError(t, err)
+	assert.Equal(t, 0, len(qr.Rows))
 	if err := client.Rollback(); err != nil {
 		t.Error(err)
 	}
@@ -685,12 +649,8 @@ func TestClientFoundRows(t *testing.T) {
 		t.Error(err)
 	}
 	qr, err = client.Execute("update vitess_test set charval='aa' where intval=124", nil)
-	if err != nil {
-		t.Error(err)
-	}
-	if qr.RowsAffected != 1 {
-		t.Errorf("Execute(rowsFound==true): %d, want 1", qr.RowsAffected)
-	}
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, qr.RowsAffected)
 	if err := client.Rollback(); err != nil {
 		t.Error(err)
 	}
@@ -698,7 +658,7 @@ func TestClientFoundRows(t *testing.T) {
 
 func TestLastInsertId(t *testing.T) {
 	client := framework.NewClient()
-	res, err := client.Execute("insert ignore into vitess_autoinc_seq SET name = 'foo', sequence = 0", nil)
+	_, err := client.Execute("insert ignore into vitess_autoinc_seq SET name = 'foo', sequence = 0", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -709,15 +669,13 @@ func TestLastInsertId(t *testing.T) {
 	}
 	defer client.Rollback()
 
-	res, err = client.Execute("insert ignore into vitess_autoinc_seq SET name = 'foo', sequence = 0", nil)
+	res, err := client.Execute("insert ignore into vitess_autoinc_seq SET name = 'foo', sequence = 0", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	qr, err := client.Execute("update vitess_autoinc_seq set sequence=last_insert_id(sequence + 1) where name='foo'", nil)
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 
 	insID := res.InsertID
 
@@ -726,9 +684,7 @@ func TestLastInsertId(t *testing.T) {
 	}
 
 	qr, err = client.Execute("select sequence from vitess_autoinc_seq where name = 'foo'", nil)
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 
 	wantCol := sqltypes.NewUint64(insID + uint64(1))
 	if !reflect.DeepEqual(qr.Rows[0][0], wantCol) {
@@ -777,4 +733,309 @@ func TestAppDebugRequest(t *testing.T) {
 	if err == nil || !strings.HasPrefix(err.Error(), want) {
 		t.Errorf("Error: %v, want prefix %s", err, want)
 	}
+}
+
+func TestBeginExecuteWithFailingPreQueriesAndCheckConnectionState(t *testing.T) {
+	client := framework.NewClient()
+
+	insQuery := "insert into vitess_test (intval, floatval, charval, binval) values (4, null, null, null)"
+	preQueries := []string{
+		"savepoint a",
+		"release savepoint b",
+	}
+	_, err := client.BeginExecute(insQuery, nil, preQueries)
+	require.Error(t, err)
+
+	qr, err := client.Execute("select intval from vitess_test where intval = 4", nil)
+	require.NoError(t, err)
+	require.Empty(t, qr.Rows)
+}
+
+func TestSelectBooleanSystemVariables(t *testing.T) {
+	client := framework.NewClient()
+
+	type testCase struct {
+		Variable string
+		Value    bool
+		Type     querypb.Type
+	}
+
+	newTestCase := func(varname string, vartype querypb.Type, value bool) testCase {
+		return testCase{Variable: varname, Value: value, Type: vartype}
+	}
+
+	tcs := []testCase{
+		newTestCase("autocommit", querypb.Type_INT64, true),
+		newTestCase("autocommit", querypb.Type_INT64, false),
+		newTestCase("enable_system_settings", querypb.Type_INT64, true),
+		newTestCase("enable_system_settings", querypb.Type_INT64, false),
+	}
+
+	for _, tc := range tcs {
+		qr, err := client.Execute(
+			fmt.Sprintf("select :%s", tc.Variable),
+			map[string]*querypb.BindVariable{tc.Variable: sqltypes.BoolBindVariable(tc.Value)},
+		)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		require.NotEmpty(t, qr.Fields, "fields should not be empty")
+		require.Equal(t, tc.Type, qr.Fields[0].Type, fmt.Sprintf("invalid type, wants: %+v, but got: %+v\n", tc.Type, qr.Fields[0].Type))
+	}
+}
+
+func TestSysSchema(t *testing.T) {
+	client := framework.NewClient()
+	_, err := client.Execute("drop table if exists `a`", nil)
+	require.NoError(t, err)
+
+	_, err = client.Execute("CREATE TABLE `a` (`one` int NOT NULL,`two` int NOT NULL,PRIMARY KEY (`one`,`two`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4", nil)
+	require.NoError(t, err)
+	defer client.Execute("drop table `a`", nil)
+
+	qr, err := client.Execute(`SELECT
+		column_name column_name,
+		data_type data_type,
+		column_type full_data_type,
+		character_maximum_length character_maximum_length,
+		numeric_precision numeric_precision,
+		numeric_scale numeric_scale,
+		datetime_precision datetime_precision,
+		column_default column_default,
+		is_nullable is_nullable,
+		extra extra,
+		table_name table_name
+	FROM information_schema.columns
+	WHERE 1 != 1
+	ORDER BY ordinal_position`, nil)
+	require.NoError(t, err)
+
+	// This is mysql behaviour that we are receiving Uint32 on field query even though the column is Uint64.
+	// assert.EqualValues(t, sqltypes.Uint64, qr.Fields[4].Type) - ideally this should be received
+	// The issue is only in MySQL 8.0 , As CI is on MySQL 5.7 need to check with Uint64
+	assert.True(t, qr.Fields[4].Type == sqltypes.Uint64 || qr.Fields[4].Type == sqltypes.Uint32)
+
+	qr, err = client.Execute(`SELECT
+		column_name column_name,
+		data_type data_type,
+		column_type full_data_type,
+		character_maximum_length character_maximum_length,
+		numeric_precision numeric_precision,
+		numeric_scale numeric_scale,
+		datetime_precision datetime_precision,
+		column_default column_default,
+		is_nullable is_nullable,
+		extra extra,
+		table_name table_name
+	FROM information_schema.columns
+	WHERE table_schema = 'vttest' and table_name = 'a'
+	ORDER BY ordinal_position`, nil)
+	require.NoError(t, err)
+	require.Equal(t, 2, len(qr.Rows))
+
+	// is_nullable
+	assert.Equal(t, `VARCHAR("NO")`, qr.Rows[0][8].String())
+	assert.Equal(t, `VARCHAR("NO")`, qr.Rows[1][8].String())
+
+	// table_name
+	// This can be either a VARCHAR or a VARBINARY. On Linux and MySQL 8, the
+	// string is tagged with a binary encoding, so it is VARBINARY.
+	// On case-insensitive filesystems, it's a VARCHAR.
+	assert.Contains(t, []string{`VARBINARY("a")`, `VARCHAR("a")`}, qr.Rows[0][10].String())
+	assert.Contains(t, []string{`VARBINARY("a")`, `VARCHAR("a")`}, qr.Rows[1][10].String())
+
+	// The field Type and the row value type are not matching and because of this wrong packet is send regarding the data of bigint unsigned to the client on vttestserver.
+	// On, Vitess cluster using protobuf we are doing the row conversion to field type and so the final row type send to client is same as field type.
+	// assert.EqualValues(t, sqltypes.Uint64, qr.Fields[4].Type) - We would have received this but because of field caching we are receiving Uint32.
+	// The issue is only in MySQL 8.0 , As CI is on MySQL 5.7 need to check with Uint64
+	assert.True(t, qr.Fields[4].Type == sqltypes.Uint64 || qr.Fields[4].Type == sqltypes.Uint32)
+	assert.Equal(t, querypb.Type_UINT64, qr.Rows[0][4].Type())
+}
+
+func TestHexAndBitBindVar(t *testing.T) {
+	client := framework.NewClient()
+
+	bv := map[string]*querypb.BindVariable{
+		"vtg1": sqltypes.HexNumBindVariable([]byte("0x9")),
+		"vtg2": sqltypes.HexValBindVariable([]byte("X'09'")),
+	}
+	qr, err := client.Execute("select :vtg1, :vtg2, 0x9, X'09', 0b1001, B'1001'", bv)
+	require.NoError(t, err)
+	assert.Equal(t, `[[VARBINARY("\t") VARBINARY("\t") VARBINARY("\t") VARBINARY("\t") VARBINARY("\t") VARBINARY("\t")]]`, fmt.Sprintf("%v", qr.Rows))
+
+	qr, err = client.Execute("select 1 + :vtg1, 1 + :vtg2, 1 + 0x9, 1 + X'09', 1 + 0b1001, 1 + B'1001'", bv)
+	require.NoError(t, err)
+	assert.Equal(t, `[[UINT64(10) UINT64(10) UINT64(10) UINT64(10) INT64(10) INT64(10)]]`, fmt.Sprintf("%v", qr.Rows))
+
+	bv = map[string]*querypb.BindVariable{
+		"vtg1": sqltypes.BitNumBindVariable([]byte("0b1001")),
+		"vtg2": sqltypes.HexNumBindVariable([]byte("0x9")),
+		"vtg3": sqltypes.BitNumBindVariable([]byte("0b100110101111")),
+		"vtg4": sqltypes.HexNumBindVariable([]byte("0x9af")),
+	}
+	qr, err = client.Execute("select :vtg1, :vtg2, :vtg3, :vtg4", bv)
+	require.NoError(t, err)
+	assert.Equal(t, `[[VARBINARY("\t") VARBINARY("\t") VARBINARY("\t\xaf") VARBINARY("\t\xaf")]]`, fmt.Sprintf("%v", qr.Rows))
+
+	qr, err = client.Execute("select 1 + :vtg1, 1 + :vtg2, 1 + :vtg3, 1 + :vtg4", bv)
+	require.NoError(t, err)
+	assert.Equal(t, `[[INT64(10) UINT64(10) INT64(2480) UINT64(2480)]]`, fmt.Sprintf("%v", qr.Rows))
+}
+
+// Test will validate drop view ddls.
+func TestShowTablesWithSizes(t *testing.T) {
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &connParams)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	setupQueries := []string{
+		`drop view if exists show_tables_with_sizes_v1`,
+		`drop table if exists show_tables_with_sizes_t1`,
+		`drop table if exists show_tables_with_sizes_employees`,
+		`create table show_tables_with_sizes_t1 (id int primary key)`,
+		`create view show_tables_with_sizes_v1 as select * from show_tables_with_sizes_t1`,
+		`CREATE TABLE show_tables_with_sizes_employees (id INT NOT NULL, store_id INT) PARTITION BY HASH(store_id) PARTITIONS 4`,
+	}
+
+	defer func() {
+		_, _ = conn.ExecuteFetch(`drop view if exists show_tables_with_sizes_v1`, 1, false)
+		_, _ = conn.ExecuteFetch(`drop table if exists show_tables_with_sizes_t1`, 1, false)
+		_, _ = conn.ExecuteFetch(`drop table if exists show_tables_with_sizes_employees`, 1, false)
+	}()
+	for _, query := range setupQueries {
+		_, err := conn.ExecuteFetch(query, 1, false)
+		require.NoError(t, err)
+	}
+
+	expectedTables := []string{
+		"show_tables_with_sizes_t1",
+		"show_tables_with_sizes_v1",
+		"show_tables_with_sizes_employees",
+	}
+	actualTables := []string{}
+
+	rs, err := conn.ExecuteFetch(conn.BaseShowTablesWithSizes(), -1, false)
+	require.NoError(t, err)
+	require.NotEmpty(t, rs.Rows)
+
+	assert.GreaterOrEqual(t, len(rs.Rows), len(expectedTables))
+
+	for _, row := range rs.Rows {
+		assert.Equal(t, 6, len(row))
+
+		tableName := row[0].ToString()
+		if tableName == "show_tables_with_sizes_t1" {
+			// TABLE_TYPE
+			assert.Equal(t, "BASE TABLE", row[1].ToString())
+
+			assert.True(t, row[2].IsIntegral())
+			createTime, err := row[2].ToCastInt64()
+			assert.NoError(t, err)
+			assert.Greater(t, createTime, int64(0))
+
+			// TABLE_COMMENT
+			assert.Equal(t, "", row[3].ToString())
+
+			assert.True(t, row[4].IsDecimal())
+			fileSize, err := row[4].ToCastInt64()
+			assert.NoError(t, err)
+			assert.Greater(t, fileSize, int64(0))
+
+			assert.True(t, row[4].IsDecimal())
+			allocatedSize, err := row[5].ToCastInt64()
+			assert.NoError(t, err)
+			assert.Greater(t, allocatedSize, int64(0))
+
+			actualTables = append(actualTables, tableName)
+		} else if tableName == "show_tables_with_sizes_v1" {
+			// TABLE_TYPE
+			assert.Equal(t, "VIEW", row[1].ToString())
+
+			assert.True(t, row[2].IsIntegral())
+			createTime, err := row[2].ToCastInt64()
+			assert.NoError(t, err)
+			assert.Greater(t, createTime, int64(0))
+
+			// TABLE_COMMENT
+			assert.Equal(t, "VIEW", row[3].ToString())
+
+			assert.True(t, row[4].IsNull())
+			assert.True(t, row[5].IsNull())
+
+			actualTables = append(actualTables, tableName)
+		} else if tableName == "show_tables_with_sizes_employees" {
+			// TABLE_TYPE
+			assert.Equal(t, "BASE TABLE", row[1].ToString())
+
+			assert.True(t, row[2].IsIntegral())
+			createTime, err := row[2].ToCastInt64()
+			assert.NoError(t, err)
+			assert.Greater(t, createTime, int64(0))
+
+			// TABLE_COMMENT
+			assert.Equal(t, "", row[3].ToString())
+
+			assert.True(t, row[4].IsDecimal())
+			fileSize, err := row[4].ToCastInt64()
+			assert.NoError(t, err)
+			assert.Greater(t, fileSize, int64(0))
+
+			assert.True(t, row[5].IsDecimal())
+			allocatedSize, err := row[5].ToCastInt64()
+			assert.NoError(t, err)
+			assert.Greater(t, allocatedSize, int64(0))
+
+			actualTables = append(actualTables, tableName)
+		}
+	}
+
+	assert.Equal(t, len(expectedTables), len(actualTables))
+	assert.ElementsMatch(t, expectedTables, actualTables)
+}
+
+// TestTuple tests that bind variables having tuple values work with vttablet.
+func TestTuple(t *testing.T) {
+	client := framework.NewClient()
+	_, err := client.Execute(`insert into vitess_a (eid, id) values (100, 103), (193, 235)`, nil)
+	require.NoError(t, err)
+
+	bv := map[string]*querypb.BindVariable{
+		"__vals": {
+			Type: querypb.Type_TUPLE,
+			Values: []*querypb.Value{
+				sqltypes.TupleToProto([]sqltypes.Value{sqltypes.NewInt64(100), sqltypes.NewInt64(103)}),
+				sqltypes.TupleToProto([]sqltypes.Value{sqltypes.NewInt64(87), sqltypes.NewInt64(4473)}),
+			},
+		},
+	}
+	res, err := client.Execute("select * from vitess_a where (eid, id) in ::__vals", bv)
+	require.NoError(t, err)
+	assert.Equal(t, `[[INT64(100) INT32(103) NULL NULL]]`, fmt.Sprintf("%v", res.Rows))
+
+	res, err = client.Execute("update vitess_a set name = 'a' where (eid, id) in ::__vals", bv)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, res.RowsAffected)
+
+	res, err = client.Execute("select * from vitess_a where (eid, id) in ::__vals", bv)
+	require.NoError(t, err)
+	assert.Equal(t, `[[INT64(100) INT32(103) VARCHAR("a") NULL]]`, fmt.Sprintf("%v", res.Rows))
+
+	bv = map[string]*querypb.BindVariable{
+		"__vals": {
+			Type: querypb.Type_TUPLE,
+			Values: []*querypb.Value{
+				sqltypes.TupleToProto([]sqltypes.Value{sqltypes.NewInt64(100), sqltypes.NewInt64(103)}),
+				sqltypes.TupleToProto([]sqltypes.Value{sqltypes.NewInt64(193), sqltypes.NewInt64(235)}),
+			},
+		},
+	}
+	res, err = client.Execute("delete from vitess_a where (eid, id) in ::__vals", bv)
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, res.RowsAffected)
+
+	res, err = client.Execute("select * from vitess_a where (eid, id) in ::__vals", bv)
+	require.NoError(t, err)
+	require.Zero(t, len(res.Rows))
 }

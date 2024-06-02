@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,9 +21,6 @@ import (
 	"fmt"
 	"testing"
 
-	"golang.org/x/net/context"
-
-	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
 )
 
@@ -61,18 +58,14 @@ func init() {
 }
 
 func BenchmarkWithNormalizer(b *testing.B) {
-	createSandbox(KsTestUnsharded)
-	hcVTGateTest.Reset()
-	_ = hcVTGateTest.AddTestTablet("aa", "1.1.1.1", 1001, KsTestUnsharded, "0", topodatapb.TabletType_MASTER, true, 1, nil)
-	saved := rpcVTGate.executor.normalize
-	rpcVTGate.executor.normalize = true
-	defer func() { rpcVTGate.executor.normalize = saved }()
+	vtgateInst, _, ctx := createVtgateEnv(b)
 
 	for i := 0; i < b.N; i++ {
-		_, _, err := rpcVTGate.Execute(
-			context.Background(),
+		_, _, err := vtgateInst.Execute(
+			ctx,
+			nil,
 			&vtgatepb.Session{
-				TargetString: "@master",
+				TargetString: "@primary",
 				Options:      executeOptions,
 			},
 			benchQuery,
@@ -85,18 +78,16 @@ func BenchmarkWithNormalizer(b *testing.B) {
 }
 
 func BenchmarkWithoutNormalizer(b *testing.B) {
-	createSandbox(KsTestUnsharded)
-	hcVTGateTest.Reset()
-	_ = hcVTGateTest.AddTestTablet("aa", "1.1.1.1", 1001, KsTestUnsharded, "0", topodatapb.TabletType_MASTER, true, 1, nil)
-	saved := rpcVTGate.executor.normalize
-	rpcVTGate.executor.normalize = false
-	defer func() { rpcVTGate.executor.normalize = saved }()
+	vtgateInst, _, ctx := createVtgateEnv(b)
+
+	vtgateInst.executor.normalize = false
 
 	for i := 0; i < b.N; i++ {
-		_, _, err := rpcVTGate.Execute(
-			context.Background(),
+		_, _, err := vtgateInst.Execute(
+			ctx,
+			nil,
 			&vtgatepb.Session{
-				TargetString: "@master",
+				TargetString: "@primary",
 				Options:      executeOptions,
 			},
 			benchQuery,

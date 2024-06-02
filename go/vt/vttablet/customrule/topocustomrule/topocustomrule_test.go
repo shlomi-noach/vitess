@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -78,11 +78,13 @@ func TestUpdate(t *testing.T) {
 
 	cell := "cell1"
 	filePath := "/keyspaces/ks1/configs/CustomRules"
-	ts := memorytopo.NewServer(cell)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ts := memorytopo.NewServer(ctx, cell)
 	qsc := tabletservermock.NewController()
 	qsc.TS = ts
 	sleepDuringTopoFailure = time.Millisecond
-	ctx := context.Background()
 
 	cr, err := newTopoCustomRule(qsc, cell, filePath)
 	if err != nil {
